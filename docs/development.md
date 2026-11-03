@@ -1,111 +1,108 @@
-# Dicey Bar development environment
+# Development and production
 
-## How Omarchy development works
+## Structure and the Omarchy contract
 
-Official sources checked in the browser:
+This repository follows the small native-plugin organization used by
+[Omaplug](https://github.com/fross100/omaplug): root manifest and public QML
+entry points, feature components, runtime helpers where needed, `tests/run.sh`,
+README and license. Omaplug itself documents normal installation/updates, not a
+dedicated dev mode; our opt-in development tool is an additional workflow.
 
-- [Shell Plugins manual](https://omarchy.org/manual/shell-plugins/)
-- [Development guide](https://plugins.omarchy.org/develop.html)
-- [Shell runtime reference](https://github.com/omacom/omarchy/blob/quattro/docs/omarchy-shell.md)
+`manifest.json` declares `dicey.bar`, `kinds: ["bar"]` and
+`entryPoints.bar: "Bar.qml"`. It replaces the whole bar, unlike the clock
+`bar-widget` in the [official guide](https://plugins.omarchy.org/develop.html).
+`widgets/` and `indicators/` contain reusable runtime components. `scripts/`,
+`tests/` and `docs/` are author tooling, not shell entry points.
 
-A plugin is QML/JavaScript inside the existing long-running `omarchy-shell`, not
-a standalone application. No frontend server or second Quickshell process is
-needed. Omarchy automatically reloads plugin code saved under
-`~/.config/omarchy/plugins/`; `shell.json` is also watched. Never edit packaged
-files under `/usr/share/omarchy`.
+QML is Qt's declarative UI language. Quickshell exposes desktop APIs to QML;
+Omarchy supplies lifecycle, components and theming. JavaScript runs inside Qt,
+not Node. Plugins run unsandboxed in the existing long-running shell: no web
+bundler, development web server or second Quickshell process is needed.
 
-The official tutorial normally edits a user-owned clone directly. We want Git
-source under `~/projects`, so a one-way copy deploys it into the real plugin
-directory. Validation rejects symlinks. The copy watcher is a development
-convenience, not a runtime dependency marketplace users should install.
+## Tests and validation
 
-## Working setup today
-
-- Source: `~/projects/dicey-bar`; manifest ID: **`dicey.bar`**.
-- Runtime copy: `~/.config/omarchy/plugins/dicey.bar`.
-- The shared `dicey-kustomarchy-sync.path` watches both projects and existing
-  runtime subdirectories, including Bar's `widgets/` and `indicators/`.
-- Its service stages a filtered copy, validates it, compares contents, backs up
-  the previous live folder, replaces changed contents, and requests a rescan.
-- Git metadata, docs, tests, mockups, scripts, virtualenvs, secrets in `.env*`,
-  caches, and Python bytecode are excluded. A lock serializes deployments.
-- Sync is one-way: direct live edits will be overwritten by a later source save.
-- This transitional setup still depends on `~/dicey-kustomarchy/scripts`.
-  Do not delete that checkout until independent tooling replaces it.
-- Run `manage-watcher restart` after adding runtime subdirectories: systemd path
-  units do not recursively add watches for future directories.
-
-From this repository:
+Install Python 3 and Arch's `qt6-declarative` package. Tests use only Python's
+standard library and the system QtQuick/QtTest modules; no pip installation or
+virtualenv is necessary. The runner deliberately resolves `python3` via `PATH`,
+so check `command -v python3` if you have Conda or another activated environment.
+Versions are not pinned or hermetic in this setup.
 
 ```bash
+tests/run.sh
 omarchy plugin validate .
-/usr/bin/python3 -B -m unittest discover -s tests -p 'test_*.py'
-~/dicey-kustomarchy/scripts/install-plugin dicey.bar
-~/dicey-kustomarchy/scripts/manage-watcher status
+qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" ./*.qml widgets/*.qml indicators/*.qml
 ```
 
-Sync does not activate a plugin. Use `omarchy bar use dicey.bar` to select this
-bar, or `omarchy bar use omarchy.bar` for fallback. Stopping the shared watcher
-pauses syncing for both projects without disabling either installed plugin.
+The test runner works from any working directory. Python orchestrates real
+offscreen Qt hide/show tests using the bar's visibility expressions, plus
+temporary-folder tests of development deployment/recovery. Tests never activate
+a desktop plugin. The Qt regression uses Arch's system Qt test runner; ensure
+`qmllint` also comes from the matching Qt installation, not a different Conda Qt.
+Existing QML lint warnings are not suppressed. Manifest validation alone does
+not prove that QML loads or that the desktop interaction works.
 
-## Recommended independent setup (next implementation)
+## Opt-in development mode
 
-Give each repository a version-controlled `scripts/dev` interface, with separate
-targets, locks, backup locations, and optional per-project user services:
-
-| Command | Proposed behavior |
-| --- | --- |
-| `doctor` | Check Omarchy/Qt versions, tools, import paths, IPC, IDs, target ownership, and conflicting live Git checkouts |
-| `check` | Manifest validation, QML lint, regression tests; no live changes |
-| `sync` | Stage this plugin, validate, back up, deploy only changed contents, rescan |
-| `watch` | Foreground recursive `inotifywait`, debounce saves, handle new directories/deletions/editor renames, exclude non-runtime files |
-| `logs` / `status` | Shell logs, enabled state, source/deployed revision, last successful deployment and last error |
-| `stop` | Stop only this project's optional background watcher |
-| `restart` | Explicit opt-in shell restart, never automatic on every save |
-| `rollback` | Stop deployment first, restore the stock bar or a selected last-good snapshot |
-
-Start with foreground `watch` so failures are visible. Add independent user
-services only after testing it, then retire the shared watcher. Never let two
-watchers deploy the same plugin. Do not rewrite plugin IDs or change activation
-and user settings implicitly when starting development tooling.
-
-Use installed Omarchy/Qt tools for runtime fidelity. The existing visibility
-test uses system Python and QtTest. `qmllint`/`qmlls` should use the installed
-shell import path; no virtualenv or npm runtime dependency is currently needed.
-A starting lint command is:
+Keep the Git checkout anywhere outside the installed production folder:
 
 ```bash
-qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" \
-  Bar.qml ScaleSafeRemap.qml widgets/*.qml indicators/*.qml
+scripts/dev.py start
 ```
 
-Establish a reviewed lint baseline first: dynamically injected shell interfaces
-may require additional import/type setup. Manifest validation alone does not
-validate QML execution, and this migration does not claim a clean lint baseline.
+This foreground Python command:
 
-## Reloading and safe testing
+1. Saves the previously active bar ID in a per-plugin recovery journal.
+2. Copies runtime QML/JS/Python/JSON and license files into a validated, real
+   `~/.config/omarchy/plugins/dicey.bar.dev` folder. Tooling, hidden directories,
+   docs, tests, mockups and symlinks are excluded/rejected.
+3. Activates that development ID. Installed `dicey.bar` files are never written.
+4. Checks for source content changes every half second, including new runtime
+   subdirectories and deletions. Each update is staged and manifest-validated
+   before replacing the last valid development copy. Omarchy does the hot reload.
+5. On Ctrl+C/SIGTERM, restores the previous bar and removes its development copy.
 
-Ordinary QML/JS edits should hot-reload. If discovery is stale, use
-`omarchy-shell shell rescanPlugins`. Kept **service** instances can survive
-reload, so their code changes may require a deliberate shell restart. Python
-changes apply when the helper process is restarted. Do not restart the shell on
-every save or during lock/authentication interactions.
+No daemon or systemd unit is installed. A per-plugin lock prevents two development
+sessions from competing. Do not manually switch bars or update/remove plugins
+while this command is active. After a terminal/shell failure or SIGKILL, run:
 
-Inspect logs with `qs log -p "${OMARCHY_PATH:-/usr/share/omarchy}/shell" --tail 100`.
-Use a separate Omarchy VM or graphical test account for risky compositor/bar
-changes. A different `$HOME` alone does not isolate the active shell's IPC.
-Plugins run unsandboxed with user permissions.
+```bash
+scripts/dev.py restore
+```
 
-Implementation order:
+The journal is retained if restoration fails, so it can be retried after the
+shell is healthy. Its path is `$XDG_STATE_HOME/omarchy/development/dicey.bar.json`
+(default `~/.local/state/omarchy/development/dicey.bar.json`). Unmanaged folders
+using the development ID are not overwritten. New runtime asset formats should
+be added deliberately to the tool's file selection.
 
-1. Independent `doctor`, `check`, `sync`, and deployment safety tests.
-2. Recursive/debounced `watch` with invalid-revision protection, deterministic
-   snapshots, and add/change/delete/rename coverage.
-3. Optional per-project services; retire the transitional coordinator.
-4. VM smoke tests: themes, monitors/scaling, widgets, restart, fallback,
-   update/removal, and interaction with Dicey Pane.
+Stop/disable any pre-existing external auto-deployer before adopting this
+workflow. This repository depends on no other source checkout or shared watcher.
+Never symlink the project into the plugin folder: Omarchy validation rejects it.
 
-Official docs note reduced service-backed third-party widget integration under
-replacement bars; document/test that limitation. Also audit Qt 6.12 palette
-references (`import qs.Commons as Commons`, `Commons.Color`), clone capabilities,
-and upstream licensing before publication. None are changed by this migration.
+Development shares your current shell process and bar layout configuration.
+It preserves production **files**, not process isolation. Use a separate
+graphical session/VM for risky changes or fully isolated configuration testing.
+Do not edit packaged `/usr/share/omarchy` files.
+
+## Production install, update and removal
+
+End users install this repository normally; no development scripts are needed:
+
+```bash
+omarchy plugin add https://github.com/dicey-dev/dicey-bar.git
+omarchy bar use dicey.bar
+# Later, deliberately review and install a published update:
+omarchy plugin update dicey.bar
+# Roll back to stock before removing:
+omarchy bar use omarchy.bar
+omarchy plugin remove dicey.bar
+```
+
+`plugin add` is for a fresh installation; `plugin update` requires a Git-managed
+installed copy. An existing manually copied install needs an explicit migration,
+not an automatic overwrite. Source edits do not update production.
+
+Before [marketplace submission](https://plugins.omarchy.org/publish.html), finish
+upstream attribution/license review and native monitor-scale/remapping,
+restart, disable/re-enable and removal tests. Keep `omarchy.clonedFrom` while
+replacement/restore behavior depends on it. Passing tests is not a security audit.
