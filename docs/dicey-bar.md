@@ -5,7 +5,7 @@ It is deliberately user-owned so Omarchy package updates do not overwrite its
 floating-island presentation.
 
 Omarchy rejects symlinked plugin directories. The project copy is the source of
-truth; use `~/dicey-kustomarchy/scripts/install-plugin dicey.bar` to copy, validate, and rescan
+truth; follow [the native development workflow](development.md) to validate and reload
 the live plugin safely.
 
 ## What changed
