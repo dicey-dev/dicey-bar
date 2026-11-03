@@ -3,36 +3,35 @@
 A floating-island status bar for Omarchy, retaining its theme integration and
 widgets while remapping surfaces safely after monitor layout/scale changes.
 
-This repository was migrated from `dicey-kustomarchy/plugins/dicey.bar`, including
-the working-tree source, documentation, and regression test. Its root manifest
-still uses **`dicey.bar`**. The source history remains in the original repository;
-this repository records the migrated source in a new local history, without a remote.
+An independent Omarchy plugin repository. The plugin ID is **`dicey.bar`**;
+no other Dicey repository, installer, or synchronization service is required.
 
-## Local development
+## Install
 
-Edit this checkout, not the installed copy. The existing local synchronizer now
-maps `~/projects/dicey-bar` to `~/.config/omarchy/plugins/dicey.bar` and is enabled
-on this machine. It stages and validates changes, backs up the previous live
-copy, and lets Omarchy hot-reload. Git metadata, docs, tests, and mockups are not
-deployed. No shell restart is needed for ordinary edits.
+Plugins run unsandboxed inside the existing Omarchy shell. Review the source
+before enabling it. Requires Omarchy's Quattro shell and its Qt/Quickshell imports.
 
 ```bash
+omarchy plugin add https://github.com/dicey-dev/dicey-bar.git
+omarchy bar use dicey.bar
+```
+
+## Development
+
+From any checkout (not the installed production folder):
+
+```bash
+tests/run.sh
 omarchy plugin validate .
-/usr/bin/python3 -B -m unittest discover -s tests -p 'test_*.py'
+scripts/dev.py start
+# Ctrl+C stops watching and restores the previously active bar.
 ```
 
-Transitional sync controls (from any directory):
-
-```bash
-~/dicey-kustomarchy/scripts/install-plugin dicey.bar
-~/dicey-kustomarchy/scripts/manage-watcher status
-~/dicey-kustomarchy/scripts/manage-watcher stop
-~/dicey-kustomarchy/scripts/manage-watcher restart
-```
-
-Regenerate the watcher with `restart` after adding a runtime subdirectory.
-See [the development-environment plan](docs/development.md) for the proposed
-independent per-project workflow and official documentation.
+Python is a **development tool**, not a runtime dependency. Its standard library
+orchestrates a real offscreen Qt test. `python3` is resolved through `PATH`; no
+pip packages are needed. Development runs as `dicey.bar.dev`, without modifying
+the installed `dicey.bar` files. No background watcher is installed.
+See [Development](docs/development.md) for setup, recovery, and production updates.
 
 ## Activation and rollback
 
@@ -42,7 +41,6 @@ omarchy bar use dicey.bar
 omarchy bar use omarchy.bar
 ```
 
-Before uninstalling, stop the sync watcher so it cannot reinstall the plugin.
 Switch to the built-in bar, then use `omarchy plugin remove dicey.bar`.
 Do not delete shared shell configuration or other plugins.
 
@@ -52,7 +50,6 @@ Do not delete shared shell configuration or other plugins.
 - [Original upstream bar reference](docs/upstream-bar.md)
 
 Derived from Omarchy's `omarchy.bar`; upstream authorship is retained in the
-migrated source. `LICENSE` is copied unchanged from the parent repository
-(Apache-2.0). A full upstream-license/notice and compatibility audit remains
-required before marketplace publication. This migration does not change
-runtime behavior, plugin metadata, or claim marketplace readiness.
+source. `LICENSE` is Apache-2.0. A full upstream-license/notice and compatibility
+audit remains required before marketplace publication. Passing development
+checks is not a security audit or marketplace approval.
