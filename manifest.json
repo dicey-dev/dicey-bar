@@ -2,9 +2,11 @@
   "schemaVersion": 1,
   "id": "dicey.bar",
   "name": "Dicey Bar",
-  "version": "1.0.0",
-  "author": "Omarchy",
-  "description": "Status bar with widgets",
+  "version": "1.0.1",
+  "author": "Dicey",
+  "license": "Apache-2.0 AND MIT",
+  "url": "https://github.com/dicey-dev/dicey-bar",
+  "description": "A theme-aware floating-island bar with monitor-scale-safe remapping",
   "kinds": [
     "bar"
   ],
