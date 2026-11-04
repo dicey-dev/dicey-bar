@@ -69,6 +69,11 @@ while this command is active. After a terminal/shell failure or SIGKILL, run:
 scripts/dev.py restore
 ```
 
+If an imported JS module or cached QML component remains stale after a rescan,
+use an explicit `omarchy restart shell` before final runtime verification. A
+successful file deployment alone does not prove that the current engine has
+discarded every cached dependency. Do not restart automatically on each save.
+
 The journal is retained if restoration fails, so it can be retried after the
 shell is healthy. Its path is `$XDG_STATE_HOME/omarchy/development/dicey.bar.json`
 (default `~/.local/state/omarchy/development/dicey.bar.json`). Unmanaged folders
@@ -102,7 +107,8 @@ omarchy plugin remove dicey.bar
 installed copy. An existing manually copied install needs an explicit migration,
 not an automatic overwrite. Source edits do not update production.
 
-Before [marketplace submission](https://plugins.omarchy.org/publish.html), finish
-upstream attribution/license review and native monitor-scale/remapping,
-restart, disable/re-enable and removal tests. Keep `omarchy.clonedFrom` while
-replacement/restore behavior depends on it. Passing tests is not a security audit.
+See [Releases and marketplace checklist](publishing.md) for license provenance,
+SemVer, supported compatibility, release verification and form values. Repeat
+native monitor-scale/remapping, restart and removal checks for behavior changes.
+The clone-source field deliberately retains supported replacement/restore
+semantics. Passing tests is not a security audit or marketplace approval.
