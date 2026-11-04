@@ -28,9 +28,17 @@ file modes, generated/private filenames, applicable syntax, and whitespace.
 The source command boundaries were manually reviewed; a regex scan alone is
 not evidence that code is safe.
 
-## Remaining release work
+## Release follow-up
 
-Full QML lint/type baselining, Qt 6.12 compatibility, upstream license/notice
-provenance, and clean-VM lifecycle testing are not completed by this review.
-Replacement bars have limited third-party service integration. Install only
-trusted plugins: all plugin code runs with the user's permissions.
+The publication-readiness pass adds the complete upstream MIT notice, explicit
+Apache/MIT distribution metadata, SemVer/changelog checks and repeatable official
+install/update/remove filesystem tests. System QML lint and native development
+activation/reload/restore checks were run on Omarchy 4.0.6 / Qt 6.12 / Quickshell
+0.3.2. Existing lint warnings are not suppressed; a clean-VM or broader-version
+certification is not claimed. See [publishing evidence](publishing.md).
+
+The dev tool writes only its marked `.dev` plugin, retains recovery state on
+failed restoration and does not modify production source files. Version tooling
+only edits the checkout's manifest/changelog; it does not publish or install.
+Replacement bars retain the host's limited third-party service integration.
+Install only trusted plugins: all plugin code runs with the user's permissions.

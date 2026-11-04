@@ -1,6 +1,7 @@
 # Dicey Bar
 
-**Alpha software (0.x).** Expect rough edges and compatibility changes.
+**Alpha software (0.x).** The current release is **v0.1.0**. Expect rough edges
+and possible compatibility changes; validation is not a stability guarantee.
 
 A floating-island status bar for Omarchy, retaining its theme integration and
 widgets while remapping surfaces safely after monitor layout/scale changes.
@@ -35,6 +36,27 @@ pip packages are needed. Development runs as `dicey.bar.dev`, without modifying
 the installed `dicey.bar` files. No background watcher is installed.
 See [Development](docs/development.md) for setup, recovery, and production updates.
 
+## Requirements and updates
+
+Tested on **Omarchy 4.0.6 / Quattro, Qt 6.12 and Quickshell 0.3.2**. Use an
+Omarchy installation with its matching shell imports, Hyprland, Bash, Git and
+`jq`. Configured widgets use Omarchy's normal helper commands; keyboard-layout
+descriptions additionally use `xkbcli` (`libxkbcommon`), recording status uses
+`pgrep` (`procps-ng`), and optional dictation uses Omarchy's Voxtype integration.
+Only enable helpers you have installed. User-configured custom modules execute
+their configured shell commands with your permissions. No installer/build,
+privileged helper, external service, download or remote build is required.
+
+```bash
+omarchy plugin update dicey.bar
+```
+
+Omarchy fetches `origin HEAD` (the remote default branch) and fast-forwards
+the installed checkout after showing the diff; it does **not** select releases
+by semantic version, and a detached checkout is not protected from updates.
+See [Releases and marketplace checklist](docs/publishing.md) for SemVer,
+rollback limitations, migration from copied installs, and submission details.
+
 ## Activation and rollback
 
 ```bash
@@ -51,7 +73,8 @@ Do not delete shared shell configuration or other plugins.
 - [Design and behavior](docs/dicey-bar.md)
 - [Original upstream bar reference](docs/upstream-bar.md)
 
-Derived from Omarchy's `omarchy.bar`; upstream authorship is retained in the
-source. `LICENSE` is Apache-2.0. A full upstream-license/notice and compatibility
-audit remains required before marketplace publication. Passing development
-checks is not a security audit or marketplace approval.
+Derived from Omarchy's `omarchy.bar`. Dicey code is Apache-2.0; upstream portions
+remain MIT. Preserve both [`LICENSE`](LICENSE) and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). The clone-source metadata is
+intentional replacement/restore integration, not a temporary author identity.
+Passing validation is not a security audit or marketplace approval.
