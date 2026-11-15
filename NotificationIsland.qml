@@ -52,6 +52,7 @@ PanelWindow {
   readonly property int maxBehind: IslandModel.MAX_STACK - 1
   readonly property int behind: Math.max(0, Math.min(maxBehind, (bar.islandStack || []).length - 1))
   readonly property real peek: Style.space(6)
+  readonly property real stackInset: Style.space(12)
   readonly property int moreCount: Math.max(0, bar.islandArrivals - 1)
 
   onWantedChanged: wanted ? show() : hide()
@@ -124,27 +125,39 @@ PanelWindow {
 
   mask: Region { item: pill }
 
-  // Cards behind the pill, nearest first; drawn before it, so it covers them.
+  // Cards behind the pill, nearest first. Each one further back is the same
+  // step narrower and lower, and sits under the one in front of it (z), so
+  // only its lower edge shows. Cards are opaque; depth is a veil of the bar
+  // background over the card, so a card never shows through another.
   Repeater {
     model: island.maxBehind
 
     BorderSurface {
       id: card
       required property int index
+      readonly property int depth: index + 1
       property real reveal: island.open && index < island.behind ? 1 : 0
       Behavior on reveal {
         NumberAnimation { duration: Style.duration(220); easing.type: Easing.OutCubic }
       }
 
+      z: -depth
       visible: reveal > 0
-      opacity: reveal * (index === 0 ? 0.9 : 0.7)
-      width: Math.max(1, pill.width - Style.space(14) * (index + 1) * 2)
+      opacity: reveal
+      width: Math.max(1, pill.width - 2 * island.stackInset * depth)
       height: pill.height
       x: Math.round((parent.width - width) / 2)
-      y: pill.y + (island.bottom ? -1 : 1) * Math.round(reveal * island.peek * (index + 1))
+      y: pill.y + (island.bottom ? -1 : 1) * Math.round(reveal * island.peek * depth)
       radius: pill.radius
       color: pill.color
       borderSpec: island.stackBorderSpec
+
+      Rectangle {
+        anchors.fill: parent
+        radius: parent.radius
+        color: Qt.rgba(island.bar.background.r, island.bar.background.g, island.bar.background.b,
+                       0.3 * card.depth)
+      }
     }
   }
 
