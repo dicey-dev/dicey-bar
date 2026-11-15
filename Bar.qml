@@ -354,6 +354,7 @@ Item {
 
   onIslandEnabledChanged: {
     islandSeen = null
+    islandActivateKey = ""
     if (!islandEnabled) closeIsland()
   }
 

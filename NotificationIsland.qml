@@ -41,7 +41,13 @@ PanelWindow {
   onWantedChanged: wanted ? show() : hide()
   Connections {
     target: island.bar
-    function onIslandSerialChanged() { if (island.wanted) island.show() }
+    function onIslandSerialChanged() {
+      if (!island.wanted) return
+      // New content in an open pill: a click aimed at the old one must not land.
+      island.clickable = false
+      clickArm.restart()
+      island.show()
+    }
   }
 
   function show() {

@@ -38,7 +38,8 @@ stays open while hovered.
   counts agree and the island's notification is the snapshot's newest.
   Otherwise the click only closes the island. A notification that reaches the
   host within about a quarter second of the click, before the host writes its
-  snapshot, can still be the one activated. Clicks in the first 0.4 seconds
+  snapshot, can still be the one activated, and so can an older toast if the
+  island's own toast is in its brief leave animation. Clicks in the first 0.4 seconds
   after the pill opens are ignored, so a click aimed at what was under it does
   not run an action.
 - **Right or middle click** closes the island. The host toast is untouched.
