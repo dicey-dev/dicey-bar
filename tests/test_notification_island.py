@@ -63,8 +63,28 @@ TestCase {
         var rows = IslandModel.parseLive(JSON.stringify([entry("n1", 100), entry("n2", 101), entry("n3", 102)]))
         var result = IslandModel.arrivals(seen, rows, 103)
         compare(result.show.key, "n3")
+        compare(result.fresh.map(function(r) { return r.key }), ["n2", "n3"])
         verify(result.seen.n2 && result.seen.n3)
-        compare(IslandModel.arrivals(result.seen, rows, 103).show, null)
+        var again = IslandModel.arrivals(result.seen, rows, 103)
+        compare(again.show, null)
+        compare(again.fresh.length, 0)
+    }
+
+    function test_stack_puts_newest_on_top_and_is_bounded() {
+        function keys(stack) { return stack.map(function(r) { return r.key }) }
+        var rows = IslandModel.parseLive(JSON.stringify([entry("n1", 1), entry("n2", 2), entry("n3", 3),
+                                                         entry("n4", 4)]))
+        var stack = IslandModel.stacked([], [rows[0]])
+        compare(keys(stack), ["n1"])
+        stack = IslandModel.stacked(stack, [rows[1], rows[2]])
+        compare(keys(stack), ["n3", "n2", "n1"])
+        // Bounded: the oldest card drops off the bottom.
+        stack = IslandModel.stacked(stack, [rows[3]])
+        compare(keys(stack), ["n4", "n3", "n2"])
+        compare(stack.length, IslandModel.MAX_STACK)
+        // A key already in the stack is not shown twice.
+        compare(keys(IslandModel.stacked(stack, [rows[3]])), ["n4", "n3", "n2"])
+        compare(IslandModel.stacked(null, null).length, 0)
     }
 
     function test_old_rows_are_not_news() {

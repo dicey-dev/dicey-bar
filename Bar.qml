@@ -345,6 +345,10 @@ Item {
   // false` in shell.json turns it off.
   readonly property bool islandEnabled: !(Util.isPlainObject(barConfig) && barConfig.notificationIsland === false)
   property var islandItem: null
+  // Newest first; islandItem is its head. islandArrivals counts every
+  // notification since the island opened, including any past the stack.
+  property var islandStack: []
+  property int islandArrivals: 0
   property string islandScreen: ""
   property int islandSerial: 0
   property var islandSeen: null
@@ -375,13 +379,21 @@ Item {
       Util.execArgv(["omarchy-shell", "notifications", "invokeLast"])
     var result = IslandModel.arrivals(islandSeen, rows, Date.now() / 1000)
     islandSeen = result.seen
-    if (result.show) openIsland(result.show)
+    if (result.show) openIsland(result.fresh)
   }
 
-  function openIsland(item) {
-    var screenName = focusedScreenName()
-    if (!screenName && Quickshell.screens.length) screenName = String(Quickshell.screens[0].name || "")
-    islandScreen = screenName
+  // `fresh` is oldest first; the newest goes on top of the open stack.
+  function openIsland(fresh) {
+    var item = fresh[fresh.length - 1]
+    if (!islandItem) {
+      var screenName = focusedScreenName()
+      if (!screenName && Quickshell.screens.length) screenName = String(Quickshell.screens[0].name || "")
+      islandScreen = screenName
+      islandStack = []
+      islandArrivals = 0
+    }
+    islandStack = IslandModel.stacked(islandStack, fresh)
+    islandArrivals += fresh.length
     islandItem = item
     islandSerial++
     islandHold.interval = IslandModel.holdMs(item.urgency)
@@ -391,6 +403,8 @@ Item {
   function closeIsland() {
     islandHold.stop()
     islandItem = null
+    islandStack = []
+    islandArrivals = 0
   }
 
   function activateIsland(key) {

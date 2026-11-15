@@ -13,6 +13,9 @@ var ICON_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/
 // A row this much older than its arrival is a restore or replay, not news.
 var MAX_AGE_SECONDS = 15
 var CRITICAL = 2
+// Notifications the island keeps while open: the one shown plus the cards
+// stacked behind it.
+var MAX_STACK = 3
 
 // Plain, single-line text: control and bidi-override characters go, runs of
 // whitespace collapse, and the result is bounded. Markup stays literal because
@@ -82,17 +85,34 @@ function keysOf(rows) {
 
 // What a fresh snapshot means for the island. `seen` is null before the first
 // read: whatever is already on screen when the bar starts is not news.
-// Returns { seen, show }, where show is the newest unseen recent row or null.
+// Returns { seen, fresh, show }: fresh is every unseen recent row, oldest
+// first, and show is the newest of them or null.
 function arrivals(seen, rows, nowSeconds) {
   var next = keysOf(rows)
-  if (!seen) return { seen: next, show: null }
-  for (var i = rows.length - 1; i >= 0; i--) {
+  if (!seen) return { seen: next, fresh: [], show: null }
+  var fresh = []
+  for (var i = 0; i < rows.length; i++) {
     var candidate = rows[i]
     if (seen[candidate.key]) continue
     if (nowSeconds - candidate.ts > MAX_AGE_SECONDS) continue
-    return { seen: next, show: candidate }
+    fresh.push(candidate)
   }
-  return { seen: next, show: null }
+  return { seen: next, fresh: fresh, show: fresh.length ? fresh[fresh.length - 1] : null }
+}
+
+// The open island's stack, newest first: fresh rows (oldest first) go on top
+// of what it already holds, each key once, at most MAX_STACK cards.
+function stacked(stack, fresh) {
+  var out = []
+  var keys = {}
+  var incoming = (fresh || []).slice().reverse().concat(stack || [])
+  for (var i = 0; i < incoming.length && out.length < MAX_STACK; i++) {
+    var item = incoming[i]
+    if (!item || keys[item.key]) continue
+    keys[item.key] = true
+    out.push(item)
+  }
+  return out
 }
 
 // The row the host's "latest toast" IPC would target, as far as the snapshot

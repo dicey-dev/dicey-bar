@@ -2,6 +2,7 @@ import Quickshell
 import Quickshell.Wayland
 import QtQuick
 import qs.Commons
+import qs.Ui
 import "NotificationIslandModel.js" as IslandModel
 
 // The center island's expanded state: a pill that grows out of the clock
@@ -38,15 +39,33 @@ PanelWindow {
   // Where the clock island sits inside the bar surface.
   readonly property real anchorOffset: Math.max(0, (bar.barSize - collapsedHeight) / 2)
 
+  // The theme's notification border, as on Omarchy's own toasts; critical
+  // notifications use the theme's urgent color instead.
+  readonly property real borderWidth: Math.max(1, Style.space(2))
+  readonly property var borderSpec: item && item.urgency === 2
+    ? Border.flat(Color.urgent, borderWidth)
+    : Border.surfaceSpec("notifications", "border", Color.notifications.border, borderWidth)
+  readonly property var stackBorderSpec: Border.surfaceSpec("notifications", "border",
+    Color.notifications.border, borderWidth)
+
+  // Earlier notifications still in the open island peek out behind the pill.
+  readonly property int maxBehind: IslandModel.MAX_STACK - 1
+  readonly property int behind: Math.max(0, Math.min(maxBehind, (bar.islandStack || []).length - 1))
+  readonly property real peek: Style.space(6)
+  readonly property int moreCount: Math.max(0, bar.islandArrivals - 1)
+
   onWantedChanged: wanted ? show() : hide()
   Connections {
     target: island.bar
     function onIslandSerialChanged() {
       if (!island.wanted) return
+      var stacking = island.open && island.item !== null
       // New content in an open pill: a click aimed at the old one must not land.
       island.clickable = false
       clickArm.restart()
       island.show()
+      // The newcomer drops onto the stack; the previous one moves behind.
+      if (stacking) arrivalAnimation.restart()
     }
   }
 
@@ -101,9 +120,33 @@ PanelWindow {
   margins.top: bottom ? 0 : bar.topIslandMargin
   margins.bottom: 0
   implicitWidth: Math.ceil(expandedWidth)
-  implicitHeight: Math.ceil(anchorOffset + expandedHeight)
+  implicitHeight: Math.ceil(anchorOffset + expandedHeight + maxBehind * peek)
 
   mask: Region { item: pill }
+
+  // Cards behind the pill, nearest first; drawn before it, so it covers them.
+  Repeater {
+    model: island.maxBehind
+
+    BorderSurface {
+      id: card
+      required property int index
+      property real reveal: island.open && index < island.behind ? 1 : 0
+      Behavior on reveal {
+        NumberAnimation { duration: Style.duration(220); easing.type: Easing.OutCubic }
+      }
+
+      visible: reveal > 0
+      opacity: reveal * (index === 0 ? 0.9 : 0.7)
+      width: Math.max(1, pill.width - Style.space(14) * (index + 1) * 2)
+      height: pill.height
+      x: Math.round((parent.width - width) / 2)
+      y: pill.y + (island.bottom ? -1 : 1) * Math.round(reveal * island.peek * (index + 1))
+      radius: pill.radius
+      color: pill.color
+      borderSpec: island.stackBorderSpec
+    }
+  }
 
   Rectangle {
     id: pill
@@ -113,8 +156,6 @@ PanelWindow {
     y: island.bottom ? parent.height - island.anchorOffset - height : island.anchorOffset
     radius: island.open ? Style.space(14) : island.anchorItem.radius
     color: Qt.rgba(island.bar.background.r, island.bar.background.g, island.bar.background.b, 1)
-    border.width: island.item && island.item.urgency === 2 && island.open ? 1 : 0
-    border.color: island.bar.urgent
     clip: true
 
     Behavior on width {
@@ -160,92 +201,144 @@ PanelWindow {
       }
 
       Item {
-        id: iconSlot
-        width: Style.space(32)
-        height: width
-        anchors.left: parent.left
-        anchors.verticalCenter: parent.verticalCenter
+        id: arrival
+        anchors.fill: parent
+        transform: Translate { id: arrivalShift }
 
-        readonly property string source: {
-          var names = IslandModel.iconNames(island.item)
-          for (var i = 0; i < names.length; i++) {
-            var path = Quickshell.iconPath(names[i], true)
-            if (path) return path
+        ParallelAnimation {
+          id: arrivalAnimation
+          NumberAnimation {
+            target: arrivalShift; property: "y"
+            from: (island.bottom ? 1 : -1) * Style.space(10); to: 0
+            duration: Style.duration(220); easing.type: Easing.OutCubic
           }
-          return ""
+          NumberAnimation {
+            target: arrival; property: "opacity"; from: 0; to: 1
+            duration: Style.duration(220); easing.type: Easing.OutCubic
+          }
         }
 
-        Image {
-          id: appIcon
-          anchors.fill: parent
-          source: iconSlot.source
-          sourceSize.width: width * 2
-          sourceSize.height: height * 2
-          fillMode: Image.PreserveAspectFit
-          asynchronous: true
-          smooth: true
-          visible: status === Image.Ready
+        Item {
+          id: iconSlot
+          width: Style.space(32)
+          height: width
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+
+          readonly property string source: {
+            var names = IslandModel.iconNames(island.item)
+            for (var i = 0; i < names.length; i++) {
+              var path = Quickshell.iconPath(names[i], true)
+              if (path) return path
+            }
+            return ""
+          }
+
+          Image {
+            id: appIcon
+            anchors.fill: parent
+            source: iconSlot.source
+            sourceSize.width: width * 2
+            sourceSize.height: height * 2
+            fillMode: Image.PreserveAspectFit
+            asynchronous: true
+            smooth: true
+            visible: status === Image.Ready
+          }
+
+          Rectangle {
+            anchors.fill: parent
+            radius: width / 2
+            visible: !appIcon.visible
+            color: Qt.rgba(island.bar.foreground.r, island.bar.foreground.g, island.bar.foreground.b, 0.12)
+
+            Text {
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              // Nerd Font bell; the bar font is the Omarchy monospace Nerd Font.
+              text: "\u{f009a}"
+              color: island.item && island.item.urgency === 2 ? Color.urgent : island.bar.foreground
+              font.family: island.bar.fontFamily
+              font.pixelSize: Style.font.title
+            }
+          }
         }
 
-        Rectangle {
-          anchors.fill: parent
-          radius: width / 2
-          visible: !appIcon.visible
-          color: Qt.rgba(island.bar.foreground.r, island.bar.foreground.g, island.bar.foreground.b, 0.12)
+        Column {
+          anchors.left: iconSlot.right
+          anchors.leftMargin: Style.space(12)
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(2)
+
+          Item {
+            width: parent.width
+            height: appName.implicitHeight
+
+            Text {
+              id: appName
+              anchors.left: parent.left
+              anchors.right: moreLabel.visible ? moreLabel.left : parent.right
+              anchors.rightMargin: moreLabel.visible ? Style.space(8) : 0
+              textFormat: Text.PlainText
+              text: island.item ? (island.item.app || "Notification") : ""
+              color: Qt.rgba(island.bar.foreground.r, island.bar.foreground.g, island.bar.foreground.b, 0.65)
+              font.family: island.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+              maximumLineCount: 1
+            }
+
+            // How many more arrived while the island was open.
+            Text {
+              id: moreLabel
+              anchors.right: parent.right
+              visible: island.moreCount > 0
+              textFormat: Text.PlainText
+              text: "+" + island.moreCount + " more"
+              color: Color.accent
+              font.family: island.bar.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
 
           Text {
-            anchors.centerIn: parent
+            width: parent.width
             textFormat: Text.PlainText
-            // Nerd Font bell; the bar font is the Omarchy monospace Nerd Font.
-            text: "\u{f009a}"
-            color: island.item && island.item.urgency === 2 ? island.bar.urgent : island.bar.foreground
+            text: IslandModel.headline(island.item)
+            color: island.bar.foreground
             font.family: island.bar.fontFamily
-            font.pixelSize: Style.font.title
+            font.pixelSize: Style.font.body
+            font.bold: true
+            elide: Text.ElideRight
+            maximumLineCount: 1
+          }
+
+          Text {
+            width: parent.width
+            visible: text !== ""
+            textFormat: Text.PlainText
+            text: IslandModel.detail(island.item)
+            color: Qt.rgba(island.bar.foreground.r, island.bar.foreground.g, island.bar.foreground.b, 0.85)
+            font.family: island.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideRight
+            maximumLineCount: 1
           }
         }
       }
+    }
 
-      Column {
-        anchors.left: iconSlot.right
-        anchors.leftMargin: Style.space(12)
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
-        spacing: Style.space(2)
-
-        Text {
-          width: parent.width
-          textFormat: Text.PlainText
-          text: island.item ? (island.item.app || "Notification") : ""
-          color: Qt.rgba(island.bar.foreground.r, island.bar.foreground.g, island.bar.foreground.b, 0.65)
-          font.family: island.bar.fontFamily
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
-          maximumLineCount: 1
-        }
-
-        Text {
-          width: parent.width
-          textFormat: Text.PlainText
-          text: IslandModel.headline(island.item)
-          color: island.bar.foreground
-          font.family: island.bar.fontFamily
-          font.pixelSize: Style.font.body
-          font.bold: true
-          elide: Text.ElideRight
-          maximumLineCount: 1
-        }
-
-        Text {
-          width: parent.width
-          visible: text !== ""
-          textFormat: Text.PlainText
-          text: IslandModel.detail(island.item)
-          color: Qt.rgba(island.bar.foreground.r, island.bar.foreground.g, island.bar.foreground.b, 0.85)
-          font.family: island.bar.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          elide: Text.ElideRight
-          maximumLineCount: 1
-        }
+    // Drawn over the content so the border sits on the pill's edge; it fades
+    // in with the morph and out before the pill becomes the clock island.
+    BorderSurface {
+      anchors.fill: parent
+      color: "transparent"
+      radius: pill.radius
+      borderSpec: island.borderSpec
+      opacity: island.open ? 1 : 0
+      Behavior on opacity {
+        NumberAnimation { duration: Style.duration(160); easing.type: Easing.OutCubic }
       }
     }
   }

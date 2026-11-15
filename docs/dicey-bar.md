@@ -26,8 +26,17 @@ the live plugin safely.
 When a new desktop notification arrives, the center island grows into a
 themed pill showing the app icon and name, the summary and a one-line body,
 then returns to the clock. It opens on the focused monitor's bar, stays about
-5.5 seconds (4 for low urgency, 8 for critical, with an accent border), and
-stays open while hovered.
+5.5 seconds (4 for low urgency, 8 for critical), and stays open while hovered.
+
+- **Border.** The pill uses the theme's notification border
+  (`[notifications] border`, its alpha, gradient and widths, falling back to
+  the accent color), the same border Omarchy draws around its own toasts.
+  Critical notifications use the theme's urgent color.
+- **Stacking.** A notification that arrives while the island is open drops in
+  on top and restarts its timer. Up to two earlier ones peek out behind the
+  pill as cards with the same border, and the app line shows "+N more" with
+  how many arrived since it opened. The stack clears when the island closes.
+  The pill always shows, and left click always acts on, the newest one.
 
 - **Left click** runs the notification's default action through the host's
   public `notifications invokeLast` IPC, exactly as clicking its toast would.

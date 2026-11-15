@@ -14,7 +14,11 @@ matching `vX.Y.Z` tags.
 
 - **Notification island.** When a new desktop notification arrives, the center
   (clock) island grows into a themed pill with the app icon and name, the
-  summary and a one-line body, then shrinks back to the clock. Left click runs
+  summary and a one-line body, then shrinks back to the clock. The pill has
+  the theme's notification border, as Omarchy's toasts do (the urgent color
+  for critical notifications). Notifications that arrive while it is open
+  stack: the newest drops in on top, up to two earlier ones peek out behind
+  it, and a "+N more" count shows how many came in. Left click runs
   the notification's default action, as clicking its toast would. Right or
   middle click closes the island. Hovering keeps it open. Set
   `"notificationIsland": false` in the `bar` section of
