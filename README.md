@@ -38,7 +38,7 @@ See [Development](docs/development.md) for setup, recovery, and production updat
 
 ## Requirements and updates
 
-Tested on **Omarchy 4.0.6 / Quattro, Qt 6.12 and Quickshell 0.3.2**. Use an
+Tested on **Omarchy 4.0.6 and 4.5.0 / Quattro, Qt 6.12 and Quickshell 0.3.2**. Use an
 Omarchy installation with its matching shell imports, Hyprland, Bash, Git and
 `jq`. Configured widgets use Omarchy's normal helper commands; keyboard-layout
 descriptions additionally use `xkbcli` (`libxkbcommon`), recording status uses

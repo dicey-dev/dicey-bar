@@ -23,12 +23,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["check", "major", "minor", "patch"])
     parser.add_argument("note", nargs="?", help="One release-note sentence (required for a bump)")
+    parser.add_argument("--stable", action="store_true",
+                        help="Allow a 0.x major bump to 1.0.0 after an explicit stability decision")
     args = parser.parse_args()
     manifest_path = ROOT / "manifest.json"
     changelog_path = ROOT / "CHANGELOG.md"
     manifest = json.loads(manifest_path.read_text())
     current = manifest["version"]
     bumped(current, "patch")  # Validate even when checking without a bump.
+    if args.stable != (args.action == "major" and current.startswith("0.")):
+        parser.error("0.x is alpha: a major bump to 1.0.0 needs an explicit stability decision; "
+                     "pass --stable only with that major bump")
     changelog = changelog_path.read_text()
     if not changelog.split("\n## [", 1)[-1].startswith(current + "]"):
         parser.error("The first changelog release must match manifest.json")
