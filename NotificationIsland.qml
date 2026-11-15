@@ -16,8 +16,11 @@ PanelWindow {
   // The in-bar center island the pill grows from and returns to.
   required property Rectangle anchorItem
 
-  readonly property bool onThisScreen: bar.islandItem !== null && screen
-    && bar.islandScreen === String(screen.name || "")
+  // The bar window's output. Reading this window's own `screen` here loops:
+  // mapping the window re-announces it.
+  required property string screenName
+  readonly property bool onThisScreen: bar.islandItem !== null && screenName !== ""
+    && bar.islandScreen === screenName
   readonly property bool wanted: onThisScreen && bar.islandEnabled && !bar.barHidden && !bar.vertical
     && anchorItem.visible
   // `open` drives the morph; `mapped` keeps the surface up until the pill has
@@ -30,7 +33,7 @@ PanelWindow {
   readonly property real collapsedWidth: Math.max(1, anchorItem.width)
   readonly property real collapsedHeight: Math.max(1, anchorItem.height)
   readonly property real expandedWidth: Math.max(collapsedWidth,
-    Math.min(Style.space(460), (screen ? screen.width : Style.space(460)) - Style.space(40)))
+    Math.min(Style.space(460), anchorItem.parent.width - Style.space(40)))
   readonly property real expandedHeight: Math.max(collapsedHeight, Style.space(60))
   // Where the clock island sits inside the bar surface.
   readonly property real anchorOffset: Math.max(0, (bar.barSize - collapsedHeight) / 2)
@@ -56,7 +59,25 @@ PanelWindow {
   Timer {
     id: collapseDone
     interval: Style.duration(160) + 40
-    onTriggered: if (!island.open) { island.mapped = false; island.item = null }
+    onTriggered: if (!island.open) {
+      // An unmapped surface may never send a pointer leave.
+      island.bar.setIslandHovered(island, false)
+      island.mapped = false
+      island.item = null
+    }
+  }
+
+  // A pill that appears under the pointer must not take a click meant for
+  // whatever was there a moment ago.
+  property bool clickable: false
+  onOpenChanged: {
+    clickable = false
+    if (open) clickArm.restart()
+  }
+  Timer {
+    id: clickArm
+    interval: 400
+    onTriggered: island.clickable = island.open
   }
 
   visible: mapped
@@ -115,7 +136,7 @@ PanelWindow {
       onContainsMouseChanged: island.bar.setIslandHovered(island, containsMouse)
       Component.onDestruction: island.bar.setIslandHovered(island, false)
       onClicked: function(mouse) {
-        if (!island.item) return
+        if (!island.item || !island.clickable) return
         if (mouse.button === Qt.LeftButton) island.bar.activateIsland(island.item.key)
         else island.bar.closeIsland()
       }

@@ -101,6 +101,12 @@ function newestKey(rows) {
   return rows.length ? rows[rows.length - 1].key : ""
 }
 
+// Whether "invoke the newest toast" would reach the island's row: it is the
+// snapshot's newest, and the host shows exactly the rows the snapshot holds.
+function mayActivate(rows, key, hostCount) {
+  return !!key && newestKey(rows) === key && hostCount === rows.length
+}
+
 // How long the island stays open. Critical waits longer, but the host's own
 // toast is what keeps a critical notification on screen.
 function holdMs(urgency) {

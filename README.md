@@ -7,6 +7,7 @@ A floating-island status bar for Omarchy, retaining its theme integration and
 widgets while remapping surfaces safely after monitor layout/scale changes.
 New notifications briefly expand the center clock island ("dynamic island"),
 alongside Omarchy's own toasts; see [the notification island](docs/dicey-bar.md#notification-island).
+The island needs Omarchy 4.5 or later; on older hosts it simply never appears.
 
 An independent Omarchy plugin repository. The plugin ID is **`dicey.bar`**;
 no other Dicey repository, installer, or synchronization service is required.

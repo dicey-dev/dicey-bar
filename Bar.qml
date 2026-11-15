@@ -349,6 +349,7 @@ Item {
   property int islandSerial: 0
   property var islandSeen: null
   property string islandActivateKey: ""
+  property int islandHostCount: -1
   property var islandHovered: []
 
   onIslandEnabledChanged: {
@@ -356,13 +357,20 @@ Item {
     if (!islandEnabled) closeIsland()
   }
 
+  // `text` is null when the snapshot could not be read: keep what was seen,
+  // so the next good read does not treat recent rows as new again.
   function readNotificationSnapshot(text) {
-    var rows = IslandModel.parseLive(text)
     var activate = islandActivateKey
+    var hostCount = islandHostCount
     islandActivateKey = ""
-    // invokeLast targets whichever toast is newest when it runs. Only ask for
-    // it while the snapshot still says the island's row is that toast.
-    if (activate && IslandModel.newestKey(rows) === activate)
+    islandHostCount = -1
+    if (text === null) return
+    var rows = IslandModel.parseLive(text)
+    // invokeLast targets whichever toast is newest on screen when it runs.
+    // The snapshot omits transient toasts and still lists held or leaving
+    // ones, so ask only when it agrees with the host's own toast count and
+    // its newest row is the island's; otherwise the click just closes.
+    if (IslandModel.mayActivate(rows, activate, hostCount))
       Util.execArgv(["omarchy-shell", "notifications", "invokeLast"])
     var result = IslandModel.arrivals(islandSeen, rows, Date.now() / 1000)
     islandSeen = result.seen
@@ -386,9 +394,21 @@ Item {
 
   function activateIsland(key) {
     closeIsland()
-    if (!key) return
+    if (!key || islandCount.running) return
     islandActivateKey = key
-    notificationSnapshot.reload()
+    islandHostCount = -1
+    islandCount.running = true
+  }
+
+  Process {
+    id: islandCount
+    command: ["omarchy-shell", "notifications", "count"]
+    stdout: StdioCollector { id: islandCountOutput }
+    onExited: function(code) {
+      var out = String(islandCountOutput.text || "").trim()
+      root.islandHostCount = code === 0 && /^[0-9]{1,4}$/.test(out) ? Number(out) : -1
+      notificationSnapshot.reload()
+    }
   }
 
   function setIslandHovered(window, hovered) {
@@ -414,7 +434,7 @@ Item {
     printErrors: false
     onFileChanged: reload()
     onLoaded: root.readNotificationSnapshot(text())
-    onLoadFailed: root.readNotificationSnapshot("")
+    onLoadFailed: root.readNotificationSnapshot(null)
   }
 
   readonly property bool vertical: position === "left" || position === "right"
@@ -1258,6 +1278,7 @@ Item {
           bar: root
           anchorItem: centerIsland
           screen: barWindow.screen
+          screenName: barWindow.screen ? String(barWindow.screen.name || "") : ""
         }
 
         Rectangle {

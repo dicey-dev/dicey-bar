@@ -17,7 +17,8 @@ tests/run.sh
 
 The bump command updates the manifest, adds a dated changelog section below
 `[Unreleased]` and writes `docs/releases/vX.Y.Z.md`; move the Unreleased entries
-into that section and expand the release notes before committing. `check` fails
+into that section, update the `[Unreleased]` and `[X.Y.Z]` compare links at
+the bottom of the changelog, and expand the release notes before committing. `check` fails
 when a released version has no release-notes file. It does not commit, publish,
 modify an installed copy, or create a tag. Review the
 diff and checks, merge the release PR, then tag that exact tested main commit

@@ -88,6 +88,18 @@ TestCase {
         compare(IslandModel.detail(rows[0]), "Body")
     }
 
+    function test_activation_needs_newest_row_and_matching_host_count() {
+        var rows = IslandModel.parseLive(JSON.stringify([entry("n1", 1), entry("n2", 2)]))
+        verify(IslandModel.mayActivate(rows, "n2", 2))
+        // A newer row, or a toast the snapshot does not hold (transient), or a
+        // held/leaving row the host does not count: the click only closes.
+        verify(!IslandModel.mayActivate(rows, "n1", 2))
+        verify(!IslandModel.mayActivate(rows, "n2", 3))
+        verify(!IslandModel.mayActivate(rows, "n2", 1))
+        verify(!IslandModel.mayActivate(rows, "n2", -1))
+        verify(!IslandModel.mayActivate(rows, "", 2))
+    }
+
     function test_hold_and_icons() {
         verify(IslandModel.holdMs(2) > IslandModel.holdMs(1))
         verify(IslandModel.holdMs(1) > IslandModel.holdMs(0))

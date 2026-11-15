@@ -31,14 +31,20 @@ stays open while hovered.
 
 - **Left click** runs the notification's default action through the host's
   public `notifications invokeLast` IPC, exactly as clicking its toast would.
-  That IPC targets whichever toast is newest when it runs, so the bar first
-  re-reads the snapshot and only invokes it while the island's notification is
-  still the newest. Otherwise the click only closes the island. A notification
-  that reaches the host within about a quarter second of the click, before the
-  host writes its snapshot, can still be the one activated.
+  That IPC targets whichever toast is newest on screen when it runs, and the
+  snapshot is not the screen: it omits transient toasts and still lists toasts
+  that are held back or leaving. So the bar asks the host's public
+  `notifications count` and re-reads the snapshot, and invokes only when the
+  counts agree and the island's notification is the snapshot's newest.
+  Otherwise the click only closes the island. A notification that reaches the
+  host within about a quarter second of the click, before the host writes its
+  snapshot, can still be the one activated. Clicks in the first 0.4 seconds
+  after the pill opens are ignored, so a click aimed at what was under it does
+  not run an action.
 - **Right or middle click** closes the island. The host toast is untouched.
 - Turn it off with `"notificationIsland": false` in the `bar` section of
-  `~/.config/omarchy/shell.json` (hot-reloads). Horizontal bars only.
+  `~/.config/omarchy/shell.json` (hot-reloads). Horizontal bars only; it does
+  not show while the bar is hidden. Needs Omarchy 4.5's notification snapshot.
 
 ### Host boundary
 
