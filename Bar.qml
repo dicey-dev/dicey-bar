@@ -7,6 +7,7 @@ import QtQuick.Layouts
 import qs.Commons
 import qs.Ui
 import "BarModel.js" as BarModel
+import "NotificationIslandModel.js" as IslandModel
 
 Item {
   id: root
@@ -336,6 +337,84 @@ Item {
 
   function releasePopout(owner) {
     if (activePopout === owner) activePopout = null
+  }
+
+  // Notification island. The host's notification service stays the only
+  // notification server; the island reads its popup snapshot read-only and
+  // never hides, dismisses or silences host toasts. `bar.notificationIsland:
+  // false` in shell.json turns it off.
+  readonly property bool islandEnabled: !(Util.isPlainObject(barConfig) && barConfig.notificationIsland === false)
+  property var islandItem: null
+  property string islandScreen: ""
+  property int islandSerial: 0
+  property var islandSeen: null
+  property string islandActivateKey: ""
+  property var islandHovered: []
+
+  onIslandEnabledChanged: {
+    islandSeen = null
+    if (!islandEnabled) closeIsland()
+  }
+
+  function readNotificationSnapshot(text) {
+    var rows = IslandModel.parseLive(text)
+    var activate = islandActivateKey
+    islandActivateKey = ""
+    // invokeLast targets whichever toast is newest when it runs. Only ask for
+    // it while the snapshot still says the island's row is that toast.
+    if (activate && IslandModel.newestKey(rows) === activate)
+      Util.execArgv(["omarchy-shell", "notifications", "invokeLast"])
+    var result = IslandModel.arrivals(islandSeen, rows, Date.now() / 1000)
+    islandSeen = result.seen
+    if (result.show) openIsland(result.show)
+  }
+
+  function openIsland(item) {
+    var screenName = focusedScreenName()
+    if (!screenName && Quickshell.screens.length) screenName = String(Quickshell.screens[0].name || "")
+    islandScreen = screenName
+    islandItem = item
+    islandSerial++
+    islandHold.interval = IslandModel.holdMs(item.urgency)
+    islandHold.restart()
+  }
+
+  function closeIsland() {
+    islandHold.stop()
+    islandItem = null
+  }
+
+  function activateIsland(key) {
+    closeIsland()
+    if (!key) return
+    islandActivateKey = key
+    notificationSnapshot.reload()
+  }
+
+  function setIslandHovered(window, hovered) {
+    var next = islandHovered.filter(function(other) { return other !== window })
+    if (hovered) next.push(window)
+    islandHovered = next
+    // Leaving the pill gives a short grace before it closes.
+    if (!hovered && next.length === 0 && islandItem && !islandHold.running) {
+      islandHold.interval = 1500
+      islandHold.restart()
+    }
+  }
+
+  Timer {
+    id: islandHold
+    onTriggered: if (root.islandHovered.length === 0) root.closeIsland()
+  }
+
+  FileView {
+    id: notificationSnapshot
+    path: root.islandEnabled ? root.stateHome + "/omarchy/notifications/live.json" : ""
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.readNotificationSnapshot(text())
+    onLoadFailed: root.readNotificationSnapshot("")
   }
 
   readonly property bool vertical: position === "left" || position === "right"
@@ -1167,7 +1246,18 @@ Item {
           IslandCenterModules {
             id: centerModules
             anchors.centerIn: parent
+            opacity: notificationIsland.open ? 0 : 1
+            Behavior on opacity {
+              NumberAnimation { duration: Style.duration(120); easing.type: Easing.OutCubic }
+            }
           }
+        }
+
+        NotificationIsland {
+          id: notificationIsland
+          bar: root
+          anchorItem: centerIsland
+          screen: barWindow.screen
         }
 
         Rectangle {

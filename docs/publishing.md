@@ -15,8 +15,11 @@ python3 scripts/version.py patch "Describe the compatible fix."
 tests/run.sh
 ```
 
-The bump command updates the manifest and prepends a dated changelog entry. It
-does not commit, publish, modify an installed copy, or create a tag. Review the
+The bump command updates the manifest, adds a dated changelog section below
+`[Unreleased]` and writes `docs/releases/vX.Y.Z.md`; move the Unreleased entries
+into that section and expand the release notes before committing. `check` fails
+when a released version has no release-notes file. It does not commit, publish,
+modify an installed copy, or create a tag. Review the
 diff and checks, merge the release PR, then tag that exact tested main commit
 `vX.Y.Z` and publish matching GitHub release notes. Never reuse or move a
 published version tag; release another patch instead.
