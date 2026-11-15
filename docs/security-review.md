@@ -33,8 +33,8 @@ not evidence that code is safe.
 The publication-readiness pass adds the complete upstream MIT notice, explicit
 Apache/MIT distribution metadata, SemVer/changelog checks and repeatable official
 install/update/remove filesystem tests. System QML lint and native development
-activation/reload/restore checks were run on Omarchy 4.0.6 / Qt 6.12 / Quickshell
-0.3.2. Existing lint warnings are not suppressed; a clean-VM or broader-version
+activation/reload/restore checks were run on Omarchy 4.0.6 and re-run on 4.5.0
+(Qt 6.12 / Quickshell 0.3.2). Existing lint warnings are not suppressed; a clean-VM or broader-version
 certification is not claimed. See [publishing evidence](publishing.md).
 
 The dev tool writes only its marked `.dev` plugin, retains recovery state on

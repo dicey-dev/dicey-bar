@@ -5,8 +5,12 @@
 `manifest.json` is the single version source of truth. Dicey Bar is alpha
 software and uses `0.x.y` versions, currently **0.1.0**. Use minor increments for
 alpha feature/API changes and patch increments for fixes; 1.0 requires an
-explicit stability decision. The plugin ID stays `dicey.bar`; changing it would
-create a different installation/listing.
+explicit stability decision, so `scripts/version.py major` refuses a 0.x
+version unless `--stable` is also passed (`--stable` is rejected for any other
+bump). The plugin ID stays `dicey.bar`; changing it would create a different
+installation/listing. The `widgets/*.manifest.json` files keep the upstream
+`omarchy.*` widget IDs and versions (`1.0.0`); they are not Dicey release
+numbers.
 
 ```bash
 python3 scripts/version.py check
@@ -61,7 +65,8 @@ deliberately re-clone/migrate if needed rather than force-resetting them. This
 one-time correction is not permission to move future published tags.
 
 References: [development guide](https://plugins.omarchy.org/develop.html),
-[runtime contract](https://github.com/omacom/omarchy/blob/quattro/shell/README.md),
+[runtime contract](https://github.com/omacom/omarchy/blob/quattro/shell/README.md)
+and its [shell reference](https://github.com/omacom/omarchy/blob/quattro/docs/omarchy-shell.md),
 [publishing guide](https://plugins.omarchy.org/publish.html).
 
 - Public, single-plugin repository with root manifest, README and licenses.
@@ -72,6 +77,16 @@ References: [development guide](https://plugins.omarchy.org/develop.html),
   and the complete MIT notice are preserved separately. `clonedFrom` is retained
   deliberately for supported replacement/restore semantics; the tutorial's
   clock-only development cleanup is not applied blindly to a full replacement.
+  This knowingly differs from the development guide, which says to remove the
+  clone-only field before publishing: for a bar, Omarchy's loader uses it to
+  route `omarchy.bar` calls to the active clone and to restore the stock bar
+  when the clone is disabled. `omarchy.bar` declares no host capabilities, so
+  nothing extra is inherited. Mention this in the submission notes.
+- The loader reads only the root `manifest.json` of a third-party plugin. The
+  bundled `widgets/*.manifest.json` files are upstream reference metadata with
+  `omarchy.*` IDs; they are not registered and are not Dicey plugin IDs.
+- QML qualifies the palette as `Commons.Color`, as the shell reference requires
+  for Qt 6.12 (a bare `Color` resolves to Qt's own type).
 - Dependencies, command execution, permissions, install/update/removal and
   development isolation limits are documented. No privileged setup/remote build.
 - `tests/run.sh`, manifest validation and system `qmllint` run before release.
@@ -79,8 +94,10 @@ References: [development guide](https://plugins.omarchy.org/develop.html),
   temporary HOME with local Git and **stubbed desktop IPC**. It is not a VM test.
 - Native `.dev` testing covers activation, edits, invalid-update rejection,
   restoration/removal and production-file preservation. Offscreen Qt tests
-  cover monitor-style hide/show remapping. The supported host is Omarchy 4.0.6,
-  Qt 6.12, Quickshell 0.3.2; untested versions are not claimed compatible.
+  cover monitor-style hide/show remapping. The supported hosts are Omarchy 4.0.6
+  and 4.5.0, Qt 6.12, Quickshell 0.3.2; untested versions are not claimed
+  compatible. On 4.5.0, validation, tests, the install check and native `.dev`
+  activation/restore were re-run, with the live bar rendering without errors.
 
 An optional preview is not required; no user desktop screenshot is distributed.
 The marketplace will use its fallback image. Validation/security scanning never
@@ -93,6 +110,8 @@ means certification, and the marketplace maintainer still decides approval.
 - Tags: `bar`, `quickshell`, `hyprland`
 - Notes: Floating-island full bar replacement; see README for compatibility,
   trusted custom-command behavior and stock-bar rollback. No build or installer.
+  Keeps `omarchy.clonedFrom: omarchy.bar` on purpose for clone routing and
+  stock-bar restore (see Guide compliance).
 
 Open the [submission form](https://github.com/omacom/omarchy-plugin-marketplace/issues/new?template=submit-plugin.yml).
 The owner confirms permission/ownership and all submission checklist statements.
