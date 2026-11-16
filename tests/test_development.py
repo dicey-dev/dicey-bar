@@ -30,6 +30,31 @@ class DevelopmentTest(unittest.TestCase):
                 dev.main()
             self.assertFalse(journal.exists())
 
+    def test_state_directory_others_can_plant_entries_in_is_refused(self):
+        # Another account must not be able to redirect the lock or journal writes.
+        for shared in ("writable", "symlinked"):
+            with self.subTest(shared), tempfile.TemporaryDirectory() as directory:
+                victim = Path(directory) / "private.txt"
+                victim.write_text("keep\n")
+                planted = Path(directory) / "planted"
+                planted.mkdir()
+                planted.chmod(0o777)
+                for name in (PLUGIN_ID + ".lock", PLUGIN_ID + ".json"):
+                    (planted / name).symlink_to(victim)
+                state = Path(directory) / "omarchy/development"
+                state.parent.mkdir()
+                if shared == "writable":
+                    planted.rename(state)
+                else:
+                    state.symlink_to(planted)
+                with patch.dict(os.environ, {"XDG_STATE_HOME": directory, "XDG_CONFIG_HOME": directory}), \
+                     patch.object(sys, "argv", ["dev.py", "restore"]), patch.object(dev, "listed", return_value=[]), \
+                     patch.object(dev, "command") as command, patch.object(dev, "rescan_until"):
+                    with self.assertRaisesRegex(ValueError, "not private"):
+                        dev.main()
+                self.assertEqual(victim.read_text(), "keep\n")
+                command.assert_not_called()
+
     def test_runtime_snapshot_excludes_tooling_and_scopes_development_id(self):
         files = dev.snapshot(ROOT)
         self.assertFalse(any(set(path.parts) & dev.EXCLUDED for path in files))

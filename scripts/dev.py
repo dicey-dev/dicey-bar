@@ -118,6 +118,21 @@ def restore(journal, plugins, plugin_id):
     print(f"Restored {previous}; production files were not modified.", flush=True)
 
 
+def open_state(path):
+    """Open the state directory only if no other account can plant entries in it."""
+    refusal = f"Refusing a development state directory that is not private to you: {path}"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        raise ValueError(refusal) from None
+    info = os.fstat(fd)
+    if info.st_uid != os.getuid() or info.st_mode & 0o022:
+        os.close(fd)
+        raise ValueError(refusal)
+    return fd
+
+
 def interrupted(_signum, _frame):
     raise KeyboardInterrupt
 
@@ -131,9 +146,12 @@ def main():
     kind = KIND
     plugins = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy/plugins"
     state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy/development"
-    state.mkdir(parents=True, exist_ok=True)
-    journal = state / (plugin_id + ".json")
-    with (state / (plugin_id + ".lock")).open("w") as lock:
+    state_fd = open_state(state)  # Kept open for the process lifetime.
+    # Use the verified directory itself, so a swapped path cannot redirect writes.
+    journal = Path(f"/proc/self/fd/{state_fd}") / (plugin_id + ".json")
+    lock_fd = os.open(plugin_id + ".lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
+                      dir_fd=state_fd)
+    with os.fdopen(lock_fd, "w") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
