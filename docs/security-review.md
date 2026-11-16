@@ -38,7 +38,9 @@ activation/reload/restore checks were run on Omarchy 4.0.6 and re-run on 4.5.0
 certification is not claimed. See [publishing evidence](publishing.md).
 
 The dev tool writes only its marked `.dev` plugin, retains recovery state on
-failed restoration and does not modify production source files. Version tooling
+failed restoration and does not modify production source files. It keeps that
+state only in a directory no other account can plant entries in, so a planted
+symlink cannot redirect its lock or journal writes. Version tooling
 only edits the checkout's manifest/changelog; it does not publish or install.
 Replacement bars retain the host's limited third-party service integration.
 Install only trusted plugins: all plugin code runs with the user's permissions.

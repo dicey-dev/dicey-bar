@@ -76,8 +76,10 @@ discarded every cached dependency. Do not restart automatically on each save.
 
 The journal is retained if restoration fails, so it can be retried after the
 shell is healthy. Its path is `$XDG_STATE_HOME/omarchy/development/dicey.bar.json`
-(default `~/.local/state/omarchy/development/dicey.bar.json`). Unmanaged folders
-using the development ID are not overwritten. New runtime asset formats should
+(default `~/.local/state/omarchy/development/dicey.bar.json`). That directory
+must be private to you: the tool refuses to run if it is a symlink, owned by
+another account, or writable by group/others, and never follows a symlink when
+creating its lock. Unmanaged folders using the development ID are not overwritten. New runtime asset formats should
 be added deliberately to the tool's file selection.
 
 Stop/disable any pre-existing external auto-deployer before adopting this
