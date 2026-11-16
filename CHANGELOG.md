@@ -26,6 +26,11 @@ matching `vX.Y.Z` tags.
 - Release notes for every version under `docs/releases/`, written and checked
   by `scripts/version.py`.
 
+### Fixed
+
+- `scripts/dev.py` no longer gives up with "omarchy-shell is not responding"
+  while the shell reloads plugins or restarts. Shell calls wait up to 60s.
+
 ### Known limitations
 
 - Omarchy's own notification toasts still appear alongside the island.
