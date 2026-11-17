@@ -114,6 +114,30 @@ class DevelopmentTest(unittest.TestCase):
             self.assertFalse((Path(env["XDG_CONFIG_HOME"]) / "omarchy/plugins" / (PLUGIN_ID + ".dev")).exists())
             self.assertFalse((Path(env["XDG_STATE_HOME"]) / "omarchy/development" / (PLUGIN_ID + ".json")).exists())
 
+    def test_command_waits_for_a_busy_shell(self):
+        busy = subprocess.CalledProcessError(1, "enable", stderr="error: omarchy-shell is not responding\n")
+        done = subprocess.CompletedProcess("enable", 0, stdout="ok\n")
+        with patch.object(dev.subprocess, "run", side_effect=[busy, busy, done]) as run, \
+             patch.object(dev.time, "sleep"):
+            self.assertEqual(dev.command("omarchy", "plugin", "enable", PLUGIN_ID), "ok")
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_args.kwargs["env"]["OMARCHY_SHELL_IPC_TIMEOUT"], dev.SHELL_TIMEOUT)
+
+    def test_command_does_not_retry_real_failures(self):
+        failure = subprocess.CalledProcessError(1, "validate", stderr="manifest.json: invalid\n")
+        with patch.object(dev.subprocess, "run", side_effect=failure) as run:
+            with self.assertRaises(subprocess.CalledProcessError):
+                dev.command("omarchy", "plugin", "validate", "x")
+        self.assertEqual(run.call_count, 1)
+
+    def test_command_gives_up_on_a_shell_that_stays_down(self):
+        busy = subprocess.CalledProcessError(1, "list", stderr="omarchy-shell is not running\n")
+        clock = iter(range(0, 1000, 30))
+        with patch.object(dev.subprocess, "run", side_effect=busy), patch.object(dev.time, "sleep"), \
+             patch.object(dev.time, "monotonic", side_effect=lambda: next(clock)):
+            with self.assertRaises(subprocess.CalledProcessError):
+                dev.command("omarchy", "plugin", "list", "--json")
+
     def test_failed_restore_keeps_recovery_journal(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = Path(directory) / "session.json"

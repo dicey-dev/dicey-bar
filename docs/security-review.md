@@ -49,3 +49,13 @@ symlink cannot redirect its lock or journal writes. Version tooling
 only edits the checkout's manifest/changelog; it does not publish or install.
 Replacement bars retain the host's limited third-party service integration.
 Install only trusted plugins: all plugin code runs with the user's permissions.
+
+## Notification island (unreleased)
+
+The island reads the host's `live.json` popup snapshot read-only, bounded to
+4 MB and 100 rows. It validates keys and icon names, strips control and
+bidi-override characters, and draws sender text with `Text.PlainText` only.
+Sender image paths and links are not used. The only command is the fixed argv
+`omarchy-shell notifications invokeLast` on a left click, gated on the
+snapshot's newest row. No DND, host-file edits, layer-rule tricks or second
+notification server are involved.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the release version or bump manifest/changelog together; never publish."""
+"""Check the release version or bump manifest/changelog/release notes together; never publish."""
 import argparse
 from datetime import date
 import json
@@ -35,20 +35,33 @@ def main():
         parser.error("0.x is alpha: a major bump to 1.0.0 needs an explicit stability decision; "
                      "pass --stable only with that major bump")
     changelog = changelog_path.read_text()
-    if not changelog.split("\n## [", 1)[-1].startswith(current + "]"):
+    releases = re.findall(r"^## \[(\d+\.\d+\.\d+)\]", changelog, re.MULTILINE)
+    if not releases or releases[0] != current:
         parser.error("The first changelog release must match manifest.json")
     if args.action == "check":
-        print(f"{manifest['id']} {current} (tag v{current})")
+        missing = [v for v in releases if not (ROOT / "docs/releases" / f"v{v}.md").is_file()]
+        if missing:
+            parser.error("Missing release notes: " + ", ".join(f"docs/releases/v{v}.md" for v in missing))
+        status = "unreleased development; last release " if "\n## [Unreleased]" in changelog else "release "
+        print(f"{manifest['id']} {current} ({status}v{current})")
         return
     if not args.note or "\n" in args.note or "\r" in args.note:
         parser.error("Provide one single-line release-note sentence")
     version = bumped(current, args.action)
-    heading = changelog.index("\n## [")
+    # A new release goes below [Unreleased], above the previous release.
+    heading = re.search(r"^## \[\d+\.\d+\.\d+\]", changelog, re.MULTILINE).start() - 1
     updated = changelog[:heading] + f"\n## [{version}] - {date.today().isoformat()}\n\n- {args.note}\n" + changelog[heading:]
+    notes = ROOT / "docs/releases" / f"v{version}.md"
+    if notes.exists():
+        parser.error(f"{notes.relative_to(ROOT)} already exists")
     manifest["version"] = version
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     changelog_path.write_text(updated)
-    print(f"{current} -> {version}; review, test and commit before tagging v{version}.")
+    notes.parent.mkdir(parents=True, exist_ok=True)
+    notes.write_text(f"# {manifest.get('name', manifest['id'])} v{version}\n\nReleased {date.today().isoformat()}.\n\n"
+                     f"## Highlights\n\n- {args.note}\n\n"
+                     "<!-- Expand from CHANGELOG.md [Unreleased]: user-visible changes, upgrade notes, known limitations. -->\n")
+    print(f"{current} -> {version}; edit {notes.relative_to(ROOT)}, review, test and commit before tagging v{version}.")
 
 
 if __name__ == "__main__":

@@ -69,6 +69,12 @@ while this command is active. After a terminal/shell failure or SIGKILL, run:
 scripts/dev.py restore
 ```
 
+Every save reloads all of the shell's plugins, and the shell can stop answering
+IPC for a few seconds while it does, or while `omarchy restart shell` runs. Shell
+calls therefore get a 10s timeout and are retried for up to 60s. If restore still
+reports `omarchy-shell is not responding`, the journal is kept: run it again once
+the shell is back.
+
 If an imported JS module or cached QML component remains stale after a rescan,
 use an explicit `omarchy restart shell` before final runtime verification. A
 successful file deployment alone does not prove that the current engine has

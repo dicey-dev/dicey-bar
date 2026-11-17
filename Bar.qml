@@ -8,6 +8,7 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 import "BarModel.js" as BarModel
+import "NotificationIslandModel.js" as IslandModel
 
 Item {
   id: root
@@ -337,6 +338,119 @@ Item {
 
   function releasePopout(owner) {
     if (activePopout === owner) activePopout = null
+  }
+
+  // Notification island. The host's notification service stays the only
+  // notification server; the island reads its popup snapshot read-only and
+  // never hides, dismisses or silences host toasts. `bar.notificationIsland:
+  // false` in shell.json turns it off.
+  readonly property bool islandEnabled: !(Util.isPlainObject(barConfig) && barConfig.notificationIsland === false)
+  property var islandItem: null
+  // Newest first; islandItem is its head. islandArrivals counts every
+  // notification since the island opened, including any past the stack.
+  property var islandStack: []
+  property int islandArrivals: 0
+  property string islandScreen: ""
+  property int islandSerial: 0
+  property var islandSeen: null
+  property string islandActivateKey: ""
+  property int islandHostCount: -1
+  property var islandHovered: []
+
+  onIslandEnabledChanged: {
+    islandSeen = null
+    islandActivateKey = ""
+    if (!islandEnabled) closeIsland()
+  }
+
+  // `text` is null when the snapshot could not be read: keep what was seen,
+  // so the next good read does not treat recent rows as new again.
+  function readNotificationSnapshot(text) {
+    var activate = islandActivateKey
+    var hostCount = islandHostCount
+    islandActivateKey = ""
+    islandHostCount = -1
+    if (text === null) return
+    var rows = IslandModel.parseLive(text)
+    // invokeLast targets whichever toast is newest on screen when it runs.
+    // The snapshot omits transient toasts and still lists held or leaving
+    // ones, so ask only when it agrees with the host's own toast count and
+    // its newest row is the island's; otherwise the click just closes.
+    if (IslandModel.mayActivate(rows, activate, hostCount))
+      Util.execArgv(["omarchy-shell", "notifications", "invokeLast"])
+    var result = IslandModel.arrivals(islandSeen, rows, Date.now() / 1000)
+    islandSeen = result.seen
+    if (result.show) openIsland(result.fresh)
+  }
+
+  // `fresh` is oldest first; the newest goes on top of the open stack.
+  function openIsland(fresh) {
+    var item = fresh[fresh.length - 1]
+    if (!islandItem) {
+      var screenName = focusedScreenName()
+      if (!screenName && Quickshell.screens.length) screenName = String(Quickshell.screens[0].name || "")
+      islandScreen = screenName
+      islandStack = []
+      islandArrivals = 0
+    }
+    islandStack = IslandModel.stacked(islandStack, fresh)
+    islandArrivals += fresh.length
+    islandItem = item
+    islandSerial++
+    islandHold.interval = IslandModel.holdMs(item.urgency)
+    islandHold.restart()
+  }
+
+  function closeIsland() {
+    islandHold.stop()
+    islandItem = null
+    islandStack = []
+    islandArrivals = 0
+  }
+
+  function activateIsland(key) {
+    closeIsland()
+    if (!key || islandCount.running) return
+    islandActivateKey = key
+    islandHostCount = -1
+    islandCount.running = true
+  }
+
+  Process {
+    id: islandCount
+    command: ["omarchy-shell", "notifications", "count"]
+    stdout: StdioCollector { id: islandCountOutput }
+    onExited: function(code) {
+      var out = String(islandCountOutput.text || "").trim()
+      root.islandHostCount = code === 0 && /^[0-9]{1,4}$/.test(out) ? Number(out) : -1
+      notificationSnapshot.reload()
+    }
+  }
+
+  function setIslandHovered(window, hovered) {
+    var next = islandHovered.filter(function(other) { return other !== window })
+    if (hovered) next.push(window)
+    islandHovered = next
+    // Leaving the pill gives a short grace before it closes.
+    if (!hovered && next.length === 0 && islandItem && !islandHold.running) {
+      islandHold.interval = 1500
+      islandHold.restart()
+    }
+  }
+
+  Timer {
+    id: islandHold
+    onTriggered: if (root.islandHovered.length === 0) root.closeIsland()
+  }
+
+  FileView {
+    id: notificationSnapshot
+    path: root.islandEnabled ? root.stateHome + "/omarchy/notifications/live.json" : ""
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.readNotificationSnapshot(text())
+    onLoadFailed: root.readNotificationSnapshot(null)
   }
 
   readonly property bool vertical: position === "left" || position === "right"
@@ -1169,7 +1283,19 @@ Item {
           IslandCenterModules {
             id: centerModules
             anchors.centerIn: parent
+            opacity: notificationIsland.open ? 0 : 1
+            Behavior on opacity {
+              NumberAnimation { duration: Style.duration(120); easing.type: Easing.OutCubic }
+            }
           }
+        }
+
+        NotificationIsland {
+          id: notificationIsland
+          bar: root
+          anchorItem: centerIsland
+          screen: barWindow.screen
+          screenName: barWindow.screen ? String(barWindow.screen.name || "") : ""
         }
 
         Rectangle {

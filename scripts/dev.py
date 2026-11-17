@@ -17,10 +17,30 @@ KIND = "bar"
 EXCLUDED = {".git", ".dev", ".venv", ".serena", ".opencode", "__pycache__",
             "docs", "tests", "scripts", "mockups", "preview", "node_modules"}
 MARKER = ".dicey-development"
+# A plugin reload or `omarchy restart shell` can keep the shell from answering
+# for longer than omarchy-shell's 2s default, so give it more time.
+SHELL_TIMEOUT = "10s"
+SHELL_WAIT = 60
+SHELL_BUSY = ("omarchy-shell is not responding", "omarchy-shell is not ready",
+              "omarchy-shell is not running")
 
 
 def command(*args):
-    return subprocess.run(args, check=True, capture_output=True, text=True, timeout=30).stdout.strip()
+    """Run a command, retrying while the shell is reloading or restarting.
+
+    Retrying is safe because every shell call here is idempotent: listing,
+    rescanning, and enabling or disabling a plugin.
+    """
+    env = {**os.environ, "OMARCHY_SHELL_IPC_TIMEOUT": SHELL_TIMEOUT}
+    deadline = time.monotonic() + SHELL_WAIT
+    while True:
+        try:
+            return subprocess.run(args, check=True, capture_output=True, text=True,
+                                  timeout=30, env=env).stdout.strip()
+        except subprocess.CalledProcessError as error:
+            if not any(busy in (error.stderr or "") for busy in SHELL_BUSY) or time.monotonic() >= deadline:
+                raise
+        time.sleep(0.5)
 
 
 def snapshot(root):
