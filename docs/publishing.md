@@ -3,7 +3,7 @@
 ## Versioning
 
 `manifest.json` is the single version source of truth. Dicey Bar is alpha
-software and uses `0.x.y` versions, currently **0.1.0**. Use minor increments for
+software and uses `0.x.y` versions, currently **0.1.1**. Use minor increments for
 alpha feature/API changes and patch increments for fixes; 1.0 requires an
 explicit stability decision, so `scripts/version.py major` refuses a 0.x
 version unless `--stable` is also passed (`--stable` is rejected for any other
