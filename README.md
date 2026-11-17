@@ -1,6 +1,6 @@
 # Dicey Bar
 
-**Alpha software (0.x).** The current release is **v0.1.0**. Expect rough edges
+**Alpha software (0.x).** The current release is **v0.1.1**. Expect rough edges
 and possible compatibility changes; validation is not a stability guarantee.
 
 A floating-island status bar for Omarchy, retaining its theme integration and
