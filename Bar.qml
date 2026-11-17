@@ -1115,6 +1115,7 @@ Item {
         radius: Style.cornerRadius
 
         Text {
+          textFormat: Text.PlainText
           id: tooltipLabel
           anchors.centerIn: parent
           text: root.tooltipText

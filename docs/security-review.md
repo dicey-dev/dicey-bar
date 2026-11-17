@@ -15,6 +15,11 @@ review, not an independent security audit or a sandbox guarantee.
 - No installer, privileged command, download-to-shell pipeline, or embedded
   credential was identified in the imported runtime. Tooltips and widget content
   remain part of the shared, unsandboxed QML environment.
+- Every text item renders `Text.PlainText`, as the upstream bar's tooltip does.
+  Tray titles and tooltips, tray menus, window titles and command output come
+  from other programs; Qt's default `AutoText` would render their markup, so an
+  `<img src="http://...">` in a tray title could make the shell issue a request.
+  `tests/test_plain_text.py` fails on any text item that omits the plain format.
 - Tests write only temporary fixtures and invoke QtTest with the offscreen
   software backend. They do not manipulate the active bar.
 - Git metadata, environment secrets, local agent state, and generated Python
