@@ -411,6 +411,7 @@ BarWidget {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: "Tray icons"
         color: root.foreground
         font.family: root.fontFamily
@@ -419,6 +420,7 @@ BarWidget {
       }
 
       Text {
+        textFormat: Text.PlainText
         text: "Pinned icons stay visible. Hidden icons never show."
         color: Qt.darker(root.foreground, 1.4)
         font.family: root.fontFamily
@@ -428,6 +430,7 @@ BarWidget {
       }
 
       Text {
+        textFormat: Text.PlainText
         visible: root.allItems.length === 0
         text: "No tray items reporting."
         color: Qt.darker(root.foreground, 1.5)
@@ -468,6 +471,7 @@ BarWidget {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.verticalCenter: parent.verticalCenter
             anchors.left: rowIcon.right
             anchors.leftMargin: Style.space(10)
@@ -567,6 +571,7 @@ BarWidget {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.verticalCenter: parent.verticalCenter
             anchors.left: parent.left
             width: Style.space(22)
@@ -578,6 +583,7 @@ BarWidget {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.verticalCenter: parent.verticalCenter
             anchors.left: parent.left
             anchors.leftMargin: Style.space(28)
@@ -682,6 +688,7 @@ BarWidget {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: !menuRow.modelData.isSeparator && menuRow.modelData.buttonType !== QsMenuButtonType.None
                 anchors.verticalCenter: parent.verticalCenter
                 anchors.left: parent.left
@@ -710,6 +717,7 @@ BarWidget {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: !menuRow.modelData.isSeparator
                 anchors.verticalCenter: parent.verticalCenter
                 anchors.left: parent.left
@@ -724,6 +732,7 @@ BarWidget {
               }
 
               Text {
+                textFormat: Text.PlainText
                 id: submenuGlyph
                 visible: !menuRow.modelData.isSeparator && menuRow.modelData.hasChildren
                 anchors.verticalCenter: parent.verticalCenter
