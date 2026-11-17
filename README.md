@@ -26,6 +26,11 @@ The full bar on a 2560px monitor:
 | :---: | :---: | :---: |
 | ![Workspaces island](docs/screenshots/island-left.png) | ![Clock island](docs/screenshots/island-center.png) | ![Status island](docs/screenshots/island-right.png) |
 
+Hover the clock and the center island expands to show its indicators and the
+other center widgets. The clock stays where it is:
+
+![Center island expanded on hover, with indicators to the left of the clock and more widgets to the right](docs/screenshots/island-center-hover.png)
+
 These captures use the Starship theme and the author's own widget layout. The
 islands show whatever widgets your bar layout lists, so some icons above come
 from separate widget plugins rather than from Dicey Bar itself.
@@ -42,9 +47,10 @@ from separate widget plugins rather than from Dicey Bar itself.
   their state and the shell isn't restarted.
 - **Islands never get stuck hidden.** Island visibility follows your
   configured entries, so a remap can't leave all three islands hidden.
-- **Clock stays centered.** The center anchor (normally the clock) stays at
-  the physical center of the display, even when the center island holds other
-  widgets.
+- **Compact center island that expands on hover.** At rest the center island
+  shows only the clock. Hover it to reveal the indicators and the other center
+  widgets. The center anchor (normally the clock) stays at the physical center
+  of the display either way.
 - **Your existing layout.** Dicey Bar is a clone of Omarchy's own
   `omarchy.bar`. It reads the same bar layout and widget IDs, and the
   `omarchy bar` commands edit it.
@@ -101,7 +107,7 @@ compared with the stock bar.
 ## Requirements and updates
 
 Tested on **Omarchy 4.0.6 and 4.5.0 / Quattro, Qt 6.12 and Quickshell 0.3.2**. Use an
-Omarchy installation with its matching shell imports, Hyprland, Bash, Git and
+Omarchy installation with its matching shell imports, Bash, Git and
 `jq`. Configured widgets use Omarchy's normal helper commands; keyboard-layout
 descriptions additionally use `xkbcli` (`libxkbcommon`), recording status uses
 `pgrep` (`procps-ng`), and optional dictation uses Omarchy's Voxtype integration.
