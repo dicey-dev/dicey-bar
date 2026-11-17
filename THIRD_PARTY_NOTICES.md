@@ -40,4 +40,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 Qt, Quickshell, Omarchy and system tools are separately installed runtime
 dependencies, not bundled binaries. Theme fonts/icons are referenced from the
 host installation; no font files, third-party app icons or private screenshots
-are distributed here.
+are distributed here. `preview.png` and `docs/screenshots/` are captures of this
+bar rendered on an Omarchy desktop: they show glyphs drawn from the host's
+icon font and a thin slice (blurred in the preview) of the stock Omarchy Starship theme
+background behind the islands.
