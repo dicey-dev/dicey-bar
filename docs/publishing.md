@@ -99,8 +99,11 @@ and its [shell reference](https://github.com/omacom/omarchy/blob/quattro/docs/om
   compatible. On 4.5.0, validation, tests, the install check and native `.dev`
   activation/restore were re-run, with the live bar rendering without errors.
 
-An optional preview is not required; no user desktop screenshot is distributed.
-The marketplace will use its fallback image. Validation/security scanning never
+The root `preview.png` (1600x900) is the optional marketplace preview; the
+marketplace detects it by name and generates its own card and detail images.
+It and `docs/screenshots/` are crops of the rendered bar only, with no windows,
+notifications or personal data. Recapture them after visible changes and check
+every image before committing it. Validation/security scanning never
 means certification, and the marketplace maintainer still decides approval.
 
 ## Form values (owner submits)
