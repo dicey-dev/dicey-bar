@@ -858,11 +858,11 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(6)
 
-              // Extend / Mirror toggle (shown with 2+ available monitors)
+              // Option A: Single Flip Button (Extend <-> Mirror, uniform with Re-probe & Identify)
               Rectangle {
                 id: modeToggle
                 visible: root.availableMonitorCount >= 2
-                implicitWidth: modeToggleRow.implicitWidth + Style.space(14)
+                implicitWidth: modeToggleRow.implicitWidth + Style.space(16)
                 implicitHeight: Style.space(26)
                 radius: Math.min(Style.cornerRadius, Style.space(6))
                 color: root.isMirroredMode
@@ -879,45 +879,50 @@ Panel {
                   anchors.centerIn: parent
                   spacing: Style.space(6)
 
-                  Text {
-                    textFormat: Text.PlainText
-                    text: "Extend"
-                    color: !root.isMirroredMode ? root.fg : root.muted
-                    font.family: root.fontName
-                    font.pixelSize: Style.font.caption
-                    font.bold: !root.isMirroredMode
+                  // Crisp geometric Extend (side-by-side) / Mirror (overlapping) icon
+                  Item {
+                    width: Style.space(13)
+                    height: Style.space(11)
                     anchors.verticalCenter: parent.verticalCenter
-                  }
+                    readonly property color iconColor: root.isMirroredMode || modeToggleMouse.containsMouse ? root.accent : root.fg
 
-                  Rectangle {
-                    id: miniTrack
-                    width: Style.space(28)
-                    height: Style.space(15)
-                    radius: Style.cornerRadius > 0 ? height / 2 : 0
-                    color: root.isMirroredMode ? root.accent : root.trackBg
-                    border.color: root.isMirroredMode ? root.accent : root.cardBorder
-                    border.width: 1
-                    anchors.verticalCenter: parent.verticalCenter
-
-                    Behavior on color { ColorAnimation { duration: Style.duration(120) } }
-
+                    // Extend: two side-by-side screens
                     Rectangle {
-                      width: miniTrack.height - Style.space(4)
-                      height: width
-                      radius: Style.cornerRadius > 0 ? height / 2 : 0
-                      anchors.verticalCenter: parent.verticalCenter
-                      x: root.isMirroredMode ? miniTrack.width - width - Style.space(2) : Style.space(2)
-                      color: root.isMirroredMode ? root.accentInk : root.muted
+                      visible: !root.isMirroredMode
+                      x: 0; y: 1
+                      width: Style.space(6); height: Style.space(9)
+                      radius: 1.5; color: "transparent"
+                      border.color: parent.iconColor; border.width: 1.4
+                    }
+                    Rectangle {
+                      visible: !root.isMirroredMode
+                      x: Style.space(7); y: 1
+                      width: Style.space(6); height: Style.space(9)
+                      radius: 1.5; color: "transparent"
+                      border.color: parent.iconColor; border.width: 1.4
+                    }
 
-                      Behavior on x { NumberAnimation { duration: Style.duration(120); easing.type: Easing.OutCubic } }
-                      Behavior on color { ColorAnimation { duration: Style.duration(120) } }
+                    // Mirror: two overlapping screens
+                    Rectangle {
+                      visible: root.isMirroredMode
+                      x: 0; y: 0
+                      width: Style.space(9); height: Style.space(8)
+                      radius: 1.5; color: "transparent"
+                      border.color: parent.iconColor; border.width: 1.4
+                    }
+                    Rectangle {
+                      visible: root.isMirroredMode
+                      x: Style.space(4); y: Style.space(3)
+                      width: Style.space(9); height: Style.space(8)
+                      radius: 1.5; color: Commons.Color.popups.background
+                      border.color: parent.iconColor; border.width: 1.4
                     }
                   }
 
                   Text {
                     textFormat: Text.PlainText
-                    text: "Mirror"
-                    color: root.isMirroredMode ? root.accent : root.muted
+                    text: root.isMirroredMode ? "Mirror" : "Extend"
+                    color: root.isMirroredMode || modeToggleMouse.containsMouse ? root.accent : root.fg
                     font.family: root.fontName
                     font.pixelSize: Style.font.caption
                     font.bold: root.isMirroredMode
