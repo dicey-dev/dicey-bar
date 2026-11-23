@@ -107,25 +107,11 @@ Panel {
     for (var i = 0; i < draft.length; i++) if (!draft[i].autoOff) n++
     return n
   }
-  readonly property bool hasInternalAvailable: {
-    for (var i = 0; i < draft.length; i++) if (!draft[i].autoOff && draft[i].internal) return true
+  readonly property bool isMirroredMode: {
+    for (var i = 0; i < draft.length; i++)
+      if (draft[i] && draft[i].enabled && !draft[i].autoOff && !!draft[i].mirrorOf) return true
     return false
   }
-  readonly property bool hasExternalAvailable: {
-    for (var i = 0; i < draft.length; i++) if (!draft[i].autoOff && !draft[i].internal) return true
-    return false
-  }
-  readonly property var layoutPresetOptions: {
-    if (availableMonitorCount < 2) return []
-    var out = [{ value: "extend", label: "Extend" }]
-    if (hasInternalAvailable && hasExternalAvailable) {
-      out.push({ value: "external", label: "External only" })
-      out.push({ value: "internal", label: "Laptop only" })
-    }
-    out.push({ value: "mirror", label: "Mirror" })
-    return out
-  }
-  readonly property string activePreset: Model.activeLayoutPreset(draft)
   readonly property int shownTextSize: textSizeEdited && draftTextSize >= 9 ? draftTextSize : Style.font.baseSize
   readonly property bool shownNightLightOn: nightLightEdited
     ? !!draftNightLight.enabled
@@ -872,6 +858,82 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(6)
 
+              // Extend / Mirror toggle (shown with 2+ available monitors)
+              Rectangle {
+                id: modeToggle
+                visible: root.availableMonitorCount >= 2
+                implicitWidth: modeToggleRow.implicitWidth + Style.space(14)
+                implicitHeight: Style.space(26)
+                radius: Math.min(Style.cornerRadius, Style.space(6))
+                color: root.isMirroredMode
+                  ? root.accentSoft
+                  : (modeToggleMouse.containsMouse ? root.trackBg : root.cardBg)
+                border.color: root.isMirroredMode || modeToggleMouse.containsMouse ? root.accentBorder : root.cardBorder
+                border.width: 1
+                anchors.verticalCenter: parent.verticalCenter
+
+                Behavior on color { ColorAnimation { duration: Style.duration(120) } }
+
+                Row {
+                  id: modeToggleRow
+                  anchors.centerIn: parent
+                  spacing: Style.space(6)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "Extend"
+                    color: !root.isMirroredMode ? root.fg : root.muted
+                    font.family: root.fontName
+                    font.pixelSize: Style.font.caption
+                    font.bold: !root.isMirroredMode
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+
+                  Rectangle {
+                    id: miniTrack
+                    width: Style.space(28)
+                    height: Style.space(15)
+                    radius: Style.cornerRadius > 0 ? height / 2 : 0
+                    color: root.isMirroredMode ? root.accent : root.trackBg
+                    border.color: root.isMirroredMode ? root.accent : root.cardBorder
+                    border.width: 1
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Behavior on color { ColorAnimation { duration: Style.duration(120) } }
+
+                    Rectangle {
+                      width: miniTrack.height - Style.space(4)
+                      height: width
+                      radius: Style.cornerRadius > 0 ? height / 2 : 0
+                      anchors.verticalCenter: parent.verticalCenter
+                      x: root.isMirroredMode ? miniTrack.width - width - Style.space(2) : Style.space(2)
+                      color: root.isMirroredMode ? root.accentInk : root.muted
+
+                      Behavior on x { NumberAnimation { duration: Style.duration(120); easing.type: Easing.OutCubic } }
+                      Behavior on color { ColorAnimation { duration: Style.duration(120) } }
+                    }
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "Mirror"
+                    color: root.isMirroredMode ? root.accent : root.muted
+                    font.family: root.fontName
+                    font.pixelSize: Style.font.caption
+                    font.bold: root.isMirroredMode
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+
+                MouseArea {
+                  id: modeToggleMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.applyPreset(root.isMirroredMode ? "extend" : "mirror")
+                }
+              }
+
               MiniActionButton {
                 text: "Re-probe"
                 onClicked: {
@@ -892,15 +954,6 @@ Panel {
           LayoutCanvas {
             width: parent.width
             height: Style.space(170)
-          }
-
-          // ---------- Quick Layout Modes (shown with 2+ available monitors) ----------
-          SegmentedBar {
-            width: parent.width
-            visible: root.layoutPresetOptions.length > 0
-            options: root.layoutPresetOptions
-            currentValue: root.activePreset
-            onPicked: function(val) { root.applyPreset(val) }
           }
 
           // ---------- Display Selector Strip ----------
