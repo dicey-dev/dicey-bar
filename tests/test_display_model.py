@@ -192,6 +192,24 @@ TestCase {
         verify(Model.planMatchesLive(lid, Model.planFromLive([laptop(), benq()], {})))
     }
 
+    function test_a_reload_undoing_an_automatic_apply_gets_one_retry() {
+        var first = Model.autoApplyStep(null, "plan", 0)
+        var retry = Model.autoApplyStep(first.last, "plan", 2000)
+        var third = Model.autoApplyStep(retry.last, "plan", 4000)
+        verify(first.allowed && retry.allowed && !third.allowed)
+        verify(Model.autoApplyStep(third.last, "plan", 21000).allowed)
+        verify(Model.autoApplyStep(third.last, "other", 5000).allowed)
+    }
+
+    function test_fullscreen_vrr_survives_hyprland_reporting_it_inactive() {
+        var plan = Model.derive([benq()], {}, {})
+        plan[0].vrr = 2
+        var memory = Model.remember({}, plan, "t")
+        var live = Model.planFromLive([benq()], memory)
+        compare(live[0].vrr, 2)
+        verify(Model.planMatchesLive(Model.derive([benq()], memory, {}), live))
+    }
+
     function test_never_turns_every_monitor_off() {
         var plan = Model.derive([benq()], {}, { "BNQ|BenQ GW2790Q|ET97T00426087": "input" })
         compare(plan[0].autoOff, false)

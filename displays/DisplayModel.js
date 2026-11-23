@@ -398,6 +398,9 @@ function planFromLive(monitors, memory, autoOff) {
     var out = liveOutput(m, ids[i])
     var profile = mem.monitors[out.fp]
     out.ddcWatch = !!(profile && profile.ddcWatch)
+    // Hyprland reports whether VRR is active, not the Off/On/Fullscreen
+    // setting, so the remembered setting is the one to edit and revert to.
+    if (profile && [0, 1, 2].indexOf(Number(profile.vrr)) !== -1) out.vrr = Number(profile.vrr)
     if (off[out.fp]) {
       out.autoOff = true
       out.offReason = String(off[out.fp])
@@ -592,6 +595,15 @@ function ddcStep(misses, reading, expected) {
     return { misses: 0, off: false }
   count++
   return { misses: count, off: count >= 2 }
+}
+
+// Hotplug handling applies the same plan at most twice in 20 seconds. The
+// second try covers a config reload (from our own monitors.lua write)
+// undoing the first; the limit stops a loop when Hyprland won't hold a plan.
+function autoApplyStep(last, signature, now) {
+  var same = !!last && last.signature === signature && now - last.at < 20000
+  var count = same ? last.count + 1 : 1
+  return { allowed: count <= 2, last: { signature: signature, at: same ? last.at : now, count: count } }
 }
 
 // Monitors that should be left off right now, keyed by fingerprint. The

@@ -51,8 +51,7 @@ Item {
   // Automatic applies of the same plan are not retried in a tight loop when
   // Hyprland keeps reporting something else (for instance a mode it cannot
   // drive), so record the last one.
-  property string lastAutoPlan: ""
-  property double lastAutoAt: 0
+  property var lastAuto: null
 
   signal refreshed()
 
@@ -148,9 +147,9 @@ Item {
     var plan = Model.derive(monitors, memory, currentAutoOff)
     if (Model.planMatchesLive(plan, livePlan)) return
     var signature = JSON.stringify(plan)
-    if (signature === lastAutoPlan && Date.now() - lastAutoAt < 20000) return
-    lastAutoPlan = signature
-    lastAutoAt = Date.now()
+    var step = Model.autoApplyStep(lastAuto, signature, Date.now())
+    lastAuto = step.last
+    if (!step.allowed) return
     run(["apply"], signature, function(code, data, stderr) {
       service.fallbacks = data && Array.isArray(data.fallbacks) ? data.fallbacks : []
       service.lastError = code === 0 ? "" : service.errorText(data, stderr)
