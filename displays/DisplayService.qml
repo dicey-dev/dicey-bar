@@ -20,7 +20,7 @@ Item {
   // The bar's theme surface (foreground, font), for the overlays.
   property var bar: null
 
-  readonly property string helperPath: decodeURIComponent(String(Qt.resolvedUrl("display_ctl.py")).replace(/^file:\/\//, ""))
+  readonly property string helperPath: decodeURIComponent(String(Qt.resolvedUrl("display_ctl.py")).replace(/^(file|qs):\/\//, ""))
 
   property var monitors: []
   property var memory: ({})

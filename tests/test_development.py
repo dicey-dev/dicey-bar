@@ -61,9 +61,16 @@ class DevelopmentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             stage = Path(directory)
             dev.write_stage(files, stage, PLUGIN_ID)
-            self.assertEqual(json.loads((stage / "manifest.json").read_text())["id"], PLUGIN_ID + ".dev")
+            manifest = json.loads((stage / "manifest.json").read_text())
+            self.assertEqual(manifest["id"], PLUGIN_ID + ".dev")
+            rev = dev.revision_tag(files)
+            self.assertTrue(manifest["entryPoints"]["bar"].startswith(rev + "/"))
+            self.assertTrue((stage / manifest["entryPoints"]["bar"]).is_file())
             for path in stage.rglob("*.qml"):
                 self.assertNotIn('"' + PLUGIN_ID + '"', path.read_text())
+            ctl_files = list(stage.rglob("display_ctl.py"))
+            self.assertEqual(len(ctl_files), 1)
+            self.assertIn(f'-- BEGIN {PLUGIN_ID} displays', ctl_files[0].read_text())
 
     def test_symlinks_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -109,10 +116,25 @@ class DevelopmentTest(unittest.TestCase):
                 dev.main()
             calls = [call.args for call in command.call_args_list]
             self.assertIn(("omarchy", "plugin", "enable", PLUGIN_ID + ".dev"), calls)
-            self.assertIn(("omarchy", "plugin", "disable", PLUGIN_ID + ".dev"), calls)
+            if kind == "bar":
+                self.assertNotIn(("omarchy", "plugin", "disable", PLUGIN_ID + ".dev"), calls)
+                self.assertIn(("omarchy-shell", "shell", "rescanPlugins"), calls)
+            else:
+                self.assertIn(("omarchy", "plugin", "disable", PLUGIN_ID + ".dev"), calls)
             self.assertIn(("omarchy", "plugin", "enable", PLUGIN_ID), calls)
             self.assertFalse((Path(env["XDG_CONFIG_HOME"]) / "omarchy/plugins" / (PLUGIN_ID + ".dev")).exists())
             self.assertFalse((Path(env["XDG_STATE_HOME"]) / "omarchy/development" / (PLUGIN_ID + ".json")).exists())
+
+    def test_rescan_until_waits_for_watcher_and_falls_back_once(self):
+        rows = [[], [], [{"id": "x.dev", "kinds": ["bar"], "enabled": False}]]
+        ticks = iter([0.0, 0.2, 2.0, 2.5, 3.0])
+        with patch.object(dev, "command") as command, patch.object(dev, "listed", side_effect=rows), \
+             patch.object(dev.time, "monotonic", side_effect=ticks), patch.object(dev.time, "sleep"):
+            dev.rescan_until("x.dev", True)
+        self.assertEqual(
+            [c.args for c in command.call_args_list],
+            [("omarchy-shell", "shell", "rescanPlugins")],
+        )
 
     def test_failed_restore_keeps_recovery_journal(self):
         with tempfile.TemporaryDirectory() as directory:
