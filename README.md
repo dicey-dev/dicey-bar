@@ -124,8 +124,7 @@ multi-monitor manager (and deduplicates `dicey.displays` if both IDs appear in
 `~/.config/omarchy/shell.json`, so only one display icon sits in the bar).
 
 - Drag displays on the canvas; they snap edge to edge and gaps close.
-- Quick multi-monitor presets (**Extend**, **External only**, **Laptop only**,
-  and **Mirror**).
+- Header **Extend / Mirror** toggle when 2+ displays are connected.
 - Pick resolution and refresh rate separately via side-by-side dropdowns, plus
   scale, orientation (`0°`–`270°`), adaptive sync, and HDR (with conditional
   SDR brightness & saturation sliders when HDR is enabled).
