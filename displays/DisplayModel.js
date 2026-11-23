@@ -367,6 +367,48 @@ function closestLayout(memory, fps) {
   return best ? best.layout : null
 }
 
+function cleanTextSize(value) {
+  var n = Math.round(Number(value))
+  return (isFinite(n) && n >= 9 && n <= 20) ? n : null
+}
+
+function cleanBrightness(value) {
+  if (value === null || value === undefined || value === "") return null
+  var n = Math.round(Number(value))
+  return (isFinite(n) && n >= 1 && n <= 100) ? n : null
+}
+
+function cleanNightLight(value) {
+  if (!value || typeof value !== "object") return null
+  var kelvin = Math.round(Number(value.kelvin))
+  if (!isFinite(kelvin) || kelvin < 1500 || kelvin > 6500) kelvin = 4000
+  return { enabled: value.enabled === true, kelvin: kelvin }
+}
+
+function sameNightLight(a, b) {
+  if (!a && !b) return true
+  if (!a || !b) return false
+  return a.enabled === b.enabled && a.kelvin === b.kelvin
+}
+
+// Pick which enabled monitor drives desktop-wide properties (text size / night
+// light) that Omarchy stores once across the session: an explicit index from
+// the panel wins, otherwise an active external monitor wins over the built-in
+// panel so docking/undocking switches cleanly.
+function primaryActiveOutput(plan, preferredIndex) {
+  if (!Array.isArray(plan) || !plan.length) return null
+  if (preferredIndex !== undefined && preferredIndex !== null
+      && preferredIndex >= 0 && preferredIndex < plan.length) {
+    var picked = plan[preferredIndex]
+    if (picked && picked.enabled && !picked.autoOff) return picked
+  }
+  for (var i = 0; i < plan.length; i++)
+    if (plan[i] && plan[i].enabled && !plan[i].autoOff && !plan[i].internal) return plan[i]
+  for (var j = 0; j < plan.length; j++)
+    if (plan[j] && plan[j].enabled && !plan[j].autoOff) return plan[j]
+  return null
+}
+
 function liveOutput(monitor, id) {
   var mode = { w: Number(monitor.width), h: Number(monitor.height), hz: Number(monitor.refreshRate) }
   return {
@@ -384,7 +426,10 @@ function liveOutput(monitor, id) {
     vrr: monitor.vrr === true ? 1 : Number(monitor.vrr) || 0,
     hdr: /^hdr/i.test(String(monitor.colorManagementPreset || "")),
     transform: Number(monitor.transform) || 0,
-    ddcWatch: false
+    ddcWatch: false,
+    textSize: null,
+    brightness: null,
+    nightLight: null
   }
 }
 
@@ -401,6 +446,11 @@ function planFromLive(monitors, memory, autoOff) {
     // Hyprland reports whether VRR is active, not the Off/On/Fullscreen
     // setting, so the remembered setting is the one to edit and revert to.
     if (profile && [0, 1, 2].indexOf(Number(profile.vrr)) !== -1) out.vrr = Number(profile.vrr)
+    if (profile) {
+      out.textSize = cleanTextSize(profile.textSize)
+      out.brightness = cleanBrightness(profile.brightness)
+      out.nightLight = cleanNightLight(profile.nightLight)
+    }
     if (off[out.fp]) {
       out.autoOff = true
       out.offReason = String(off[out.fp])
@@ -428,6 +478,9 @@ function derive(monitors, memory, autoOff) {
     out.vrr = [0, 1, 2].indexOf(Number(profile.vrr)) !== -1 ? Number(profile.vrr) : 0
     out.hdr = profile.hdr === true && m.hdrCapable !== false
     out.ddcWatch = profile.ddcWatch === true
+    out.textSize = cleanTextSize(profile.textSize)
+    out.brightness = cleanBrightness(profile.brightness)
+    out.nightLight = cleanNightLight(profile.nightLight)
     out.autoOff = !!off[out.fp]
     out.offReason = off[out.fp] ? String(off[out.fp]) : ""
     out.enabled = true
@@ -566,6 +619,12 @@ function remember(memory, plan, now) {
       hdr: o.hdr === true,
       ddcWatch: o.ddcWatch === true
     }
+    var textSize = cleanTextSize(o.textSize !== null && o.textSize !== undefined ? o.textSize : previous.textSize)
+    if (textSize !== null) profile.textSize = textSize
+    var brightness = cleanBrightness(o.brightness !== null && o.brightness !== undefined ? o.brightness : previous.brightness)
+    if (brightness !== null) profile.brightness = brightness
+    var nightLight = cleanNightLight(o.nightLight ? o.nightLight : previous.nightLight)
+    if (nightLight !== null) profile.nightLight = nightLight
     // The input a watched monitor is expected on is learned when the watch is
     // switched on, and kept while it stays on.
     if (profile.ddcWatch && previous.ddcWatch && previous.ddcInput) profile.ddcInput = previous.ddcInput
