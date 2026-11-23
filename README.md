@@ -83,23 +83,31 @@ omarchy bar move omarchy.weather --section center --index 0
 omarchy bar set omarchy.clock format HH:mm
 ```
 
-The `left`, `center` and `right` sections become the three islands. The stock
-bar's newer `centerBegin`, `centerEnd` and `tray` sections are not drawn, so
-keep widgets in the three main sections. `centerAnchor` names the widget that
-stays at the physical center of the screen:
+`left` and `right` become the outer islands. The center island holds
+`centerBegin`, `center` and `centerEnd`, the sections current Omarchy writes.
+The `center` section stays at the physical center of the screen and is all
+the island shows at rest; hovering it reveals `centerBegin` before it and
+`centerEnd` after it. Widgets in the `tray` section are drawn inside the tray's
+drawer, as on the stock bar:
 
 ```json
 "bar": {
   "id": "dicey.bar",
   "position": "top",
-  "centerAnchor": "omarchy.clock",
   "layout": {
     "left": [{ "id": "omarchy.workspaces" }],
+    "centerBegin": [{ "id": "omarchy.indicators" }],
     "center": [{ "id": "omarchy.clock" }],
-    "right": [{ "id": "omarchy.tray" }, { "id": "omarchy.audio" }, { "id": "omarchy.power" }]
+    "centerEnd": [{ "id": "omarchy.weather" }],
+    "right": [{ "id": "omarchy.tray" }, { "id": "omarchy.audio" }, { "id": "omarchy.power" }],
+    "tray": []
   }
 }
 ```
+
+Older layouts that keep everything in `center` still work: `centerAnchor`
+names the one center widget shown at rest, and the widgets before and after it
+are revealed on hover.
 
 See [Design and behavior](docs/dicey-bar.md) for what Dicey Bar changes
 compared with the stock bar.

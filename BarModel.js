@@ -1,3 +1,9 @@
+// The bar's sections as current Omarchy writes them to shell.json. The
+// center box sits in the middle of the bar; centerBegin and centerEnd hang
+// off its edges; tray is drawn inside the tray widget's drawer.
+var sections = ["left", "centerBegin", "center", "centerEnd", "right", "tray"]
+var centerSections = ["centerBegin", "center", "centerEnd"]
+
 function isPlainObject(value) {
   return !!value && typeof value === "object" && !Array.isArray(value)
 }
@@ -55,14 +61,45 @@ function entryIndex(entries, name) {
   return -1
 }
 
-function entriesBefore(entries, name) {
-  var index = entryIndex(entries, name)
-  return index <= 0 ? [] : entries.slice(0, index)
+// Panel tabbing and positional hotkeys take the center as one section: the
+// box and the two sections hanging off it, in the order they read.
+function navigationRegions(region) {
+  var name = String(region || "")
+  return centerSections.indexOf(name) !== -1 ? centerSections.slice() : [name]
 }
 
-function entriesAfter(entries, name) {
-  var index = entryIndex(entries, name)
-  return index === -1 ? [] : entries.slice(index + 1)
+// The center island: the anchor group always shown, and the flanks the
+// island reveals around it on hover. A legacy `centerAnchor` picks one entry
+// of the center section as the anchor and leaves its neighbours in the
+// flanks. Without one, the whole center section is the anchor and
+// centerBegin/centerEnd are the flanks. Each flank keeps every entry's own
+// section, so drags and settings write back where the entry lives.
+function centerIsland(layout, anchorId) {
+  function section(name) {
+    var entries = isPlainObject(layout) ? layout[name] : null
+    return Array.isArray(entries) ? entries : []
+  }
+  function rows(entries, region, into) {
+    for (var i = 0; i < entries.length; i++) {
+      into.entries.push(entries[i])
+      into.regions.push(region)
+    }
+    return into
+  }
+  var center = section("center")
+  var index = anchorId ? entryIndex(center, anchorId) : -1
+  var before = rows(section("centerBegin"), "centerBegin", { entries: [], regions: [] })
+  var after = { entries: [], regions: [] }
+  if (index !== -1) {
+    rows(center.slice(0, index), "center", before)
+    rows(center.slice(index + 1), "center", after)
+  }
+  rows(section("centerEnd"), "centerEnd", after)
+  return {
+    before: before,
+    anchor: index === -1 ? center.slice() : [center[index]],
+    after: after
+  }
 }
 
 // A shell.json write that only changes inline widget settings (the battery
@@ -75,7 +112,7 @@ function entriesAfter(entries, name) {
 // a duplicated id makes the push ambiguous.
 function inlineSettingsDelta(current, next) {
   if (!isPlainObject(current) || !isPlainObject(next)) return null
-  var regions = ["left", "center", "right"]
+  var regions = sections
   var counts = {}
   for (var r = 0; r < regions.length; r++) {
     var entries = Array.isArray(next[regions[r]]) ? next[regions[r]] : []
@@ -132,13 +169,12 @@ function customModulePath(entry, home, configDir) {
   return source
 }
 
-// A center module is mounted twice once an anchor is set: the copy that is
-// actually drawn, and a zero-size placeholder holding its place in the flow
-// beside the anchor. Panel routing has to pick the drawn one — it is the only
-// one that can anchor a popup, carry the open-panel mark, or be found again
-// by switchPanelFrom — and fall back to the placeholder only when nothing is
-// on screen. The order the two are registered in is not stable across a live
-// bar reconfiguration, so picking the first match is not good enough.
+// A widget has a copy on every monitor's bar, and a center flank's copy is
+// zero-size while the island is collapsed. Panel routing has to pick a drawn
+// copy — it is the only one that can anchor a popup, carry the open-panel
+// mark, or be found again by switchPanelFrom — and fall back to a hidden one
+// only when nothing is on screen. The order copies are registered in is not
+// stable across a live bar reconfiguration, so the first match is not enough.
 function isDrawnSlot(slot) {
   return !!slot && slot.visible === true && slot.width > 0 && slot.height > 0
 }
@@ -208,6 +244,19 @@ function nearestDropTarget(candidates, point, vertical) {
   return best
 }
 
+// Whether a real fullscreen window (Hyprland fullscreen mode bit 2) is on the
+// given workspace.
+function fullscreenOn(toplevels, workspaceId) {
+  var list = toplevels || []
+  for (var i = 0; i < list.length; i++) {
+    var toplevel = list[i]
+    if (!toplevel || !toplevel.workspace || toplevel.workspace.id !== workspaceId) continue
+    var ipc = toplevel.lastIpcObject
+    if (ipc && (Number(ipc.fullscreen) & 2) !== 0) return true
+  }
+  return false
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     isDrawnSlot: isDrawnSlot,
@@ -220,8 +269,10 @@ if (typeof module !== "undefined") {
     pinTrayToInner: pinTrayToInner,
     moduleString: moduleString,
     entryIndex: entryIndex,
-    entriesBefore: entriesBefore,
-    entriesAfter: entriesAfter,
+    sections: sections,
+    navigationRegions: navigationRegions,
+    centerIsland: centerIsland,
+    fullscreenOn: fullscreenOn,
     inlineSettingsDelta: inlineSettingsDelta,
     expandPath: expandPath,
     customModuleSafeName: customModuleSafeName,
