@@ -37,6 +37,24 @@ the live plugin safely.
 The tray-section drawer and the card morph rely on the Omarchy 4.5 tray and
 panels; on Omarchy 4.0.6 the tray and panels keep their older behavior.
 
+## Displays panel
+
+`displays/` holds an optional monitor manager, used through the
+`dicey.displays` layout ID. Bar.qml resolves that ID itself because a
+third-party bar only sees a read-only snapshot of the widget registry.
+
+- `DisplayModel.js` is pure layout logic: monitor identity (EDID
+  make/model/serial, connector name for internal panels), remembered
+  per-monitor profiles and per-combination layouts, snapping and gap closing.
+- `display_ctl.py` is the only code that runs commands or writes files. It
+  validates every plan, writes Lua strings with byte escapes, applies rules
+  with `hyprctl eval`, and owns the `-- BEGIN dicey.bar displays` block in
+  `monitors.lua`.
+- `DisplayService.qml` runs once per bar. It reapplies remembered settings
+  when monitors are added or removed, polls DDC/CI input for watched
+  monitors, and shows the identify and keep/revert overlays.
+- `DisplaysWidget.qml` is the panel.
+
 ## Activation
 
 ```bash

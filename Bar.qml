@@ -8,6 +8,7 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 import "BarModel.js" as BarModel
+import "displays" as Displays
 
 Item {
   id: root
@@ -1361,6 +1362,14 @@ Item {
     }
   }
 
+  // Displays: a bar widget (`dicey.displays` in the bar layout) and the one
+  // service behind every screen's copy of it, which also re-applies the
+  // remembered display settings when monitors connect.
+  readonly property string displaysWidgetId: "dicey.displays"
+  readonly property var displayService: displayServiceItem
+  Displays.DisplayService { id: displayServiceItem; bar: root }
+  Component { id: displaysWidgetComponent; Displays.DisplaysWidget { } }
+
   component DragGhostPanel: PanelWindow {
     id: ghostWindow
 
@@ -1750,6 +1759,9 @@ Item {
       var w = root.barWidgetRegistry.widgets
       if (customType) return null
       var registryName = root.canonicalWidgetId(moduleName)
+      // The bar's own Displays widget is not in the host registry, which a
+      // third-party bar only receives a read-only copy of.
+      if (registryName === root.displaysWidgetId) return displaysWidgetComponent
       return w[registryName] ? w[registryName].component : null
     }
     readonly property bool qmlCustom: customType === "qml"
