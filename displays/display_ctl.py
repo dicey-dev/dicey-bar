@@ -4,11 +4,15 @@
 The panel and its hotplug service decide what each monitor should do
 (displays/DisplayModel.js). This helper only carries that out:
 
-  state                 JSON: connected monitors, HDR support, lid, memory
-  apply                 stdin plan -> live `hyprctl eval`, then read back
-  persist               stdin {"plan": [...], "memory": {...}?} -> write the
-                        memory file and the managed block in monitors.lua
-  ddc-poll NAME...      JSON: each connector's DDC/CI input source code
+  state                     JSON: connected monitors, HDR support, lid, nightLight, memory
+  apply                     stdin plan -> live `hyprctl eval`, then read back
+  persist                   stdin {"plan": [...]?, "memory": {...}?} -> write memory
+                            and/or the managed block in monitors.lua
+  ddc-poll NAME...          JSON: each connector's DDC/CI input source code
+  ddc-inputs NAME           JSON: supported VCP 0x60 inputs + current input for NAME
+  ddc-set-input NAME CODE   JSON: switch monitor NAME to VCP 0x60 input CODE
+  ddc-relearn NAME FP       JSON: re-read VCP 0x60 for NAME and store under FP
+  nightlight on KELVIN|off  JSON: control hyprsunset temperature & notify bar
 
 Every value written into Lua is validated or emitted as an escaped string
 literal, because monitors.lua is code Hyprland runs.
@@ -20,6 +24,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 BEGIN = "-- BEGIN dicey.bar displays"
@@ -29,6 +34,27 @@ TAKEOVER_HEADER = "-- Monitor rules are managed by the Displays panel in Dicey B
 CATCH_ALL = 'hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" })'
 HYPRCTL_TIMEOUT = 10
 DDC_TIMEOUT = 4
+DDC_CAP_TIMEOUT = 8
+DAY_KELVIN = 6500
+
+MCCS_INPUTS = {
+    "0x01": "VGA-1",
+    "0x02": "VGA-2",
+    "0x03": "DVI-1",
+    "0x04": "DVI-2",
+    "0x05": "Composite-1",
+    "0x06": "Composite-2",
+    "0x07": "S-Video-1",
+    "0x08": "S-Video-2",
+    "0x0f": "DP-1",
+    "0x10": "DP-2",
+    "0x11": "HDMI-1",
+    "0x12": "HDMI-2",
+    "0x19": "USB-C-1",
+    "0x1b": "USB-C",
+}
+
+DEFAULT_INPUT_CODES = ("0x0f", "0x10", "0x11", "0x12", "0x1b")
 
 
 def home() -> Path:
@@ -91,6 +117,11 @@ def validate_output(output: dict) -> dict:
     name = str(output.get("name") or "")
     if not selector or not name or "\n" in selector or "\n" in name:
         raise ValueError("output needs a name and selector")
+    mirror_raw = str(output.get("mirrorOf") or "").strip()
+    if mirror_raw.lower() == "none":
+        mirror_raw = ""
+    if "\n" in mirror_raw or (mirror_raw and not re.fullmatch(r"[A-Za-z0-9._-]+", mirror_raw)):
+        raise ValueError(f"invalid mirrorOf: {mirror_raw!r}")
     clean = {
         "name": name,
         "selector": selector,
@@ -100,6 +131,7 @@ def validate_output(output: dict) -> dict:
         "offReason": str(output.get("offReason") or ""),
         "hdr": output.get("hdr") is True,
         "ddcWatch": output.get("ddcWatch") is True,
+        "mirrorOf": mirror_raw,
     }
     if clean["offReason"] not in ("", "lid", "input"):
         raise ValueError(f"invalid offReason: {clean['offReason']!r}")
@@ -120,6 +152,8 @@ def validate_output(output: dict) -> dict:
     clean["scale"] = _number(output.get("scale", 1), 0.1, 10, "scale")
     clean["vrr"] = _int(output.get("vrr", 0), 0, 2, "vrr")
     clean["transform"] = _int(output.get("transform", 0), 0, 7, "transform")
+    clean["sdrBrightness"] = _number(output.get("sdrBrightness", 1), 0.5, 2.0, "sdrBrightness")
+    clean["sdrSaturation"] = _number(output.get("sdrSaturation", 1), 0.5, 1.5, "sdrSaturation")
     return clean
 
 
@@ -127,12 +161,23 @@ def validate_plan(plan) -> list:
     if not isinstance(plan, list) or not plan:
         raise ValueError("plan must be a non-empty list")
     outputs = [validate_output(o) for o in plan]
-    if not any(o["enabled"] and not o["autoOff"] for o in outputs):
+    if not any(o["enabled"] and not o["autoOff"] and not o["mirrorOf"] for o in outputs):
         raise ValueError("plan would leave every display off")
+    by_name = {o["name"]: o for o in outputs}
+    for o in outputs:
+        if not o["mirrorOf"]:
+            continue
+        if o["mirrorOf"] == o["name"]:
+            raise ValueError(f"output {o['name']} cannot mirror itself")
+        target = by_name.get(o["mirrorOf"])
+        if not target or not target["enabled"] or target["autoOff"]:
+            raise ValueError(f"mirror target {o['mirrorOf']} is not active")
+        if target["mirrorOf"]:
+            raise ValueError(f"cannot mirror another mirror ({o['mirrorOf']})")
     return outputs
 
 
-def monitor_rule(output: dict, *, keep_on: bool = False) -> str:
+def monitor_rule(output: dict, *, keep_on: bool = False, include_clear_mirror: bool = False) -> str:
     """One hl.monitor call. Hyprland merges a rule into the one already set for
     that output, so every field is spelled out: a rule that left out
     `disabled` or `bitdepth` would keep the old value."""
@@ -142,6 +187,8 @@ def monitor_rule(output: dict, *, keep_on: bool = False) -> str:
     mode = output["mode"]
     if mode is None:
         return f'hl.monitor({{ output = {selector}, disabled = false, mode = "preferred", position = "auto", scale = "auto" }})'
+    sdr_b = output["sdrBrightness"] if output["hdr"] else 1
+    sdr_s = output["sdrSaturation"] if output["hdr"] else 1
     fields = [
         f"output = {selector}",
         "disabled = false",
@@ -152,19 +199,27 @@ def monitor_rule(output: dict, *, keep_on: bool = False) -> str:
         f"vrr = {output['vrr']}",
         'cm = "hdr"' if output["hdr"] else 'cm = "srgb"',
         f"bitdepth = {10 if output['hdr'] else 8}",
+        f"sdrbrightness = {_fmt(sdr_b)}",
+        f"sdrsaturation = {_fmt(sdr_s)}",
     ]
+    if output.get("mirrorOf"):
+        fields.append(f"mirror = {lua_string(output['mirrorOf'])}")
+    elif include_clear_mirror:
+        fields.append('mirror = ""')
     return "hl.monitor({ " + ", ".join(fields) + " })"
 
 
 def live_lua(outputs: list) -> str:
-    """Rules for `hyprctl eval`. A monitor off because the lid is shut is
-    skipped: Omarchy's clamshell handling owns it. One switched to another
-    input is turned off here. Monitors switched on come first so no step
-    leaves nothing lit."""
-    on = [o for o in outputs if o["enabled"] and not o["autoOff"]]
+    """Rules for `hyprctl eval`. Non-mirroring enabled monitors come first so
+    mirror sources exist and no step leaves nothing lit; mirrored monitors next;
+    then disabled and input-switched monitors. Lid-closed panels are skipped."""
+    primary_on = [o for o in outputs if o["enabled"] and not o["autoOff"] and not o["mirrorOf"]]
+    mirror_on = [o for o in outputs if o["enabled"] and not o["autoOff"] and o["mirrorOf"]]
     off = [o for o in outputs if (not o["enabled"] and not o["autoOff"]) or o["offReason"] == "input"]
-    return "\n".join([monitor_rule(o) for o in on] +
-                     [monitor_rule(dict(o, enabled=False)) for o in off])
+    lines = [monitor_rule(o, include_clear_mirror=True) for o in primary_on]
+    lines += [monitor_rule(o) for o in mirror_on]
+    lines += [monitor_rule(dict(o, enabled=False)) for o in off]
+    return "\n".join(lines)
 
 
 def file_block(outputs: list, carried: list) -> str:
@@ -325,6 +380,61 @@ def load_memory() -> dict:
         return {}
 
 
+def parse_hyprsunset_temp(text: str):
+    match = re.search(r"\b(\d{4})\b", text or "")
+    if not match:
+        return None
+    temp = int(match.group(1))
+    return temp if 1000 <= temp <= 10000 else None
+
+
+def nightlight_state() -> dict:
+    try:
+        result = subprocess.run(["hyprctl", "hyprsunset", "temperature"],
+                                capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return {"enabled": False, "kelvin": DAY_KELVIN}
+    if result.returncode != 0:
+        return {"enabled": False, "kelvin": DAY_KELVIN}
+    temp = parse_hyprsunset_temp(result.stdout)
+    if temp is None:
+        return {"enabled": False, "kelvin": DAY_KELVIN}
+    return {"enabled": temp < DAY_KELVIN, "kelvin": temp}
+
+
+def set_nightlight(enabled: bool, kelvin: int = 4000) -> dict:
+    if enabled:
+        target = _int(kelvin, 1500, 6400, "kelvin")
+        running = subprocess.run(["pgrep", "-x", "hyprsunset"], capture_output=True).returncode == 0
+        if not running:
+            subprocess.Popen(["hyprsunset"], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            for _ in range(15):
+                time.sleep(0.1)
+                probe = subprocess.run(["hyprctl", "hyprsunset", "temperature"],
+                                       capture_output=True, text=True, timeout=2)
+                if probe.returncode == 0:
+                    break
+        result = subprocess.run(["hyprctl", "hyprsunset", "temperature", str(target)],
+                                capture_output=True, text=True, timeout=4)
+        ok = result.returncode == 0
+        state_out = {"enabled": True, "kelvin": target}
+    else:
+        subprocess.run(["hyprctl", "hyprsunset", "temperature", str(DAY_KELVIN)],
+                       capture_output=True, text=True, timeout=4)
+        subprocess.run(["hyprctl", "hyprsunset", "identity"],
+                       capture_output=True, text=True, timeout=4)
+        ok = True
+        state_out = {"enabled": False, "kelvin": DAY_KELVIN}
+    # Let Omarchy's nightlight service refresh its indicator without overwriting our Kelvin.
+    try:
+        subprocess.run(["omarchy-shell", "ipc", "call", "nightlight", "refresh"],
+                       capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {"ok": ok, "nightLight": state_out}
+
+
 def connected_monitors() -> list:
     monitors = []
     for monitor in hyprctl_json("monitors", "all"):
@@ -338,7 +448,12 @@ def connected_monitors() -> list:
 
 
 def state() -> dict:
-    return {"monitors": connected_monitors(), "lidClosed": lid_closed(), "memory": load_memory()}
+    return {
+        "monitors": connected_monitors(),
+        "lidClosed": lid_closed(),
+        "nightLight": nightlight_state(),
+        "memory": load_memory(),
+    }
 
 
 # ------------------------------------------------------------------ apply
@@ -381,6 +496,11 @@ def fallbacks(outputs: list) -> list:
 
 # ------------------------------------------------------------------ DDC/CI
 
+def input_label(code: str) -> str:
+    norm = "0x%02x" % int(code, 16) if isinstance(code, str) else ""
+    return MCCS_INPUTS.get(norm, f"Input {norm.upper()}")
+
+
 def ddc_buses() -> dict:
     """Connector name -> I2C bus number, from `ddcutil detect`."""
     try:
@@ -410,6 +530,37 @@ def parse_ddc_detect(text: str) -> dict:
 def parse_vcp_input(text: str):
     match = re.search(r"VCP\s+60\s+SNC\s+x([0-9a-fA-F]{1,2})\b", text or "")
     return "0x%02x" % int(match.group(1), 16) if match else None
+
+
+def parse_vcp60_capabilities(text: str) -> list:
+    """Extract supported VCP 0x60 input codes from `ddcutil capabilities`."""
+    lines = (text or "").splitlines()
+    in_60 = False
+    in_values = False
+    seen = []
+    for raw in lines:
+        stripped = raw.strip()
+        if re.match(r"Feature:\s*60\b", stripped, re.IGNORECASE):
+            in_60 = True
+            in_values = False
+            continue
+        if in_60:
+            if re.match(r"Feature:\s*[0-9a-fA-F]{2}\b", stripped, re.IGNORECASE):
+                break
+            if stripped.startswith("Values:"):
+                in_values = True
+                continue
+            if in_values:
+                match = re.match(r"([0-9a-fA-F]{2})\s*:\s*(.*)$", stripped)
+                if match:
+                    code = "0x%02x" % int(match.group(1), 16)
+                    raw_label = match.group(2).strip()
+                    label = MCCS_INPUTS.get(code) or raw_label or f"Input {code.upper()}"
+                    if not any(item["code"] == code for item in seen):
+                        seen.append({"code": code, "label": label})
+                elif stripped and not stripped.startswith("("):
+                    break
+    return seen
 
 
 def ddc_input(bus: str):
@@ -446,26 +597,90 @@ def ddc_poll(names: list) -> dict:
     return {name: (ddc_input(buses[name]) if name in buses else None) for name in names}
 
 
+def ddc_inputs(name: str) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
+        raise ValueError(f"invalid monitor name: {name!r}")
+    buses = cached_buses([name])
+    bus = buses.get(name)
+    if not bus:
+        return {"ok": False, "name": name, "current": None, "inputs": [], "errors": ["No DDC/CI bus found for display"]}
+    current = ddc_input(bus)
+    inputs = []
+    try:
+        cap = subprocess.run(["ddcutil", "--bus", bus, "--skip-ddc-checks", "capabilities"],
+                             capture_output=True, text=True, timeout=DDC_CAP_TIMEOUT)
+        if cap.returncode == 0:
+            inputs = parse_vcp60_capabilities(cap.stdout)
+    except (OSError, subprocess.SubprocessError):
+        inputs = []
+    if not inputs:
+        inputs = [{"code": c, "label": input_label(c)} for c in DEFAULT_INPUT_CODES]
+    if current and not any(item["code"] == current for item in inputs):
+        inputs.insert(0, {"code": current, "label": input_label(current)})
+    return {"ok": True, "name": name, "current": current, "inputs": inputs}
+
+
+def ddc_set_input(name: str, code: str) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
+        raise ValueError(f"invalid monitor name: {name!r}")
+    if not re.fullmatch(r"0x[0-9a-fA-F]{1,2}", str(code or "")):
+        raise ValueError(f"invalid VCP input code: {code!r}")
+    norm = "0x%02x" % int(code, 16)
+    buses = cached_buses([name])
+    bus = buses.get(name)
+    if not bus:
+        return {"ok": False, "errors": [f"No DDC/CI bus found for {name}"]}
+    result = subprocess.run(["ddcutil", "--bus", bus, "--skip-ddc-checks", "setvcp", "60", norm],
+                            capture_output=True, text=True, timeout=DDC_TIMEOUT)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip() or f"ddcutil setvcp exited {result.returncode}"
+        return {"ok": False, "errors": [err]}
+    return {"ok": True, "name": name, "code": norm, "label": input_label(norm)}
+
+
+def ddc_relearn(name: str, fp: str) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
+        raise ValueError(f"invalid monitor name: {name!r}")
+    reading = ddc_poll([name]).get(name)
+    if not reading:
+        return {"ok": False, "errors": [f"Could not read DDC/CI input for {name}"]}
+    memory = load_memory()
+    if not isinstance(memory.get("monitors"), dict):
+        memory["monitors"] = {}
+    profile = memory["monitors"].get(fp)
+    if not isinstance(profile, dict):
+        profile = {"ddcWatch": True}
+        memory["monitors"][fp] = profile
+    profile["ddcWatch"] = True
+    profile["ddcInput"] = reading
+    atomic_write(memory_path(), json.dumps(memory, indent=2, sort_keys=True) + "\n", 0o600)
+    return {"ok": True, "ddcInput": reading, "label": input_label(reading), "memory": memory}
+
+
 # ------------------------------------------------------------------ persist
 
 def persist(payload: dict) -> dict:
-    outputs = validate_plan(payload.get("plan"))
+    plan_raw = payload.get("plan")
+    outputs = validate_plan(plan_raw) if plan_raw is not None else None
     memory = payload.get("memory")
+    if outputs is None and memory is None:
+        raise ValueError("persist requires plan and/or memory")
     if memory is not None:
         if not isinstance(memory, dict):
             raise ValueError("memory must be an object")
         monitors = memory.get("monitors") if isinstance(memory.get("monitors"), dict) else {}
-        # Learn the input a newly watched monitor is on, so a later switch to
-        # another input can be told apart from it.
-        learn = [o for o in outputs if o["ddcWatch"] and not (monitors.get(o["fp"]) or {}).get("ddcInput")]
-        if learn:
-            readings = ddc_poll([o["name"] for o in learn])
-            for output in learn:
-                profile = monitors.get(output["fp"])
-                if isinstance(profile, dict) and readings.get(output["name"]):
-                    profile["ddcInput"] = readings[output["name"]]
+        if outputs is not None:
+            # Learn the input a newly watched monitor is on, so a later switch to
+            # another input can be told apart from it.
+            learn = [o for o in outputs if o["ddcWatch"] and not (monitors.get(o["fp"]) or {}).get("ddcInput")]
+            if learn:
+                readings = ddc_poll([o["name"] for o in learn])
+                for output in learn:
+                    profile = monitors.get(output["fp"])
+                    if isinstance(profile, dict) and readings.get(output["name"]):
+                        profile["ddcInput"] = readings[output["name"]]
         atomic_write(memory_path(), json.dumps(memory, indent=2, sort_keys=True) + "\n", 0o600)
-    changed = write_monitors_lua(outputs)
+    changed = write_monitors_lua(outputs) if outputs is not None else False
     return {"ok": True, "monitorsLuaChanged": changed}
 
 
@@ -490,6 +705,26 @@ def main(argv: list) -> int:
             result = persist(payload)
         elif command == "ddc-poll":
             result = ddc_poll(argv[1:])
+        elif command == "ddc-inputs":
+            if len(argv) < 2:
+                raise ValueError("ddc-inputs expects monitor name")
+            result = ddc_inputs(argv[1])
+        elif command == "ddc-set-input":
+            if len(argv) < 3:
+                raise ValueError("ddc-set-input expects monitor name and code")
+            result = ddc_set_input(argv[1], argv[2])
+        elif command == "ddc-relearn":
+            if len(argv) < 3:
+                raise ValueError("ddc-relearn expects monitor name and fingerprint")
+            result = ddc_relearn(argv[1], argv[2])
+        elif command == "nightlight":
+            if len(argv) < 2 or argv[1] not in ("on", "off"):
+                raise ValueError("nightlight expects 'on <kelvin>' or 'off'")
+            if argv[1] == "on":
+                kelvin = int(argv[2]) if len(argv) >= 3 else 4000
+                result = set_nightlight(True, kelvin)
+            else:
+                result = set_nightlight(False)
         else:
             print(f"unknown command: {command}", file=sys.stderr)
             return 2

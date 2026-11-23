@@ -59,11 +59,18 @@ class LuaTest(unittest.TestCase):
         self.assertEqual(ctl.lua_string("é"), '"\\195\\169"')
 
     def test_rule_spells_out_every_field(self):
-        rule = ctl.monitor_rule(output(hdr=True, vrr=2, scale=1.25, x=1920, y=-200))
+        rule = ctl.monitor_rule(output(hdr=True, vrr=2, scale=1.25, x=1920, y=-200,
+                                       transform=1, sdrBrightness=1.35, sdrSaturation=1.1))
         self.assertEqual(rule, 'hl.monitor({ output = "desc:BNQ BenQ GW2790Q ET97T00426087", '
                                'disabled = false, mode = "2560x1440@100.00", position = "1920x-200", '
-                               'scale = 1.25, transform = 0, vrr = 2, cm = "hdr", bitdepth = 10 })')
-        self.assertIn('cm = "srgb", bitdepth = 8', ctl.monitor_rule(output()))
+                               'scale = 1.25, transform = 1, vrr = 2, cm = "hdr", bitdepth = 10, '
+                               'sdrbrightness = 1.35, sdrsaturation = 1.1 })')
+        sdr_rule = ctl.monitor_rule(output(sdrBrightness=1.5))
+        self.assertIn('cm = "srgb", bitdepth = 8, sdrbrightness = 1, sdrsaturation = 1', sdr_rule)
+        mirror_rule = ctl.monitor_rule(output(mirrorOf="eDP-1"))
+        self.assertIn('mirror = "eDP-1"', mirror_rule)
+        clear_rule = ctl.monitor_rule(output(), include_clear_mirror=True)
+        self.assertIn('mirror = ""', clear_rule)
 
     def test_disabled_rule(self):
         self.assertEqual(ctl.monitor_rule(output(enabled=False)),
@@ -71,6 +78,7 @@ class LuaTest(unittest.TestCase):
 
     def test_validation_rejects_bad_values(self):
         for bad in ({"x": 1.5}, {"scale": 0}, {"vrr": 3}, {"transform": True},
+                    {"sdrBrightness": 3.0}, {"sdrSaturation": 0.1}, {"mirrorOf": "a\nb"},
                     {"mode": {"w": "2560; os.exit()", "h": 1440, "hz": 60}}, {"selector": "a\nb"}):
             with self.subTest(bad=bad), self.assertRaises((ValueError, TypeError)):
                 output(**bad)
@@ -80,13 +88,29 @@ class LuaTest(unittest.TestCase):
             ctl.validate_plan([dict(output(enabled=False))])
         with self.assertRaises(ValueError):
             ctl.validate_plan([dict(output(autoOff=True))])
+        with self.assertRaises(ValueError):
+            ctl.validate_plan([dict(output(mirrorOf="HDMI-A-1"))])
+        with self.assertRaises(ValueError):
+            ctl.validate_plan([
+                dict(output(**LAPTOP)),
+                dict(output(mirrorOf="eDP-1")),
+                dict(output(name="DP-3", selector="DP-3", mirrorOf="HDMI-A-1")),
+            ])
 
-    def test_live_rules_skip_auto_off_and_turn_monitors_on_first(self):
-        lua = ctl.live_lua([output(**LAPTOP, enabled=False), output(), output(name="DP-3", selector="DP-3", autoOff=True)])
+    def test_live_rules_order_primary_then_mirrors_then_disabled(self):
+        lua = ctl.live_lua([
+            output(**LAPTOP, enabled=False),
+            output(name="DP-3", selector="DP-3", mirrorOf="HDMI-A-1"),
+            output(),
+            output(name="DP-4", selector="DP-4", autoOff=True),
+        ])
         lines = lua.split("\n")
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines), 3)
         self.assertIn("desc:BNQ", lines[0])
-        self.assertIn('output = "eDP-1", disabled = true', lines[1])
+        self.assertIn('mirror = ""', lines[0])
+        self.assertIn('output = "DP-3"', lines[1])
+        self.assertIn('mirror = "HDMI-A-1"', lines[1])
+        self.assertIn('output = "eDP-1", disabled = true', lines[2])
 
 
     def test_input_switched_monitor_is_turned_off_live_but_lid_is_left_alone(self):
@@ -174,8 +198,50 @@ Invalid display
         self.assertEqual(ctl.parse_vcp_input("VCP 60 SNC x0F"), "0x0f")
         self.assertIsNone(ctl.parse_vcp_input("VCP 60 ERR"))
 
+    def test_ddc_capabilities_and_nightlight_parsers(self):
+        caps = """VCP Features:
+   Feature: 10 (Brightness)
+   Feature: 60 (Input Source)
+      Values:
+         0f: DisplayPort-1
+         11: HDMI-1
+         12: HDMI-2
+   Feature: 62 (Audio speaker volume)
+"""
+        self.assertEqual(ctl.parse_vcp60_capabilities(caps), [
+            {"code": "0x0f", "label": "DP-1"},
+            {"code": "0x11", "label": "HDMI-1"},
+            {"code": "0x12", "label": "HDMI-2"},
+        ])
+        self.assertEqual(ctl.parse_hyprsunset_temp("4000\n"), 4000)
+        self.assertIsNone(ctl.parse_hyprsunset_temp("Couldn't connect"))
+
 
 class PersistTest(unittest.TestCase):
+    def test_persist_memory_only_skips_monitors_lua(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lua = Path(tmp) / "hypr" / "monitors.lua"
+            env = {"XDG_STATE_HOME": str(Path(tmp) / "state"), "DICEY_DISPLAYS_MONITORS_LUA": str(lua)}
+            memory = {"version": 1, "monitors": {}, "layouts": {}}
+            with mock.patch.dict(os.environ, env):
+                result = ctl.persist({"memory": memory})
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["monitorsLuaChanged"])
+            self.assertFalse(lua.exists())
+            self.assertEqual(json.loads((Path(tmp) / "state" / "dicey-bar" / "displays.json").read_text()), memory)
+
+    def test_ddc_relearn_updates_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"XDG_STATE_HOME": str(Path(tmp) / "state")}
+            fp = "BNQ|BenQ GW2790Q|ET97T00426087"
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(ctl, "ddc_poll", return_value={"HDMI-A-1": "0x0f"}):
+                result = ctl.ddc_relearn("HDMI-A-1", fp)
+                saved = json.loads((Path(tmp) / "state" / "dicey-bar" / "displays.json").read_text())
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["ddcInput"], "0x0f")
+            self.assertEqual(saved["monitors"][fp]["ddcInput"], "0x0f")
+
     def test_persist_writes_memory_and_learns_watched_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             lua = Path(tmp) / "hypr" / "monitors.lua"

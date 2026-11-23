@@ -26,6 +26,7 @@ Item {
   property var memory: ({})
   property bool lidClosed: false
   property bool loaded: false
+  property var liveNightLight: ({ enabled: false, kelvin: 4000 })
   // Monitors left off for now (lid shut, switched to another input), keyed by
   // fingerprint, and the current state as a plan with those marked.
   readonly property var currentAutoOff: Model.autoOffFor(Model.planFromLive(monitors, memory), lidClosed, ddcOff)
@@ -40,7 +41,7 @@ Item {
   property var fallbacks: []
   property string lastError: ""
 
-  // After an Apply that changes a mode or turns a monitor on or off.
+  // After an Apply that changes a mode, rotation, HDR, mirror, or power state.
   property bool confirming: false
   property int confirmSeconds: 0
   property var pendingCommit: null
@@ -107,6 +108,15 @@ Item {
     return String(stderr || "").trim().split("\n").pop() || "The display helper failed"
   }
 
+  function hasSavedProfile(fp) {
+    return !!(memory && memory.monitors && fp && Object.prototype.hasOwnProperty.call(memory.monitors, fp))
+  }
+
+  function savedDdcInput(fp) {
+    if (!memory || !memory.monitors || !fp || !memory.monitors[fp]) return ""
+    return String(memory.monitors[fp].ddcInput || "")
+  }
+
   // ---------------------------------------------------------------- state
   function refresh(then) {
     if (then) refreshWaiters = refreshWaiters.concat([then])
@@ -118,6 +128,15 @@ Item {
         service.monitors = data.monitors
         service.memory = Model.normalizeMemory(data.memory)
         service.lidClosed = data.lidClosed === true
+        if (data.nightLight && typeof data.nightLight === "object") {
+          var prevK = service.liveNightLight && service.liveNightLight.kelvin >= 1500 && service.liveNightLight.kelvin <= 6400
+            ? service.liveNightLight.kelvin : 4000
+          var k = Number(data.nightLight.kelvin)
+          service.liveNightLight = {
+            enabled: data.nightLight.enabled === true,
+            kelvin: (data.nightLight.enabled === true && isFinite(k) && k >= 1500 && k <= 6400) ? Math.round(k) : prevK
+          }
+        }
         service.loaded = true
         service.forgetGoneMonitors()
       } else {
@@ -141,7 +160,7 @@ Item {
     ddcMisses = misses
   }
 
-  // ---------------------------------------------------------------- per-monitor side effects
+  // ---------------------------------------------------------------- side effects
   property var brightnessRestoreQueue: []
 
   Process { id: textSizeApplyProc }
@@ -158,8 +177,31 @@ Item {
     brightnessRestoreProc.running = true
   }
 
-  // Restore per-monitor brightness and per-setup OS-wide text size after a
-  // hotplug reconcile or Apply commit.
+  function setAllBrightness(pct, outputs) {
+    var clamped = Math.max(1, Math.min(100, Math.round(Number(pct))))
+    var list = Array.isArray(outputs) ? outputs : livePlan
+    var queue = []
+    for (var i = 0; i < list.length; i++) {
+      var o = list[i]
+      if (o && o.enabled && !o.autoOff) queue.push({ name: o.name, pct: clamped })
+    }
+    if (!queue.length) return
+    brightnessRestoreQueue = queue
+    pumpBrightnessRestore()
+  }
+
+  function setNightLight(enabled, kelvin, done) {
+    var k = Math.max(1500, Math.min(6400, Math.round(Number(kelvin) || 4000)))
+    liveNightLight = { enabled: !!enabled, kelvin: k }
+    var args = enabled ? ["nightlight", "on", String(k)] : ["nightlight", "off"]
+    run(args, null, function(code, data, stderr) {
+      if (code !== 0) service.lastError = service.errorText(data, stderr)
+      if (done) done(code === 0, data, stderr)
+    })
+  }
+
+  // Restore per-monitor brightness and per-setup OS-wide text size & night
+  // light after a hotplug reconcile or Apply commit.
   function applyMonitorPreferences(plan, savedMemory, restoreBrightness) {
     if (!Array.isArray(plan) || !plan.length) return
     if (restoreBrightness) {
@@ -174,11 +216,77 @@ Item {
         pumpBrightnessRestore()
       }
     }
-    var textSize = Model.layoutTextSize(savedMemory || memory, plan)
+    var mem = savedMemory || memory
+    var textSize = Model.layoutTextSize(mem, plan)
     if (textSize !== null && textSize !== Style.font.baseSize) {
       textSizeApplyProc.command = ["omarchy-display-text-size", String(textSize)]
       if (!textSizeApplyProc.running) textSizeApplyProc.running = true
     }
+    if (restoreBrightness) {
+      var savedNl = Model.layoutNightLight(mem, plan)
+      if (savedNl && !Model.sameNightLight(savedNl, liveNightLight)) {
+        setNightLight(savedNl.enabled, savedNl.kelvin, null)
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- memory & DDC actions
+  function forgetMonitor(fp, done) {
+    if (!fp) return
+    var nextMemory = Model.forgetMonitor(memory, fp)
+    memory = nextMemory
+    run(["persist"], JSON.stringify({ memory: nextMemory }), function(code, data, stderr) {
+      service.lastError = code === 0 ? "" : service.errorText(data, stderr)
+      service.refresh(function() {
+        if (done) done(code === 0)
+      })
+    })
+  }
+
+  function relearnDdcInput(name, fp, done) {
+    if (!name || !fp) return
+    run(["ddc-relearn", name, fp], null, function(code, data, stderr) {
+      if (code === 0 && data && data.ok) {
+        if (data.memory) service.memory = Model.normalizeMemory(data.memory)
+        var off = {}
+        var misses = {}
+        for (var k in service.ddcOff) if (k !== fp) off[k] = service.ddcOff[k]
+        for (var m in service.ddcMisses) if (m !== fp) misses[m] = service.ddcMisses[m]
+        service.ddcOff = off
+        service.ddcMisses = misses
+        service.lastError = ""
+        if (done) done(true, data)
+      } else {
+        var err = service.errorText(data, stderr)
+        service.lastError = err
+        if (done) done(false, { error: err })
+      }
+    })
+  }
+
+  function probeDdcInputs(name, done) {
+    if (!name) return
+    run(["ddc-inputs", name], null, function(code, data, stderr) {
+      if (code === 0 && data && data.ok) {
+        if (done) done(true, data)
+      } else {
+        if (done) done(false, { error: service.errorText(data, stderr) })
+      }
+    })
+  }
+
+  function setDdcInput(name, codeHex, done) {
+    if (!name || !codeHex) return
+    run(["ddc-set-input", name, codeHex], null, function(code, data, stderr) {
+      if (code === 0 && data && data.ok) {
+        service.lastError = ""
+        if (done) done(true, data)
+      } else {
+        var err = service.errorText(data, stderr)
+        service.lastError = err
+        if (done) done(false, { error: err })
+      }
+    })
   }
 
   // ---------------------------------------------------------------- automatic
@@ -275,8 +383,8 @@ Item {
 
   // ---------------------------------------------------------------- Apply
   // `plan` is the panel's full arrangement. Applying it saves each monitor's
-  // settings and this combination's layout; a mode change first waits for
-  // the user to keep it.
+  // settings and this combination's layout; a mode/power/rotation/mirror change
+  // first waits for the user to keep it.
   function applyFromPanel(plan, options) {
     if (confirming || !plan || !plan.length) return
     var before = livePlan
