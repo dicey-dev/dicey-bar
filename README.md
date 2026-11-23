@@ -57,10 +57,11 @@ from separate widget plugins rather than from Dicey Bar itself.
 - **Drop-in and reversible.** You can switch back to the stock bar with one
   command. There is no build step, daemon, privileged helper or second
   Quickshell process.
-- **Displays panel.** An optional `dicey.displays` widget arranges monitors
-  by drag and drop, sets each one's resolution, refresh rate, scale, adaptive
-  sync, HDR and brightness, and remembers it all per monitor when you press
-  Apply. See [Displays panel](#displays-panel).
+- **Displays panel.** Replaces Omarchy's default monitor icon (`omarchy.monitor`)
+  with a built-in multi-monitor manager: drag-and-drop layout snapping,
+  separate resolution and refresh rate dropdowns, scale, adaptive sync, HDR,
+  brightness, night light, text size, and per-monitor automatic restore. See
+  [Displays panel](#displays-panel).
 - **Plain-text rendering.** Window titles, tray tooltips and command output are
   always drawn as plain text, never as rich text or markup.
 
@@ -118,31 +119,28 @@ compared with the stock bar.
 
 ## Displays panel
 
-Dicey Bar ships an optional monitor manager. Add it to any bar section by
-editing `~/.config/omarchy/shell.json` (`omarchy bar put` only accepts
-installed widget plugins, and this widget belongs to the bar itself):
-
-```json
-"right": [{ "id": "dicey.displays" }, { "id": "omarchy.audio" }]
-```
+Dicey Bar upgrades the stock `omarchy.monitor` icon into a built-in
+multi-monitor manager (and deduplicates `dicey.displays` if both IDs appear in
+`~/.config/omarchy/shell.json`, so only one display icon sits in the bar).
 
 - Drag displays on the canvas; they snap edge to edge and gaps close.
-- Pick resolution and refresh rate separately, plus scale, adaptive sync and
-  HDR (for displays that report HDR support).
-- **Apply** applies the change and remembers it. Each monitor keeps its own
-  settings, and each combination of connected monitors keeps its own
-  layout, so plugging a monitor back in restores what you used last time
-  with it. A monitor in a new combination is placed beside the display it
-  was last next to.
+- Pick resolution and refresh rate separately via side-by-side dropdowns, plus
+  scale, adaptive sync and HDR (for displays that report HDR support).
+- **Apply & Remember** applies the change and remembers it. Each monitor keeps
+  its own settings, and each combination of connected monitors keeps its own
+  layout, so plugging a monitor back in restores what you used last time with
+  it. A monitor in a new combination is placed beside the display it was last
+  next to.
 - Changing a mode or turning a display on or off asks you to keep the change
   and reverts on its own after 10 seconds.
-- Brightness, text size and night light apply straight away.
-- **Turn off when switched away** (external monitors) reads the monitor's
-  input over DDC/CI every 5 seconds. When the monitor shows another input or
-  stops answering, it is turned off and the layout is rearranged without it;
-  it comes back when the monitor returns to this computer's input. This
-  needs `ddcutil` and a monitor with DDC/CI enabled.
-- Closing the laptop lid is left to Omarchy's own clamshell handling.
+- Brightness (per-monitor or all-monitors), night light (toggle + Kelvin
+  slider) and global text size apply straight away.
+- **Switch away / power off** (external monitors) reads the monitor's input
+  over DDC/CI every 5 seconds. When the monitor shows another input or stops
+  answering, it is turned off and the layout is rearranged without it; it comes
+  back when the monitor returns to this computer's input. This needs `ddcutil`
+  and a monitor with DDC/CI enabled.
+- Closing the laptop lid is handled by Omarchy's clamshell guard.
 
 Settings are stored in `~/.local/state/dicey-bar/displays.json`. The panel
 writes its rules into a marked block in `~/.config/hypr/monitors.lua` so they

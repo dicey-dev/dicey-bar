@@ -405,7 +405,7 @@ Item {
       out[section] = section === "left" || section === "center" || section === "right"
         ? pinTrayToInner(entries, section) : entries
     }
-    return out
+    return BarModel.mergeDisplayEntries(out)
   }
 
   // The tray drawer reveals inward (away from the bar edge). Place it at the
@@ -581,14 +581,20 @@ Item {
   // (clock, workspaces, tray) return null. Used by shell.summon/toggle so
   // panel hotkeys route through the bar instead of a per-target IPC handler
   // that only reaches whichever per-monitor instance claimed the target.
+  function isDisplaysWidgetId(id) {
+    var key = String(id || "")
+    return key === root.displaysWidgetId || key === "omarchy.monitor"
+  }
+
   function findPanelWidget(pluginId) {
     var id = String(pluginId || "")
     if (!id) return null
+    var wantDisplays = isDisplaysWidgetId(id)
     var candidates = []
     for (var i = 0; i < moduleSlots.length; i++) {
       var slot = moduleSlots[i]
       if (!slot || !slot.activeItem) continue
-      if (slot.moduleName !== id) continue
+      if (slot.moduleName !== id && !(wantDisplays && isDisplaysWidgetId(slot.moduleName))) continue
       var item = slot.activeItem
       if (typeof item.open !== "function" || typeof item.close !== "function" || item.opened === undefined) continue
       candidates.push({ slot: slot, screenName: slotScreenName(slot), opened: item.opened === true })
@@ -1759,9 +1765,9 @@ Item {
       var w = root.barWidgetRegistry.widgets
       if (customType) return null
       var registryName = root.canonicalWidgetId(moduleName)
-      // The bar's own Displays widget is not in the host registry, which a
-      // third-party bar only receives a read-only copy of.
-      if (registryName === root.displaysWidgetId) return displaysWidgetComponent
+      // Dicey Bar's built-in Displays panel takes over `omarchy.monitor` and
+      // also answers the standalone `dicey.displays` id.
+      if (root.isDisplaysWidgetId(registryName)) return displaysWidgetComponent
       return w[registryName] ? w[registryName].component : null
     }
     readonly property bool qmlCustom: customType === "qml"

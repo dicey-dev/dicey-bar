@@ -7,15 +7,15 @@ import qs.Commons
 import qs.Commons as Commons
 import "DisplayModel.js" as Model
 
-// The Displays bar widget: drag monitors into place, choose each one's
-// resolution, refresh rate, scale, HDR and adaptive sync, and press Apply.
-// Apply also remembers every monitor's settings and this combination's
-// layout; DisplayService brings them back when the monitors reconnect.
-// Brightness, text size and night light take effect straight away.
+// Unified Displays bar widget (replaces stock `omarchy.monitor` and answers
+// `dicey.displays`). Drag monitors into place, pick resolution and refresh rate
+// side-by-side, tune scale, adaptive sync, HDR, brightness, night light and
+// global text size, and press Apply to remember every monitor and layout.
 Panel {
   id: root
-  moduleName: "dicey.displays"
-  ipcTarget: "dicey.displays"
+  moduleName: "omarchy.monitor"
+  ipcTarget: "omarchy.monitor"
+  manageIpc: false
 
   readonly property var service: bar && bar.displayService ? bar.displayService : null
   readonly property var live: service ? service.livePlan : []
@@ -25,7 +25,6 @@ Panel {
   property var draft: []
   property int selected: 0
   property bool edited: false
-  property bool resolutionsOpen: false
 
   readonly property bool dirty: {
     if (!draft.length || draft.length !== live.length) return false
@@ -42,15 +41,75 @@ Panel {
       if (currentGroups[i].w === current.mode.w && currentGroups[i].h === current.mode.h) return currentGroups[i].rates
     return [current.mode.hz]
   }
+  readonly property var resolutionOptions: {
+    var out = []
+    for (var i = 0; i < currentGroups.length; i++) {
+      var g = currentGroups[i]
+      out.push({ value: g.key, label: g.w + " × " + g.h })
+    }
+    if (!out.length && current && current.mode) {
+      var k = current.mode.w + "x" + current.mode.h
+      out.push({ value: k, label: current.mode.w + " × " + current.mode.h })
+    }
+    return out
+  }
+  readonly property string currentResolutionKey: current && current.mode ? (current.mode.w + "x" + current.mode.h) : ""
+  readonly property var rateOptions: {
+    var out = []
+    for (var i = 0; i < currentRates.length; i++) {
+      var r = currentRates[i]
+      out.push({ value: Model.formatHz(r), label: Model.formatHz(r) + " Hz" })
+    }
+    return out
+  }
+  readonly property string currentRateKey: {
+    if (!current || !current.mode) return ""
+    for (var i = 0; i < currentRates.length; i++)
+      if (Model.sameHz(currentRates[i], current.mode.hz)) return Model.formatHz(currentRates[i])
+    return Model.formatHz(current.mode.hz)
+  }
   readonly property int enabledCount: {
     var n = 0
     for (var i = 0; i < draft.length; i++) if (draft[i].enabled && !draft[i].autoOff) n++
     return n
   }
+  readonly property string setupSummary: {
+    var names = []
+    for (var i = 0; i < draft.length; i++) {
+      if (!draft[i].enabled || draft[i].autoOff) continue
+      names.push(draft[i].internal ? "Built-in" : shortModelName(i))
+    }
+    if (!names.length) return "No active displays"
+    return names.join(" + ")
+  }
 
+  // Theme-derived palette — strictly Commons.Color tokens so theme swaps apply live.
   readonly property color fg: bar ? bar.foreground : Commons.Color.foreground
-  readonly property color muted: Qt.darker(fg, 1.4)
+  readonly property color bg: Commons.Color.popups.background
+  readonly property color accent: Commons.Color.accent
+  readonly property color alertColor: Commons.Color.bar.active
+  readonly property color muted: Qt.rgba(fg.r, fg.g, fg.b, 0.58)
+  readonly property color cardBg: Qt.rgba(fg.r, fg.g, fg.b, 0.035)
+  readonly property color trackBg: Qt.rgba(fg.r, fg.g, fg.b, 0.055)
+  readonly property color canvasBg: Qt.rgba(bg.r * 0.65, bg.g * 0.65, bg.b * 0.65, 0.92)
+  readonly property color cardBorder: Qt.rgba(fg.r, fg.g, fg.b, 0.14)
+  readonly property color hairline: Qt.rgba(fg.r, fg.g, fg.b, 0.10)
+  readonly property color accentSoft: Qt.rgba(accent.r, accent.g, accent.b, 0.16)
+  readonly property color accentBorder: Qt.rgba(accent.r, accent.g, accent.b, 0.72)
+  readonly property color alertSoft: Qt.rgba(alertColor.r, alertColor.g, alertColor.b, 0.16)
+  readonly property color alertBorder: Qt.rgba(alertColor.r, alertColor.g, alertColor.b, 0.68)
+  readonly property real accentLuma: 0.2126 * accent.r + 0.7152 * accent.g + 0.0722 * accent.b
+  readonly property color accentInk: accentLuma > 0.45 ? Commons.Color.background : Commons.Color.foreground
   readonly property string fontName: bar ? bar.fontFamily : Style.font.family
+
+  function shortModelName(index) {
+    var m = index >= 0 && index < liveMonitors.length ? liveMonitors[index] : null
+    if (!m) return draft[index] ? draft[index].name : ""
+    var model = String(m.model || "").trim()
+    if (model && !/^0x[0-9a-f]+$/i.test(model)) return model
+    var desc = String(m.description || "").trim()
+    return desc || String(m.name || "")
+  }
 
   function resetDraft() {
     draft = live.map(copyOutput)
@@ -73,15 +132,31 @@ Panel {
     edited = true
   }
 
-  function setResolution(index, group) {
+  function setResolutionByKey(index, key) {
+    for (var i = 0; i < currentGroups.length; i++) {
+      var group = currentGroups[i]
+      if (group.key !== key) continue
+      var o = draft[index]
+      var hz = group.rates[0]
+      for (var r = 0; r < group.rates.length; r++)
+        if (Model.sameHz(group.rates[r], o.mode.hz)) hz = group.rates[r]
+      update(index, {
+        mode: { w: group.w, h: group.h, hz: hz },
+        scale: Model.cleanScale(o.scale, group.w, group.h)
+      }, true)
+      return
+    }
+  }
+
+  function setRateByKey(index, key) {
     var o = draft[index]
-    var hz = group.rates[0]
-    for (var i = 0; i < group.rates.length; i++) if (Model.sameHz(group.rates[i], o.mode.hz)) hz = group.rates[i]
-    update(index, {
-      mode: { w: group.w, h: group.h, hz: hz },
-      scale: Model.cleanScale(o.scale, group.w, group.h)
-    }, true)
-    resolutionsOpen = false
+    if (!o || !o.mode) return
+    for (var i = 0; i < currentRates.length; i++) {
+      if (Model.formatHz(currentRates[i]) === key) {
+        update(index, { mode: { w: o.mode.w, h: o.mode.h, hz: currentRates[i] } }, false)
+        return
+      }
+    }
   }
 
   function canTurnOff(index) {
@@ -98,13 +173,52 @@ Panel {
 
   function offText(o) {
     if (!o) return ""
-    if (o.offReason === "lid") return "Off while the lid is closed"
-    if (o.offReason === "input") return "Off: switched to another input"
+    if (o.offReason === "lid") return "Off while lid is closed"
+    if (o.offReason === "input") return "Switched to another input"
     return ""
   }
 
-  function modeLabel(mode) {
-    return mode ? mode.w + " × " + mode.h : ""
+  function statusBadgeText(o) {
+    if (!o) return ""
+    if (o.autoOff) return o.offReason === "lid" ? "Lid closed" : "Switched away"
+    return o.enabled ? "Active" : "Disabled"
+  }
+
+  function focusedOutputName() {
+    for (var i = 0; i < liveMonitors.length; i++)
+      if (liveMonitors[i] && liveMonitors[i].focused) return String(liveMonitors[i].name || "")
+    return current ? current.name : ""
+  }
+
+  // Compatible with stock `omarchy.monitor` IPC so brightness hotkeys and
+  // `omarchy launch monitor` route directly to this unified panel.
+  ShellIpc {
+    target: "omarchy.monitor"
+
+    function brightness(percent: string): string {
+      var target = root.focusedOutputName()
+      if (target) {
+        root.brightnessFor = target
+        root.setBrightness(Number(percent))
+      }
+      return "got " + root.brightness
+    }
+
+    function state(): string {
+      return JSON.stringify({
+        brightness: root.brightness,
+        brightnessAvailable: root.brightnessAvailable,
+        focusedMonitor: root.focusedOutputName(),
+        scale: root.current ? String(root.current.scale) : "",
+        displays: root.liveMonitors
+      })
+    }
+
+    function open() { root.open() }
+    function close() { root.close() }
+    function toggle() { root.toggle() }
+    function show() { root.open() }
+    function hide() { root.close() }
   }
 
   Connections {
@@ -114,27 +228,22 @@ Panel {
 
   onOpenedChanged: {
     if (!opened) return
-    resolutionsOpen = false
     resetDraft()
     if (service) service.refresh()
+    if (nightlight && typeof nightlight.refresh === "function") nightlight.refresh()
     readBrightness()
   }
-  onSelectedChanged: {
-    resolutionsOpen = false
-    readBrightness()
-  }
+  onSelectedChanged: readBrightness()
 
   // ---------------------------------------------------------------- brightness
   property int brightness: 0
   property bool brightnessAvailable: false
   property string brightnessFor: ""
-  property bool brightnessQueued: false
-
+  property bool syncAllBrightness: false
+  property var brightnessWriteQueue: []
   property bool brightnessReadQueued: false
 
   function readBrightness() {
-    // Read the draft directly: inside onSelectedChanged `current` may still
-    // name the previously selected monitor.
     var o = selected >= 0 && selected < draft.length ? draft[selected] : null
     brightnessAvailable = false
     if (!o || !o.enabled || o.autoOff || !opened) return
@@ -147,15 +256,28 @@ Panel {
     brightnessRead.running = true
   }
 
-  function setBrightness(value) {
-    brightness = Math.max(1, Math.min(100, Math.round(value)))
-    if (brightnessWrite.running) {
-      brightnessQueued = true
-      return
-    }
-    brightnessQueued = false
-    brightnessWrite.command = ["omarchy-brightness-display", "--no-osd", "--monitor", brightnessFor, brightness + "%"]
+  function pumpBrightnessWrites() {
+    if (brightnessWrite.running || brightnessWriteQueue.length === 0) return
+    var next = brightnessWriteQueue[0]
+    brightnessWriteQueue = brightnessWriteQueue.slice(1)
+    brightnessWrite.command = ["omarchy-brightness-display", "--no-osd", "--monitor", next.name, next.pct + "%"]
     brightnessWrite.running = true
+  }
+
+  function setBrightness(value) {
+    var pct = Math.max(1, Math.min(100, Math.round(value)))
+    brightness = pct
+    var targets = []
+    if (syncAllBrightness && enabledCount > 1) {
+      for (var i = 0; i < draft.length; i++) {
+        if (draft[i].enabled && !draft[i].autoOff) targets.push({ name: draft[i].name, pct: pct })
+      }
+    } else if (brightnessFor) {
+      targets.push({ name: brightnessFor, pct: pct })
+    }
+    if (!targets.length) return
+    brightnessWriteQueue = targets
+    pumpBrightnessWrites()
   }
 
   Process {
@@ -180,30 +302,43 @@ Panel {
 
   Process {
     id: brightnessWrite
-    onRunningChanged: if (!running && root.brightnessQueued) root.setBrightness(root.brightness)
+    onRunningChanged: if (!running) root.pumpBrightnessWrites()
   }
 
   Timer {
     id: brightnessDebounce
-    interval: 150
+    interval: 140
     onTriggered: root.setBrightness(root.brightness)
   }
 
   // ---------------------------------------------------------------- text size
-  // The same notches and CLI as Omarchy's own display panel.
   readonly property var textSizeStops: [9, 10, 11, 12, 14, 16, 20]
-
-  function nearestTextStop(px) {
-    var best = 0
-    for (var i = 1; i < textSizeStops.length; i++)
-      if (Math.abs(textSizeStops[i] - px) < Math.abs(textSizeStops[best] - px)) best = i
-    return best
-  }
-
   Process { id: textSizeProc }
+
+  function setTextSize(px) {
+    textSizeProc.command = ["omarchy-display-text-size", String(px)]
+    if (!textSizeProc.running) textSizeProc.running = true
+  }
 
   // ---------------------------------------------------------------- night light
   readonly property var nightlight: bar && bar.shell ? bar.shell.firstPartyServiceFor("omarchy.nightlight") : null
+  property int desiredKelvin: 4000
+  readonly property int activeKelvin: {
+    if (nightlight && nightlight.enabled && nightlight.temperature) {
+      var t = Math.round(Number(nightlight.temperature))
+      if (isFinite(t) && t >= 1500 && t <= 6500) return t
+    }
+    return desiredKelvin
+  }
+
+  Timer {
+    id: kelvinDebounce
+    interval: 120
+    onTriggered: {
+      if (root.nightlight && root.nightlight.enabled && typeof root.nightlight.applyTemperature === "function")
+        root.nightlight.applyTemperature(root.desiredKelvin)
+    }
+  }
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -224,61 +359,151 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: panel.loadedContent
-    contentWidth: panel.fittedContentWidth(Style.space(420))
-    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(720))
+    contentWidth: panel.fittedContentWidth(Style.space(620))
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(760))
 
     content: PanelKeyCatcher {
-      implicitHeight: column.implicitHeight + footer.implicitHeight + Style.space(12)
+      id: keyCatcher
+      implicitHeight: column.implicitHeight + footer.implicitHeight + Style.space(14)
       anchors.fill: parent
-      onCloseRequested: root.close()
+      onCloseRequested: {
+        if (resDropdown.popupOpen) resDropdown.close()
+        else if (hzDropdown.popupOpen) hzDropdown.close()
+        else root.close()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
-      // ---------- Apply (pinned below the scrolling settings) ----------
+      // ---------- Sticky Footer ----------
       Item {
         id: footer
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        implicitHeight: Math.max(applyButton.implicitHeight, statusText.implicitHeight)
+        implicitHeight: footerRow.implicitHeight + Style.space(10)
         height: implicitHeight
 
-        Text {
-          id: statusText
+        Rectangle {
           anchors.left: parent.left
-          anchors.right: applyButton.left
-          anchors.rightMargin: Style.space(10)
-          anchors.verticalCenter: parent.verticalCenter
-          textFormat: Text.PlainText
-          wrapMode: Text.Wrap
-          text: {
-            var s = root.service
-            if (!s) return ""
-            if (s.lastError) return s.lastError
-            if (s.fallbacks.length) {
-              var f = s.fallbacks[0]
-              return f.name + " is running " + f.actual + " instead of " + f.wanted + " (likely link bandwidth)"
-            }
-            if (s.confirming) return "Waiting for you to keep or revert"
-            if (root.dirty) return "Apply to use and remember these settings"
-            return ""
-          }
-          color: root.service && (root.service.lastError || root.service.fallbacks.length) ? Commons.Color.bar.active : root.muted
-          font.family: root.fontName
-          font.pixelSize: Style.font.caption
+          anchors.right: parent.right
+          anchors.top: parent.top
+          height: 1
+          color: root.hairline
         }
 
-        Button {
-          id: applyButton
+        Item {
+          id: footerRow
+          anchors.left: parent.left
           anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          text: "Apply"
-          bordered: true
-          active: root.dirty
-          enabled: root.dirty && !!root.service && !root.service.confirming
-          opacity: enabled ? 1 : 0.45
-          foreground: root.fg
-          fontFamily: root.fontName
-          onClicked: root.apply()
+          anchors.bottom: parent.bottom
+          implicitHeight: Math.max(footerActions.implicitHeight, statusText.implicitHeight)
+          height: implicitHeight
+
+          Text {
+            id: statusText
+            anchors.left: parent.left
+            anchors.right: footerActions.left
+            anchors.rightMargin: Style.space(12)
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            text: {
+              var s = root.service
+              if (!s) return ""
+              if (s.lastError) return s.lastError
+              if (s.fallbacks.length) {
+                var f = s.fallbacks[0]
+                return f.name + " fell back to " + f.actual + " instead of " + f.wanted
+              }
+              if (s.confirming) return "Confirming changes (" + s.confirmSeconds + "s)"
+              if (root.dirty) return "Unsaved draft · Apply to preview & remember setup"
+              return "Synced with monitors.lua · auto-applies on reconnect"
+            }
+            color: {
+              var s = root.service
+              if (s && (s.lastError || s.fallbacks.length)) return root.alertColor
+              if (root.dirty || (s && s.confirming)) return root.accent
+              return root.muted
+            }
+            font.family: root.fontName
+            font.pixelSize: Style.font.caption
+          }
+
+          Row {
+            id: footerActions
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(8)
+
+            // Discard draft
+            Rectangle {
+              id: discardBtn
+              readonly property bool activeAction: root.dirty && !!root.service && !root.service.confirming
+              implicitWidth: discardLabel.implicitWidth + Style.space(18)
+              implicitHeight: Style.space(28)
+              radius: Style.cornerRadius
+              color: discardMouse.containsMouse && activeAction ? root.trackBg : "transparent"
+              border.color: discardMouse.containsMouse && activeAction ? root.accentBorder : root.cardBorder
+              border.width: 1
+              opacity: activeAction ? 1 : 0.4
+
+              Text {
+                id: discardLabel
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: "Discard"
+                color: root.fg
+                font.family: root.fontName
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+
+              MouseArea {
+                id: discardMouse
+                anchors.fill: parent
+                enabled: discardBtn.activeAction
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.resetDraft()
+              }
+            }
+
+            // Primary Accent Apply button
+            Rectangle {
+              id: applyBtn
+              readonly property bool canApply: root.dirty && !!root.service && !root.service.confirming
+              implicitWidth: applyLabel.implicitWidth + Style.space(22)
+              implicitHeight: Style.space(28)
+              radius: Style.cornerRadius
+              color: canApply
+                ? (applyMouse.containsMouse ? Qt.lighter(root.accent, 1.08) : root.accent)
+                : root.trackBg
+              border.color: canApply ? root.accent : root.cardBorder
+              border.width: 1
+              opacity: canApply ? 1 : 0.55
+
+              Behavior on color { ColorAnimation { duration: Style.duration(120) } }
+
+              Text {
+                id: applyLabel
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: "Apply & Remember"
+                color: applyBtn.canApply ? root.accentInk : root.muted
+                font.family: root.fontName
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+
+              MouseArea {
+                id: applyMouse
+                anchors.fill: parent
+                enabled: applyBtn.canApply
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.apply()
+              }
+            }
+          }
         }
       }
 
@@ -288,11 +513,10 @@ Panel {
         anchors.right: parent.right
         anchors.top: parent.top
         anchors.bottom: footer.top
-        anchors.bottomMargin: Style.space(12)
+        anchors.bottomMargin: Style.space(10)
         clip: true
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
         ScrollBar.vertical.policy: column.implicitHeight > height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
-        // Keep the scrollbar off the switches and values on the right edge.
         rightPadding: ScrollBar.vertical.visible ? ScrollBar.vertical.width + Style.space(4) : 0
         Binding {
           target: scrollArea.contentItem
@@ -303,454 +527,885 @@ Panel {
         Column {
           id: column
           width: scrollArea.availableWidth
-          spacing: Style.space(12)
+          spacing: Style.space(10)
+
+          readonly property bool twoColumn: width >= Style.space(500)
 
           // ---------- Header ----------
           Item {
             width: parent.width
-            implicitHeight: Math.max(heroIcon.implicitHeight, heroText.implicitHeight)
+            implicitHeight: Math.max(headerLeft.implicitHeight, headerActions.implicitHeight)
 
-            Text {
-              id: heroIcon
-              textFormat: Text.PlainText
-              text: root.draft.length > 1 ? "󰍺" : "󰍹"
-              color: root.fg
-              font.family: root.fontName
-              font.pixelSize: Style.font.display
+            Row {
+              id: headerLeft
               anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-            }
-
-            Column {
-              id: heroText
-              anchors.left: heroIcon.right
-              anchors.leftMargin: Style.space(14)
-              anchors.right: identifyButton.left
+              anchors.right: headerActions.left
               anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
+              spacing: Style.space(10)
 
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: "Displays"
-                color: root.fg
-                font.family: root.fontName
-                font.pixelSize: Style.font.title
-                font.bold: true
-                elide: Text.ElideRight
-              }
-
-              Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                text: root.draft.length === 1 ? "1 CONNECTED" : root.draft.length + " CONNECTED"
-                color: root.muted
-                font.family: root.fontName
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                font.letterSpacing: 1.2
-                elide: Text.ElideRight
-              }
-            }
-
-            Button {
-              id: identifyButton
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Identify"
-              bordered: true
-              fontSize: Style.font.caption
-              foreground: root.fg
-              fontFamily: root.fontName
-              tooltipText: "Show each display's number on it"
-              onClicked: if (root.service) root.service.identify()
-            }
-          }
-
-          // ---------- Layout canvas ----------
-          LayoutCanvas {
-            width: parent.width
-            height: Style.space(180)
-          }
-
-          // ---------- Display tabs ----------
-          Flow {
-            width: parent.width
-            spacing: Style.spacing.xs
-
-            Repeater {
-              model: root.draft
-
-              Button {
-                required property var modelData
-                required property int index
-                text: (index + 1) + "  " + modelData.name
-                bordered: true
-                active: root.selected === index
-                fontSize: Style.font.caption
-                foreground: root.fg
-                fontFamily: root.fontName
-                opacity: modelData.enabled && !modelData.autoOff ? 1 : 0.55
-                onClicked: root.selected = index
-              }
-            }
-          }
-
-          PanelSeparator { foreground: root.fg }
-
-          // ---------- Selected display ----------
-          Column {
-            width: parent.width
-            spacing: Style.space(12)
-            visible: root.current !== null
-
-            Item {
-              width: parent.width
-              implicitHeight: Math.max(nameColumn.implicitHeight, powerSwitch.implicitHeight)
-
-              Column {
-                id: nameColumn
-                anchors.left: parent.left
-                anchors.right: powerSwitch.left
-                anchors.rightMargin: Style.space(10)
+              Rectangle {
+                width: Style.space(32)
+                height: Style.space(32)
+                radius: Math.min(Style.cornerRadius, Style.space(7))
+                color: root.accentSoft
+                border.color: root.accentBorder
+                border.width: 1
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(2)
 
                 Text {
-                  width: parent.width
+                  anchors.centerIn: parent
                   textFormat: Text.PlainText
-                  text: root.currentMonitor ? String(root.currentMonitor.description || root.current.name) : ""
-                  color: root.fg
+                  text: root.draft.length > 1 ? "󰍺" : "󰍹"
+                  color: root.accent
                   font.family: root.fontName
-                  font.pixelSize: Style.font.body
-                  font.bold: true
-                  elide: Text.ElideRight
+                  font.pixelSize: Style.font.heading
+                }
+              }
+
+              Column {
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(3)
+                width: Math.max(0, headerLeft.width - Style.space(42))
+
+                Row {
+                  width: parent.width
+                  spacing: Style.space(8)
+
+                  Text {
+                    id: headerTitle
+                    textFormat: Text.PlainText
+                    text: "Displays"
+                    color: root.fg
+                    font.family: root.fontName
+                    font.pixelSize: Style.font.title
+                    font.bold: true
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+
+                  Rectangle {
+                    visible: root.draft.length > 0
+                    implicitWidth: Math.min(setupPillText.implicitWidth + Style.space(14),
+                      Math.max(Style.space(60), parent.width - headerTitle.implicitWidth - Style.space(8)))
+                    implicitHeight: setupPillText.implicitHeight + Style.space(6)
+                    radius: height / 2
+                    color: root.accentSoft
+                    border.color: root.accentBorder
+                    border.width: 1
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Text {
+                      id: setupPillText
+                      anchors.fill: parent
+                      anchors.leftMargin: Style.space(7)
+                      anchors.rightMargin: Style.space(7)
+                      verticalAlignment: Text.AlignVCenter
+                      textFormat: Text.PlainText
+                      text: root.setupSummary
+                      color: root.accent
+                      font.family: root.fontName
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                      elide: Text.ElideRight
+                    }
+                  }
                 }
 
                 Text {
                   width: parent.width
                   textFormat: Text.PlainText
-                  text: {
-                    if (!root.current) return ""
-                    var off = root.offText(root.current)
-                    return off ? root.current.name + " · " + off : root.current.name
-                  }
+                  text: (root.draft.length === 1 ? "1 display connected" : root.draft.length + " displays connected")
+                    + " · " + root.enabledCount + " active"
                   color: root.muted
                   font.family: root.fontName
                   font.pixelSize: Style.font.caption
                   elide: Text.ElideRight
                 }
               }
-
-              ToggleSwitch {
-                id: powerSwitch
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.fg
-                checked: !!root.current && root.current.enabled && !root.current.autoOff
-                interactive: !!root.current && !root.current.autoOff && root.canTurnOff(root.selected)
-                opacity: interactive ? 1 : 0.45
-                onToggled: root.update(root.selected, { enabled: !root.current.enabled }, true)
-              }
             }
 
-            Column {
-              width: parent.width
-              spacing: Style.space(12)
-              visible: !!root.current && root.current.enabled && !root.current.autoOff
+            Row {
+              id: headerActions
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
 
-              // Resolution
-              Column {
-                width: parent.width
-                spacing: Style.space(6)
+              MiniActionButton {
+                text: "Re-probe"
+                onClicked: {
+                  if (root.service) root.service.refresh()
+                  root.readBrightness()
+                }
+              }
 
-                CursorSurface {
-                  width: parent.width
-                  height: resolutionRow.implicitHeight + Style.spacing.controlGap
-                  foreground: root.fg
-                  fill: Style.hoverFillFor(root.fg, Commons.Color.accent)
-                  hasCursor: resolutionMouse.containsMouse
+              MiniActionButton {
+                text: "Identify"
+                accented: root.service && root.service.identifying
+                onClicked: if (root.service) root.service.identify()
+              }
+            }
+          }
 
-                  Item {
-                    id: resolutionRow
-                    anchors.fill: parent
-                    anchors.leftMargin: Style.space(6)
-                    anchors.rightMargin: Style.space(6)
-                    implicitHeight: resolutionValue.implicitHeight
+          // ---------- Interactive Layout Canvas ----------
+          LayoutCanvas {
+            width: parent.width
+            height: Style.space(186)
+          }
 
-                    PanelSectionHeader {
-                      text: "Resolution"
-                      foreground: root.fg
-                      fontFamily: root.fontName
-                      anchors.left: parent.left
-                      anchors.verticalCenter: parent.verticalCenter
-                    }
+          // ---------- Display Selector Strip ----------
+          Flow {
+            width: parent.width
+            spacing: Style.space(6)
 
-                    Text {
-                      id: resolutionValue
-                      textFormat: Text.PlainText
-                      text: root.modeLabel(root.current ? root.current.mode : null) + (root.resolutionsOpen ? "  󰅃" : "  󰅀")
-                      color: root.fg
-                      font.family: root.fontName
-                      font.pixelSize: Style.font.body
-                      anchors.right: parent.right
-                      anchors.verticalCenter: parent.verticalCenter
-                    }
+            Repeater {
+              model: root.draft
+
+              Rectangle {
+                id: tabPill
+                required property var modelData
+                required property int index
+                readonly property bool isSelected: root.selected === index
+                readonly property bool isActive: modelData.enabled && !modelData.autoOff
+
+                implicitWidth: pillRow.implicitWidth + Style.space(16)
+                implicitHeight: Style.space(26)
+                radius: Math.min(Style.cornerRadius, Style.space(6))
+                color: isSelected
+                  ? root.accentSoft
+                  : (pillMouse.containsMouse ? root.trackBg : root.cardBg)
+                border.color: isSelected
+                  ? root.accentBorder
+                  : (pillMouse.containsMouse ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.28) : root.cardBorder)
+                border.width: 1
+                opacity: isActive || isSelected ? 1 : 0.65
+
+                Behavior on color { ColorAnimation { duration: Style.duration(120) } }
+
+                Row {
+                  id: pillRow
+                  anchors.centerIn: parent
+                  spacing: Style.space(6)
+
+                  Rectangle {
+                    width: Style.space(6)
+                    height: Style.space(6)
+                    radius: width / 2
+                    anchors.verticalCenter: parent.verticalCenter
+                    color: tabPill.modelData.autoOff
+                      ? root.alertColor
+                      : (tabPill.isActive ? root.accent : root.muted)
                   }
 
-                  MouseArea {
-                    id: resolutionMouse
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.resolutionsOpen = !root.resolutionsOpen
+                  Text {
+                    textFormat: Text.PlainText
+                    text: (tabPill.index + 1) + " · " + tabPill.modelData.name
+                    color: tabPill.isSelected ? root.accent : root.fg
+                    font.family: root.fontName
+                    font.pixelSize: Style.font.caption
+                    font.bold: tabPill.isSelected
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+
+                  Text {
+                    visible: !tabPill.isActive
+                    textFormat: Text.PlainText
+                    text: tabPill.modelData.autoOff ? "AUTO OFF" : "OFF"
+                    color: tabPill.modelData.autoOff ? root.alertColor : root.muted
+                    font.family: root.fontName
+                    font.pixelSize: Math.max(8, Style.font.caption - 1)
+                    font.bold: true
+                    anchors.verticalCenter: parent.verticalCenter
                   }
                 }
 
+                MouseArea {
+                  id: pillMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.selected = tabPill.index
+                }
+              }
+            }
+          }
+
+          // ---------- Two-Column Bordered Cards ----------
+          Item {
+            id: cardsContainer
+            width: parent.width
+            readonly property int gap: Style.space(10)
+            readonly property real cardWidth: column.twoColumn ? Math.floor((width - gap) / 2) : width
+            readonly property real matchedHeight: Math.max(displayCard.implicitHeight, deskCard.implicitHeight)
+            implicitHeight: column.twoColumn ? matchedHeight : (displayCard.implicitHeight + gap + deskCard.implicitHeight)
+            height: implicitHeight
+
+            // ========== LEFT CARD: SELECTED DISPLAY ==========
+            CardBox {
+              id: displayCard
+              x: 0
+              y: 0
+              width: cardsContainer.cardWidth
+              height: column.twoColumn ? cardsContainer.matchedHeight : implicitHeight
+              visible: root.current !== null
+
+              Column {
+                id: displayCardCol
+                width: parent.width
+                spacing: Style.space(10)
+
+                // Micro-header + live status badge
+                Item {
+                  width: parent.width
+                  implicitHeight: Math.max(secDisplayLbl.implicitHeight, statusPill.implicitHeight)
+
+                  Text {
+                    id: secDisplayLbl
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    textFormat: Text.PlainText
+                    text: "SELECTED DISPLAY"
+                    color: root.muted
+                    font.family: root.fontName
+                    font.pixelSize: Math.max(9, Style.font.caption - 1)
+                    font.bold: true
+                    font.letterSpacing: 1.0
+                  }
+
+                  Rectangle {
+                    id: statusPill
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    readonly property bool isOn: !!root.current && root.current.enabled && !root.current.autoOff
+                    readonly property bool isWarn: !!root.current && root.current.autoOff
+                    implicitWidth: statusPillLabel.implicitWidth + Style.space(12)
+                    implicitHeight: statusPillLabel.implicitHeight + Style.space(4)
+                    radius: height / 2
+                    color: isWarn ? root.alertSoft : (isOn ? root.accentSoft : root.trackBg)
+                    border.color: isWarn ? root.alertBorder : (isOn ? root.accentBorder : root.cardBorder)
+                    border.width: 1
+
+                    Text {
+                      id: statusPillLabel
+                      anchors.centerIn: parent
+                      textFormat: Text.PlainText
+                      text: root.statusBadgeText(root.current)
+                      color: statusPill.isWarn ? root.alertColor : (statusPill.isOn ? root.accent : root.muted)
+                      font.family: root.fontName
+                      font.pixelSize: Math.max(9, Style.font.caption - 1)
+                      font.bold: true
+                    }
+                  }
+                }
+
+                // Monitor identity + Enable toggle
+                Item {
+                  width: parent.width
+                  implicitHeight: Math.max(monNameCol.implicitHeight, powerSwitch.implicitHeight)
+
+                  Column {
+                    id: monNameCol
+                    anchors.left: parent.left
+                    anchors.right: powerSwitch.left
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(2)
+
+                    Text {
+                      width: parent.width
+                      textFormat: Text.PlainText
+                      text: root.current ? root.shortModelName(root.selected) : ""
+                      color: root.fg
+                      font.family: root.fontName
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                      elide: Text.ElideRight
+                    }
+
+                    Text {
+                      width: parent.width
+                      textFormat: Text.PlainText
+                      text: {
+                        if (!root.current) return ""
+                        var off = root.offText(root.current)
+                        return off ? root.current.name + " · " + off : root.current.name
+                      }
+                      color: root.current && root.current.autoOff ? root.alertColor : root.muted
+                      font.family: root.fontName
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                    }
+                  }
+
+                  AccentSwitch {
+                    id: powerSwitch
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    checked: !!root.current && root.current.enabled && !root.current.autoOff
+                    interactive: !!root.current && !root.current.autoOff && root.canTurnOff(root.selected)
+                    onToggled: root.update(root.selected, { enabled: !root.current.enabled }, true)
+                  }
+                }
+
+                // Active-monitor settings
                 Column {
                   width: parent.width
-                  visible: root.resolutionsOpen
-                  spacing: 0
+                  spacing: Style.space(10)
+                  visible: !!root.current && root.current.enabled && !root.current.autoOff
 
-                  Repeater {
-                    model: root.resolutionsOpen ? root.currentGroups : []
+                  Rectangle { width: parent.width; height: 1; color: root.hairline }
 
-                    CursorSurface {
-                      required property var modelData
-                      readonly property bool chosen: !!root.current && root.current.mode
-                        && root.current.mode.w === modelData.w && root.current.mode.h === modelData.h
-                      width: parent.width
-                      height: optionText.implicitHeight + Style.spacing.sm
+                  // Side-by-side Resolution & Refresh Rate Dropdowns
+                  Row {
+                    id: modeDropdownRow
+                    width: parent.width
+                    spacing: Style.space(8)
+                    readonly property real halfWidth: Math.floor((width - spacing) / 2)
+
+                    Dropdown {
+                      id: resDropdown
+                      width: modeDropdownRow.halfWidth
+                      label: "Resolution"
+                      options: root.resolutionOptions
+                      value: root.currentResolutionKey
                       foreground: root.fg
-                      fill: Style.hoverFillFor(root.fg, Commons.Color.accent)
-                      currentFill: Style.selectedFillFor(root.fg, Commons.Color.accent)
-                      current: chosen
-                      hasCursor: optionMouse.containsMouse
+                      background: Commons.Color.popups.background
+                      accent: root.accent
+                      fontFamily: root.fontName
+                      onPopupOpenChanged: if (popupOpen && hzDropdown.popupOpen) hzDropdown.close()
+                      onChanged: function(val) {
+                        root.setResolutionByKey(root.selected, val)
+                        value = Qt.binding(function() { return root.currentResolutionKey })
+                      }
+                    }
+
+                    Dropdown {
+                      id: hzDropdown
+                      width: modeDropdownRow.halfWidth
+                      label: "Refresh rate"
+                      options: root.rateOptions
+                      value: root.currentRateKey
+                      foreground: root.fg
+                      background: Commons.Color.popups.background
+                      accent: root.accent
+                      fontFamily: root.fontName
+                      onPopupOpenChanged: if (popupOpen && resDropdown.popupOpen) resDropdown.close()
+                      onChanged: function(val) {
+                        root.setRateByKey(root.selected, val)
+                        value = Qt.binding(function() { return root.currentRateKey })
+                      }
+                    }
+                  }
+
+                  // Scale segmented bar
+                  Column {
+                    width: parent.width
+                    spacing: Style.space(5)
+
+                    Item {
+                      width: parent.width
+                      implicitHeight: scaleTitle.implicitHeight
 
                       Text {
-                        id: optionText
+                        id: scaleTitle
                         anchors.left: parent.left
-                        anchors.leftMargin: Style.space(12)
-                        anchors.verticalCenter: parent.verticalCenter
                         textFormat: Text.PlainText
-                        text: modelData.w + " × " + modelData.h
+                        text: "Scale"
                         color: root.fg
                         font.family: root.fontName
-                        font.pixelSize: Style.font.body
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
                       }
 
                       Text {
                         anchors.right: parent.right
-                        anchors.rightMargin: Style.space(12)
-                        anchors.verticalCenter: parent.verticalCenter
                         textFormat: Text.PlainText
-                        text: "up to " + Model.formatHz(modelData.rates[0]) + " Hz"
-                        color: root.muted
+                        text: root.current ? Commons.I18n.formatNumber(root.current.scale) + "×" : ""
+                        color: root.accent
                         font.family: root.fontName
                         font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
+                    }
+
+                    SegmentedBar {
+                      width: parent.width
+                      options: {
+                        var list = root.current && root.current.mode
+                          ? Model.scaleOptions(root.current.mode.w, root.current.mode.h) : []
+                        var out = []
+                        for (var i = 0; i < list.length; i++)
+                          out.push({ value: list[i], label: Commons.I18n.formatNumber(list[i]) + "×" })
+                        return out
+                      }
+                      currentValue: root.current ? root.current.scale : 1
+                      compareNumeric: true
+                      onPicked: function(val) { root.update(root.selected, { scale: val }, true) }
+                    }
+                  }
+
+                  // Adaptive Sync (VRR) segmented bar
+                  Column {
+                    width: parent.width
+                    spacing: Style.space(5)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Adaptive sync (VRR)"
+                      color: root.fg
+                      font.family: root.fontName
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+
+                    SegmentedBar {
+                      width: parent.width
+                      options: [
+                        { value: 0, label: "Off" },
+                        { value: 1, label: "Always" },
+                        { value: 2, label: "Fullscreen" }
+                      ]
+                      currentValue: root.current ? root.current.vrr : 0
+                      onPicked: function(val) { root.update(root.selected, { vrr: val }, false) }
+                    }
+                  }
+
+                  Rectangle { width: parent.width; height: 1; color: root.hairline }
+
+                  // HDR row
+                  Item {
+                    width: parent.width
+                    implicitHeight: Math.max(hdrCol.implicitHeight, hdrSwitch.implicitHeight)
+
+                    Column {
+                      id: hdrCol
+                      anchors.left: parent.left
+                      anchors.right: hdrSwitch.left
+                      anchors.rightMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(1)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: "HDR"
+                        color: root.fg
+                        font.family: root.fontName
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
                       }
 
-                      MouseArea {
-                        id: optionMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.setResolution(root.selected, parent.modelData)
+                      Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        text: root.currentMonitor && root.currentMonitor.hdrCapable
+                          ? (root.current && root.current.hdr ? "10-bit PQ enabled" : "HDR capable · 10-bit PQ")
+                          : "Not reported by display"
+                        color: root.current && root.current.hdr ? root.accent : root.muted
+                        font.family: root.fontName
+                        font.pixelSize: Math.max(9, Style.font.caption - 1)
+                        elide: Text.ElideRight
+                      }
+                    }
+
+                    AccentSwitch {
+                      id: hdrSwitch
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      checked: !!root.current && root.current.hdr
+                      interactive: !!root.currentMonitor && root.currentMonitor.hdrCapable === true
+                      onToggled: root.update(root.selected, { hdr: !root.current.hdr }, false)
+                    }
+                  }
+                }
+
+                // Disabled helper message
+                Text {
+                  width: parent.width
+                  visible: !!root.current && (!root.current.enabled || root.current.autoOff)
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  text: root.current && root.current.autoOff
+                    ? "Automatically paused (" + root.offText(root.current).toLowerCase() + "). Will restore automatically when available."
+                    : "Display is turned off. Toggle the switch above and press Apply to re-enable."
+                  color: root.muted
+                  font.family: root.fontName
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
+
+            // ========== RIGHT CARD: LUMINANCE, TEXT & AUTOMATION ==========
+            CardBox {
+              id: deskCard
+              x: column.twoColumn ? (cardsContainer.cardWidth + cardsContainer.gap) : 0
+              y: column.twoColumn ? 0 : (displayCard.implicitHeight + cardsContainer.gap)
+              width: cardsContainer.cardWidth
+              height: column.twoColumn ? cardsContainer.matchedHeight : implicitHeight
+
+              Column {
+                id: deskCardCol
+                width: parent.width
+                spacing: Style.space(10)
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "LUMINANCE & DESK"
+                  color: root.muted
+                  font.family: root.fontName
+                  font.pixelSize: Math.max(9, Style.font.caption - 1)
+                  font.bold: true
+                  font.letterSpacing: 1.0
+                }
+
+                // Brightness
+                Column {
+                  width: parent.width
+                  spacing: Style.space(5)
+
+                  Item {
+                    width: parent.width
+                    implicitHeight: Math.max(brightHead.implicitHeight, brightRight.implicitHeight)
+
+                    Row {
+                      id: brightHead
+                      anchors.left: parent.left
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(6)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: "Brightness"
+                        color: root.fg
+                        font.family: root.fontName
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: root.current ? (root.current.internal ? "Backlight" : "DDC/CI") : ""
+                        color: root.muted
+                        font.family: root.fontName
+                        font.pixelSize: Math.max(9, Style.font.caption - 1)
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                    }
+
+                    Row {
+                      id: brightRight
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(6)
+
+                      // Sync all toggle chip
+                      Rectangle {
+                        visible: root.brightnessAvailable && root.enabledCount > 1
+                        implicitWidth: allLbl.implicitWidth + Style.space(10)
+                        implicitHeight: allLbl.implicitHeight + Style.space(4)
+                        radius: height / 2
+                        color: root.syncAllBrightness ? root.accentSoft : "transparent"
+                        border.color: root.syncAllBrightness ? root.accentBorder : root.cardBorder
+                        border.width: 1
+                        anchors.verticalCenter: parent.verticalCenter
+
+                        Text {
+                          id: allLbl
+                          anchors.centerIn: parent
+                          textFormat: Text.PlainText
+                          text: "All"
+                          color: root.syncAllBrightness ? root.accent : root.muted
+                          font.family: root.fontName
+                          font.pixelSize: Math.max(9, Style.font.caption - 1)
+                          font.bold: root.syncAllBrightness
+                        }
+
+                        MouseArea {
+                          anchors.fill: parent
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: root.syncAllBrightness = !root.syncAllBrightness
+                        }
+                      }
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: root.brightnessAvailable
+                          ? Math.round(brightnessSlider.dragging ? brightnessSlider.liveValue : root.brightness) + "%"
+                          : "N/A"
+                        color: root.brightnessAvailable ? root.accent : root.muted
+                        font.family: root.fontName
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                    }
+                  }
+
+                  PanelSlider {
+                    id: brightnessSlider
+                    visible: root.brightnessAvailable
+                    bar: root.bar
+                    width: parent.width
+                    minimum: 1
+                    maximum: 100
+                    step: 1
+                    integer: true
+                    value: root.brightness
+                    trackColor: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.14)
+                    fillColor: root.accent
+                    knobColor: root.accent
+                    onMoved: function(v) {
+                      root.brightness = Math.round(v)
+                      brightnessDebounce.restart()
+                    }
+                    onReleased: function(v) {
+                      brightnessDebounce.stop()
+                      root.setBrightness(v)
+                    }
+                  }
+
+                  Text {
+                    visible: !root.brightnessAvailable
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: "No backlight or DDC/CI reported for this display"
+                    color: root.muted
+                    font.family: root.fontName
+                    font.pixelSize: Math.max(9, Style.font.caption - 1)
+                    elide: Text.ElideRight
+                  }
+                }
+
+                Rectangle { width: parent.width; height: 1; color: root.hairline }
+
+                // Night Light (toggle + warm Kelvin slider)
+                Column {
+                  width: parent.width
+                  spacing: Style.space(5)
+                  visible: root.nightlight !== null
+
+                  Item {
+                    width: parent.width
+                    implicitHeight: Math.max(nlLeft.implicitHeight, nlRight.implicitHeight)
+
+                    Row {
+                      id: nlLeft
+                      anchors.left: parent.left
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(6)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: "Night Light"
+                        color: root.fg
+                        font.family: root.fontName
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: root.nightlight && root.nightlight.enabled
+                          ? (Math.round(kelvinSlider.dragging ? kelvinSlider.liveValue : root.activeKelvin) + "K")
+                          : "Off"
+                        color: root.nightlight && root.nightlight.enabled ? root.alertColor : root.muted
+                        font.family: root.fontName
+                        font.pixelSize: Style.font.caption
+                        font.bold: !!root.nightlight && root.nightlight.enabled
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                    }
+
+                    AccentSwitch {
+                      id: nlRight
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      activeColor: root.alertColor
+                      checked: !!root.nightlight && root.nightlight.enabled
+                      onToggled: if (root.nightlight) root.nightlight.setNightlight(!root.nightlight.enabled)
+                    }
+                  }
+
+                  PanelSlider {
+                    id: kelvinSlider
+                    bar: root.bar
+                    width: parent.width
+                    enabled: !!root.nightlight && root.nightlight.enabled
+                    opacity: enabled ? 1 : 0.38
+                    minimum: 1800
+                    maximum: 6000
+                    step: 100
+                    integer: true
+                    value: root.activeKelvin
+                    trackColor: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.14)
+                    fillColor: root.alertColor
+                    knobColor: root.alertColor
+                    onMoved: function(v) {
+                      root.desiredKelvin = Math.round(v)
+                      kelvinDebounce.restart()
+                    }
+                    onReleased: function(v) {
+                      kelvinDebounce.stop()
+                      root.desiredKelvin = Math.round(v)
+                      if (root.nightlight && root.nightlight.enabled && typeof root.nightlight.applyTemperature === "function")
+                        root.nightlight.applyTemperature(root.desiredKelvin)
+                    }
+                  }
+                }
+
+                Rectangle { width: parent.width; height: 1; color: root.hairline; visible: root.nightlight !== null }
+
+                // Global Text Size stops
+                Column {
+                  width: parent.width
+                  spacing: Style.space(5)
+
+                  Item {
+                    width: parent.width
+                    implicitHeight: textSzTitle.implicitHeight
+
+                    Text {
+                      id: textSzTitle
+                      anchors.left: parent.left
+                      textFormat: Text.PlainText
+                      text: "Global text size"
+                      color: root.fg
+                      font.family: root.fontName
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+
+                    Text {
+                      anchors.right: parent.right
+                      textFormat: Text.PlainText
+                      text: Style.font.baseSize + "px · " + Math.round(Style.font.baseSize * 9 / 12) + "pt term"
+                      color: root.accent
+                      font.family: root.fontName
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                  }
+
+                  SegmentedBar {
+                    width: parent.width
+                    options: {
+                      var out = []
+                      for (var i = 0; i < root.textSizeStops.length; i++)
+                        out.push({ value: root.textSizeStops[i], label: String(root.textSizeStops[i]) })
+                      return out
+                    }
+                    currentValue: Style.font.baseSize
+                    onPicked: function(val) { root.setTextSize(val) }
+                  }
+                }
+
+                Rectangle { width: parent.width; height: 1; color: root.hairline }
+
+                // Auto-Disable rules for selected display
+                Column {
+                  width: parent.width
+                  spacing: Style.space(6)
+                  visible: root.current !== null
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "AUTO-DISABLE"
+                    color: root.muted
+                    font.family: root.fontName
+                    font.pixelSize: Math.max(9, Style.font.caption - 1)
+                    font.bold: true
+                    font.letterSpacing: 1.0
+                  }
+
+                  // External display: DDC/CI input & power-off switch
+                  Item {
+                    width: parent.width
+                    visible: !!root.current && !root.current.internal
+                    implicitHeight: Math.max(ddcCol.implicitHeight, ddcSwitch.implicitHeight)
+
+                    Column {
+                      id: ddcCol
+                      anchors.left: parent.left
+                      anchors.right: ddcSwitch.left
+                      anchors.rightMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(2)
+
+                      Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        text: "Switch away / power off"
+                        color: root.fg
+                        font.family: root.fontName
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                        elide: Text.ElideRight
+                      }
+
+                      Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        wrapMode: Text.Wrap
+                        text: root.current && root.current.ddcWatch
+                          ? "Watching input via DDC/CI (VCP 0x60)"
+                          : "Auto-disable when monitor switches HDMI/DP input"
+                        color: root.current && root.current.ddcWatch ? root.accent : root.muted
+                        font.family: root.fontName
+                        font.pixelSize: Math.max(9, Style.font.caption - 1)
+                      }
+                    }
+
+                    AccentSwitch {
+                      id: ddcSwitch
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      checked: !!root.current && root.current.ddcWatch
+                      onToggled: root.update(root.selected, { ddcWatch: !root.current.ddcWatch }, false)
+                    }
+                  }
+
+                  // Internal display: Omarchy clamshell status
+                  Rectangle {
+                    width: parent.width
+                    visible: !!root.current && root.current.internal
+                    implicitHeight: lidCol.implicitHeight + Style.space(12)
+                    radius: Math.min(Style.cornerRadius, Style.space(6))
+                    color: root.accentSoft
+                    border.color: root.accentBorder
+                    border.width: 1
+
+                    Column {
+                      id: lidCol
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      anchors.margins: Style.space(8)
+                      spacing: Style.space(2)
+
+                      Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        text: "Clamshell lid guard active"
+                        color: root.accent
+                        font.family: root.fontName
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
+
+                      Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        wrapMode: Text.Wrap
+                        text: "Built-in panel auto-disables on lid close while an external display is connected."
+                        color: root.muted
+                        font.family: root.fontName
+                        font.pixelSize: Math.max(9, Style.font.caption - 1)
                       }
                     }
                   }
                 }
               }
-
-              // Refresh rate
-              SettingRow {
-                title: "Refresh rate"
-
-                Repeater {
-                  model: root.currentRates
-
-                  Button {
-                    required property var modelData
-                    text: Model.formatHz(modelData) + " Hz"
-                    bordered: true
-                    active: !!root.current && Model.sameHz(root.current.mode.hz, modelData)
-                    fontSize: Style.font.caption
-                    foreground: root.fg
-                    fontFamily: root.fontName
-                    onClicked: root.update(root.selected, { mode: { w: root.current.mode.w, h: root.current.mode.h, hz: modelData } }, false)
-                  }
-                }
-              }
-
-              // Scale
-              SettingRow {
-                title: "Scale"
-
-                Repeater {
-                  model: root.current && root.current.mode ? Model.scaleOptions(root.current.mode.w, root.current.mode.h) : []
-
-                  Button {
-                    required property var modelData
-                    text: Commons.I18n.formatNumber(modelData) + "x"
-                    bordered: true
-                    active: !!root.current && Math.abs(root.current.scale - modelData) < 0.001
-                    fontSize: Style.font.caption
-                    foreground: root.fg
-                    fontFamily: root.fontName
-                    onClicked: root.update(root.selected, { scale: modelData }, true)
-                  }
-                }
-              }
-
-              // Adaptive sync
-              SettingRow {
-                title: "Adaptive sync"
-
-                Repeater {
-                  model: [{ value: 0, label: "Off" }, { value: 1, label: "On" }, { value: 2, label: "Fullscreen" }]
-
-                  Button {
-                    required property var modelData
-                    text: modelData.label
-                    bordered: true
-                    active: !!root.current && root.current.vrr === modelData.value
-                    fontSize: Style.font.caption
-                    foreground: root.fg
-                    fontFamily: root.fontName
-                    onClicked: root.update(root.selected, { vrr: modelData.value }, false)
-                  }
-                }
-              }
-
-              // HDR
-              SwitchRow {
-                title: "HDR"
-                caption: root.currentMonitor && root.currentMonitor.hdrCapable ? "" : "This display does not report HDR support"
-                checked: !!root.current && root.current.hdr
-                interactive: !!root.currentMonitor && root.currentMonitor.hdrCapable === true
-                onToggled: root.update(root.selected, { hdr: !root.current.hdr }, false)
-              }
-
-              // Brightness (live)
-              Column {
-                width: parent.width
-                spacing: Style.space(6)
-                visible: root.brightnessAvailable
-
-                Item {
-                  width: parent.width
-                  implicitHeight: brightnessHeader.implicitHeight
-
-                  PanelSectionHeader {
-                    id: brightnessHeader
-                    text: "Brightness"
-                    foreground: root.fg
-                    fontFamily: root.fontName
-                    anchors.left: parent.left
-                  }
-
-                  Text {
-                    anchors.right: parent.right
-                    anchors.rightMargin: Style.space(6)
-                    anchors.verticalCenter: parent.verticalCenter
-                    textFormat: Text.PlainText
-                    text: Math.round(brightnessSlider.dragging ? brightnessSlider.liveValue : root.brightness) + "%"
-                    color: root.muted
-                    font.family: root.fontName
-                    font.pixelSize: Style.font.caption
-                    font.bold: true
-                  }
-                }
-
-                PanelSlider {
-                  id: brightnessSlider
-                  bar: root.bar
-                  width: parent.width
-                  minimum: 1
-                  maximum: 100
-                  step: 1
-                  integer: true
-                  value: root.brightness
-                  onMoved: function(v) {
-                    root.brightness = Math.round(v)
-                    brightnessDebounce.restart()
-                  }
-                  onReleased: function(v) {
-                    brightnessDebounce.stop()
-                    root.setBrightness(v)
-                  }
-                }
-              }
-
-              // Input watch (external displays)
-              SwitchRow {
-                visible: !!root.current && !root.current.internal
-                title: "Turn off when switched away"
-                caption: "Turns this display off while it shows another input or is powered off, using DDC/CI"
-                checked: !!root.current && root.current.ddcWatch
-                onToggled: root.update(root.selected, { ddcWatch: !root.current.ddcWatch }, false)
-              }
             }
-          }
-
-          PanelSeparator { foreground: root.fg }
-
-          // ---------- Text size (all displays, live) ----------
-          Column {
-            width: parent.width
-            spacing: Style.space(6)
-
-            Item {
-              width: parent.width
-              implicitHeight: textSizeHeader.implicitHeight
-
-              PanelSectionHeader {
-                id: textSizeHeader
-                text: "Text size"
-                foreground: root.fg
-                fontFamily: root.fontName
-                anchors.left: parent.left
-              }
-
-              Text {
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-                textFormat: Text.PlainText
-                text: (textSizeSlider.dragging
-                  ? root.textSizeStops[Math.round(textSizeSlider.liveValue)]
-                  : Style.font.baseSize) + "px"
-                color: root.muted
-                font.family: root.fontName
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
-            }
-
-            PanelSlider {
-              id: textSizeSlider
-              bar: root.bar
-              width: parent.width
-              minimum: 0
-              maximum: root.textSizeStops.length - 1
-              step: 1
-              integer: true
-              tickCount: root.textSizeStops.length
-              value: root.nearestTextStop(Style.font.baseSize)
-              onReleased: function(v) {
-                textSizeProc.command = ["omarchy-display-text-size", String(root.textSizeStops[Math.round(v)])]
-                if (!textSizeProc.running) textSizeProc.running = true
-              }
-            }
-          }
-
-          SwitchRow {
-            visible: root.nightlight !== null
-            title: "Night light"
-            caption: "Warmer colours on every display"
-            checked: !!root.nightlight && root.nightlight.enabled
-            onToggled: if (root.nightlight) root.nightlight.setNightlight(!root.nightlight.enabled)
           }
 
           Item { width: parent.width; height: Style.space(2) }
@@ -759,81 +1414,187 @@ Panel {
     }
   }
 
-  // A titled row of option buttons that wraps when it runs out of width.
-  component SettingRow: Column {
-    id: settingRow
-    property string title: ""
-    default property alias buttons: flow.data
-    width: parent ? parent.width : 0
-    spacing: Style.space(6)
+  // ==================== REUSABLE THEMED SUB-COMPONENTS ====================
 
-    PanelSectionHeader {
-      text: settingRow.title
-      foreground: root.fg
-      fontFamily: root.fontName
-    }
+  component CardBox: Rectangle {
+    id: cardBox
+    default property alias body: cardInner.data
+    property int pad: Style.space(12)
+    implicitHeight: cardInner.childrenRect.height + pad * 2
+    radius: Style.cornerRadius
+    color: root.cardBg
+    border.color: root.cardBorder
+    border.width: 1
 
-    Flow {
-      id: flow
-      width: parent.width
-      spacing: Style.spacing.xs
+    Item {
+      id: cardInner
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: parent.top
+      anchors.margins: cardBox.pad
+      height: childrenRect.height
     }
   }
 
-  component SwitchRow: Item {
-    id: switchRow
-    property string title: ""
-    property string caption: ""
+  component MiniActionButton: Rectangle {
+    id: miniBtn
+    property string text: ""
+    property bool accented: false
+    signal clicked()
+
+    implicitWidth: miniLbl.implicitWidth + Style.space(16)
+    implicitHeight: Style.space(26)
+    radius: Math.min(Style.cornerRadius, Style.space(6))
+    color: accented
+      ? root.accentSoft
+      : (miniMouse.containsMouse ? root.trackBg : root.cardBg)
+    border.color: accented || miniMouse.containsMouse ? root.accentBorder : root.cardBorder
+    border.width: 1
+
+    Behavior on color { ColorAnimation { duration: Style.duration(120) } }
+
+    Text {
+      id: miniLbl
+      anchors.centerIn: parent
+      textFormat: Text.PlainText
+      text: miniBtn.text
+      color: miniBtn.accented || miniMouse.containsMouse ? root.accent : root.fg
+      font.family: root.fontName
+      font.pixelSize: Style.font.caption
+      font.bold: miniBtn.accented
+    }
+
+    MouseArea {
+      id: miniMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: miniBtn.clicked()
+    }
+  }
+
+  // Accent-colored toggle switch so active states always pop with theme color.
+  component AccentSwitch: Item {
+    id: sw
     property bool checked: false
     property bool interactive: true
+    property color activeColor: root.accent
     signal toggled()
-    width: parent ? parent.width : 0
-    implicitHeight: Math.max(switchText.implicitHeight, rowSwitch.implicitHeight)
 
-    Column {
-      id: switchText
-      anchors.left: parent.left
-      anchors.right: rowSwitch.left
-      anchors.rightMargin: Style.space(10)
-      anchors.verticalCenter: parent.verticalCenter
-      spacing: Style.space(2)
+    readonly property real activeLuma: 0.2126 * activeColor.r + 0.7152 * activeColor.g + 0.0722 * activeColor.b
+    readonly property color knobInk: activeLuma > 0.45 ? Commons.Color.background : Commons.Color.foreground
 
-      PanelSectionHeader {
-        text: switchRow.title
-        foreground: root.fg
-        fontFamily: root.fontName
-      }
+    implicitWidth: Style.space(36)
+    implicitHeight: Style.space(20)
+    opacity: interactive ? 1 : 0.42
 
-      Text {
-        width: parent.width
-        visible: switchRow.caption !== ""
-        textFormat: Text.PlainText
-        text: switchRow.caption
-        wrapMode: Text.Wrap
-        color: root.muted
-        font.family: root.fontName
-        font.pixelSize: Style.font.caption
+    Rectangle {
+      id: swTrack
+      anchors.fill: parent
+      radius: Style.cornerRadius > 0 ? height / 2 : 0
+      color: sw.checked ? sw.activeColor : root.trackBg
+      border.color: sw.checked
+        ? sw.activeColor
+        : (swMouse.containsMouse && sw.interactive ? root.accentBorder : root.cardBorder)
+      border.width: 1
+
+      Behavior on color { ColorAnimation { duration: Style.duration(120) } }
+
+      Rectangle {
+        width: swTrack.height - Style.space(6)
+        height: width
+        radius: Style.cornerRadius > 0 ? height / 2 : 0
+        anchors.verticalCenter: parent.verticalCenter
+        x: sw.checked ? swTrack.width - width - Style.space(3) : Style.space(3)
+        color: sw.checked ? sw.knobInk : root.muted
+
+        Behavior on x { NumberAnimation { duration: Style.duration(120); easing.type: Easing.OutCubic } }
+        Behavior on color { ColorAnimation { duration: Style.duration(120) } }
       }
     }
 
-    ToggleSwitch {
-      id: rowSwitch
-      anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
-      foreground: root.fg
-      checked: switchRow.checked
-      interactive: switchRow.interactive
-      opacity: interactive ? 1 : 0.45
-      onToggled: switchRow.toggled()
+    MouseArea {
+      id: swMouse
+      anchors.fill: parent
+      enabled: sw.interactive
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: sw.toggled()
     }
   }
 
-  // The monitors drawn to scale. Drag one to move it; on release it snaps to
-  // the nearest edge of the others, so no gap or overlap is left.
+  // Full-width equal-segment control bar with solid accent active pill.
+  component SegmentedBar: Rectangle {
+    id: seg
+    property var options: []
+    property var currentValue: null
+    property bool compareNumeric: false
+    signal picked(var value)
+
+    implicitHeight: Style.space(28)
+    radius: Math.min(Style.cornerRadius, Style.space(6))
+    color: root.trackBg
+    border.color: root.cardBorder
+    border.width: 1
+
+    Row {
+      anchors.fill: parent
+      anchors.margins: Style.space(2)
+      spacing: Style.space(2)
+
+      Repeater {
+        model: seg.options
+
+        Rectangle {
+          id: segItem
+          required property var modelData
+          required property int index
+          readonly property bool isActive: seg.compareNumeric
+            ? Math.abs(Number(seg.currentValue) - Number(modelData.value)) < 0.001
+            : seg.currentValue === modelData.value
+
+          width: seg.options.length > 0
+            ? (parent.width - parent.spacing * (seg.options.length - 1)) / seg.options.length
+            : 0
+          height: parent.height
+          radius: Math.max(0, seg.radius - Style.space(2))
+          color: isActive
+            ? root.accent
+            : (segMouse.containsMouse ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.08) : "transparent")
+
+          Behavior on color { ColorAnimation { duration: Style.duration(110) } }
+
+          Text {
+            anchors.centerIn: parent
+            width: parent.width - Style.space(4)
+            horizontalAlignment: Text.AlignHCenter
+            textFormat: Text.PlainText
+            text: String(segItem.modelData.label)
+            color: segItem.isActive ? root.accentInk : (segMouse.containsMouse ? root.fg : root.muted)
+            font.family: root.fontName
+            font.pixelSize: Style.font.caption
+            font.bold: segItem.isActive
+            elide: Text.ElideRight
+          }
+
+          MouseArea {
+            id: segMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: seg.picked(segItem.modelData.value)
+          }
+        }
+      }
+    }
+  }
+
+  // Interactive scale-accurate layout canvas with dot grid & rich display tiles.
   component LayoutCanvas: Item {
     id: canvas
 
-    readonly property real pad: Style.space(12)
+    readonly property real pad: Style.space(14)
+    readonly property real footerPad: Style.space(22)
     property int dragIndex: -1
     property var frozenView: null
     property var dragRect: null
@@ -850,15 +1611,15 @@ Panel {
         maxX = Math.max(maxX, r.x + r.w)
         maxY = Math.max(maxY, r.y + r.h)
       }
+      var usableH = Math.max(Style.space(60), height - footerPad)
       if (minX === Infinity) return { k: 1, ox: pad, oy: pad, minX: 0, minY: 0 }
       var spanX = Math.max(1, maxX - minX)
       var spanY = Math.max(1, maxY - minY)
-      // Leave room around the layout so a monitor can be dragged past an edge.
-      var k = Math.min((width - pad * 2) / (spanX * 1.35), (height - pad * 2) / (spanY * 1.35))
+      var k = Math.min((width - pad * 2) / (spanX * 1.28), (usableH - pad * 2) / (spanY * 1.22))
       return {
         k: k,
         ox: (width - spanX * k) / 2,
-        oy: (height - spanY * k) / 2,
+        oy: (usableH - spanY * k) / 2,
         minX: minX,
         minY: minY
       }
@@ -872,11 +1633,34 @@ Panel {
     }
 
     Rectangle {
+      id: canvasFrame
       anchors.fill: parent
       radius: Style.cornerRadius
-      color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05)
-      border.color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.18)
+      color: root.canvasBg
+      border.color: root.cardBorder
       border.width: 1
+      clip: true
+
+      // Subtle dot grid matching the mockup
+      Canvas {
+        id: dotGrid
+        anchors.fill: parent
+        property color dotColor: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.14)
+        onDotColorChanged: requestPaint()
+        onWidthChanged: requestPaint()
+        onHeightChanged: requestPaint()
+        onPaint: {
+          var ctx = getContext("2d")
+          ctx.clearRect(0, 0, width, height)
+          ctx.fillStyle = dotColor
+          var step = Math.max(14, Style.space(16))
+          for (var y = step; y < height - canvas.footerPad; y += step) {
+            for (var x = step; x < width; x += step) {
+              ctx.fillRect(x, y, 1.5, 1.5)
+            }
+          }
+        }
+      }
     }
 
     Repeater {
@@ -889,51 +1673,114 @@ Panel {
         readonly property bool shown: modelData.enabled && !modelData.autoOff
         readonly property var rect: canvas.dragIndex === index && canvas.dragRect ? canvas.dragRect : Model.rectOf(modelData)
         readonly property bool chosen: root.selected === index
+        readonly property bool draggingThis: canvas.dragIndex === index
 
         visible: shown
-        x: canvas.view.ox + (rect.x - canvas.view.minX) * canvas.view.k
-        y: canvas.view.oy + (rect.y - canvas.view.minY) * canvas.view.k
-        width: Math.max(Style.space(24), rect.w * canvas.view.k)
-        height: Math.max(Style.space(16), rect.h * canvas.view.k)
-        z: canvas.dragIndex === index ? 2 : 1
+        x: Math.round(canvas.view.ox + (rect.x - canvas.view.minX) * canvas.view.k)
+        y: Math.round(canvas.view.oy + (rect.y - canvas.view.minY) * canvas.view.k)
+        width: Math.max(Style.space(62), Math.round(rect.w * canvas.view.k))
+        height: Math.max(Style.space(40), Math.round(rect.h * canvas.view.k))
+        z: draggingThis ? 3 : (chosen ? 2 : 1)
         radius: Math.min(Style.cornerRadius, Style.space(6))
-        color: chosen ? Style.selectedFillFor(root.fg, Commons.Color.accent) : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.10)
-        border.color: chosen ? Commons.Color.accent : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.45)
-        border.width: chosen ? Math.max(2, Style.space(2)) : 1
+        color: chosen
+          ? Qt.tint(Commons.Color.popups.background, root.accentSoft)
+          : (tileMouse.containsMouse
+            ? Qt.lighter(Commons.Color.popups.background, 1.25)
+            : Qt.lighter(Commons.Color.popups.background, 1.12))
+        border.color: chosen
+          ? root.accent
+          : (tileMouse.containsMouse ? root.accentBorder : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.34))
+        border.width: chosen ? 2 : 1
+        clip: true
 
-        Column {
-          anchors.centerIn: parent
-          width: parent.width - Style.space(8)
-          spacing: 0
+        // Top row: #index · name + scale badge
+        Item {
+          id: tileTop
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.top: parent.top
+          anchors.margins: Style.space(6)
+          height: tileName.implicitHeight
 
           Text {
-            width: parent.width
-            horizontalAlignment: Text.AlignHCenter
+            id: tileName
+            anchors.left: parent.left
+            anchors.right: tileScale.left
+            anchors.rightMargin: Style.space(4)
             textFormat: Text.PlainText
-            text: String(tile.index + 1)
-            color: tile.chosen ? Commons.Color.accent : root.fg
+            text: (tile.index + 1) + " · " + tile.modelData.name
+            color: tile.chosen ? root.accent : root.fg
             font.family: root.fontName
-            font.pixelSize: Style.font.title
+            font.pixelSize: Style.font.caption
             font.bold: true
+            elide: Text.ElideRight
           }
 
           Text {
-            width: parent.width
-            visible: tile.height > Style.space(46)
-            horizontalAlignment: Text.AlignHCenter
+            id: tileScale
+            anchors.right: parent.right
             textFormat: Text.PlainText
-            text: tile.modelData.name
-            elide: Text.ElideRight
+            text: Commons.I18n.formatNumber(tile.modelData.scale) + "×"
+            color: root.accent
+            font.family: root.fontName
+            font.pixelSize: Math.max(9, Style.font.caption - 1)
+            font.bold: true
+          }
+        }
+
+        // Middle: model name
+        Text {
+          visible: tile.height >= Style.space(52)
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.leftMargin: Style.space(6)
+          anchors.rightMargin: Style.space(6)
+          textFormat: Text.PlainText
+          text: root.shortModelName(tile.index)
+          color: root.muted
+          font.family: root.fontName
+          font.pixelSize: Math.max(9, Style.font.caption - 1)
+          elide: Text.ElideRight
+        }
+
+        // Bottom row: resolution + refresh rate
+        Item {
+          visible: tile.height >= Style.space(64) && !!tile.modelData.mode
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
+          anchors.margins: Style.space(6)
+          height: tileRes.implicitHeight
+
+          Text {
+            id: tileRes
+            anchors.left: parent.left
+            anchors.right: tileHz.left
+            anchors.rightMargin: Style.space(4)
+            textFormat: Text.PlainText
+            text: tile.modelData.mode ? (tile.modelData.mode.w + "×" + tile.modelData.mode.h) : ""
             color: root.muted
             font.family: root.fontName
-            font.pixelSize: Style.font.caption
+            font.pixelSize: Math.max(9, Style.font.caption - 1)
+            elide: Text.ElideRight
+          }
+
+          Text {
+            id: tileHz
+            anchors.right: parent.right
+            textFormat: Text.PlainText
+            text: tile.modelData.mode ? (Math.round(tile.modelData.mode.hz) + "Hz") : ""
+            color: root.muted
+            font.family: root.fontName
+            font.pixelSize: Math.max(9, Style.font.caption - 1)
           }
         }
 
         MouseArea {
+          id: tileMouse
           anchors.fill: parent
           hoverEnabled: true
-          // The panel scrolls; without this its flickable takes over the drag.
           preventStealing: true
           cursorShape: canvas.dragIndex === tile.index ? Qt.ClosedHandCursor : Qt.OpenHandCursor
           property point grab: Qt.point(0, 0)
@@ -957,7 +1804,6 @@ Panel {
               w: start.w,
               h: start.h
             }
-            // Snap edges into line within about a dozen screen pixels.
             canvas.dragRect = Model.attach(wanted, canvas.others(tile.index), Style.space(12) / v.k)
           }
           onReleased: {
@@ -965,8 +1811,6 @@ Panel {
             var index = tile.index
             var r = canvas.dragRect
             var moved = r && start && (r.x !== start.x || r.y !== start.y)
-            // Clear the drag first: replacing the draft rebuilds every tile,
-            // this handler's own included, so nothing after it would run.
             canvas.dragIndex = -1
             canvas.dragRect = null
             canvas.frozenView = null
@@ -985,6 +1829,47 @@ Panel {
             start = null
           }
         }
+      }
+    }
+
+    // Canvas footer hint & live coordinate readout
+    Item {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.bottom: parent.bottom
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      anchors.bottomMargin: Style.space(5)
+      height: canvasHint.implicitHeight
+
+      Text {
+        id: canvasHint
+        anchors.left: parent.left
+        anchors.right: canvasCoord.left
+        anchors.rightMargin: Style.space(8)
+        textFormat: Text.PlainText
+        text: "Drag tiles to arrange · edges snap flush"
+        color: root.muted
+        font.family: root.fontName
+        font.pixelSize: Math.max(9, Style.font.caption - 1)
+        elide: Text.ElideRight
+      }
+
+      Text {
+        id: canvasCoord
+        anchors.right: parent.right
+        textFormat: Text.PlainText
+        text: {
+          if (canvas.dragIndex >= 0 && canvas.dragRect && root.draft[canvas.dragIndex])
+            return root.draft[canvas.dragIndex].name + " @ " + canvas.dragRect.x + ", " + canvas.dragRect.y
+          if (root.current)
+            return root.current.name + " @ " + Math.round(root.current.x) + ", " + Math.round(root.current.y)
+          return ""
+        }
+        color: root.accent
+        font.family: root.fontName
+        font.pixelSize: Math.max(9, Style.font.caption - 1)
+        font.bold: true
       }
     }
 
