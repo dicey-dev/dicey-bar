@@ -1080,7 +1080,7 @@ Item {
       // Only hiding resets it: at a whole-number scale the ratio dips to 1 after the first frame.
       onVisibleChanged: if (!visible) revealed = false
       onScaleReadyChanged: if (scaleReady) Qt.callLater(function() {
-        if (tooltipWindow.scaleReady) tooltipWindow.revealed = true
+        if (tooltipWindow && tooltipWindow.scaleReady) tooltipWindow.revealed = true
       })
 
       anchor {
