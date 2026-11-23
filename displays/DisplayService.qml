@@ -158,9 +158,9 @@ Item {
     brightnessRestoreProc.running = true
   }
 
-  // Apply per-monitor remembered brightness, text size and night light after a
-  // hotplug reconcile or panel Remember commit.
-  function applyMonitorPreferences(plan, preferredIndex, restoreBrightness) {
+  // Restore per-monitor brightness and per-setup OS-wide text size after a
+  // hotplug reconcile or Apply commit.
+  function applyMonitorPreferences(plan, savedMemory, restoreBrightness) {
     if (!Array.isArray(plan) || !plan.length) return
     if (restoreBrightness) {
       var queue = []
@@ -174,20 +174,10 @@ Item {
         pumpBrightnessRestore()
       }
     }
-    var lead = Model.primaryActiveOutput(plan, preferredIndex)
-    if (!lead) return
-    if (lead.textSize !== null && lead.textSize !== undefined && Number(lead.textSize) !== Style.font.baseSize) {
-      textSizeApplyProc.command = ["omarchy-display-text-size", String(Math.round(Number(lead.textSize)))]
+    var textSize = Model.layoutTextSize(savedMemory || memory, plan)
+    if (textSize !== null && textSize !== Style.font.baseSize) {
+      textSizeApplyProc.command = ["omarchy-display-text-size", String(textSize)]
       if (!textSizeApplyProc.running) textSizeApplyProc.running = true
-    }
-    var nl = bar && bar.shell ? bar.shell.firstPartyServiceFor("omarchy.nightlight") : null
-    if (nl && lead.nightLight) {
-      if (lead.nightLight.enabled) {
-        if (typeof nl.applyTemperature === "function") nl.applyTemperature(lead.nightLight.kelvin)
-        else if (typeof nl.setNightlight === "function") nl.setNightlight(true)
-      } else if (nl.enabled && typeof nl.setNightlight === "function") {
-        nl.setNightlight(false)
-      }
     }
   }
 
@@ -204,9 +194,9 @@ Item {
       service.fallbacks = data && Array.isArray(data.fallbacks) ? data.fallbacks : []
       service.lastError = code === 0 ? "" : service.errorText(data, stderr)
       // Keep monitors.lua in step so a config reload shows the same layout.
-      // The memory itself only changes on Remember.
+      // The memory itself only changes on Apply.
       if (code === 0) {
-        service.applyMonitorPreferences(plan, -1, true)
+        service.applyMonitorPreferences(plan, service.memory, true)
         service.run(["persist"], JSON.stringify({ plan: plan }), null)
       }
       service.refresh()
@@ -287,11 +277,11 @@ Item {
   // `plan` is the panel's full arrangement. Applying it saves each monitor's
   // settings and this combination's layout; a mode change first waits for
   // the user to keep it.
-  function applyFromPanel(plan, preferredIndex) {
+  function applyFromPanel(plan, options) {
     if (confirming || !plan || !plan.length) return
     var before = livePlan
     var mustConfirm = Model.needsConfirmation(plan, before)
-    var nextMemory = Model.remember(memory, plan, new Date().toISOString())
+    var nextMemory = Model.remember(memory, plan, new Date().toISOString(), options)
     run(["apply"], JSON.stringify(plan), function(code, data, stderr) {
       service.fallbacks = data && Array.isArray(data.fallbacks) ? data.fallbacks : []
       if (code !== 0) {
@@ -302,21 +292,21 @@ Item {
       }
       service.lastError = ""
       if (mustConfirm) {
-        service.pendingCommit = { plan: plan, memory: nextMemory, preferredIndex: preferredIndex }
+        service.pendingCommit = { plan: plan, memory: nextMemory }
         service.revertPlan = before
         service.confirmSeconds = 10
         service.confirming = true
         confirmTimer.restart()
         service.refresh()
       } else {
-        service.commit(plan, nextMemory, preferredIndex)
+        service.commit(plan, nextMemory)
       }
     })
   }
 
-  function commit(plan, nextMemory, preferredIndex) {
+  function commit(plan, nextMemory) {
     memory = nextMemory
-    applyMonitorPreferences(plan, preferredIndex, false)
+    applyMonitorPreferences(plan, nextMemory, false)
     run(["persist"], JSON.stringify({ plan: plan, memory: nextMemory }), function(code, data, stderr) {
       service.lastError = code === 0 ? "" : service.errorText(data, stderr)
       service.refresh()
@@ -330,7 +320,7 @@ Item {
     var pending = pendingCommit
     pendingCommit = null
     revertPlan = null
-    if (pending) commit(pending.plan, pending.memory, pending.preferredIndex)
+    if (pending) commit(pending.plan, pending.memory)
   }
 
   function revert() {
