@@ -126,16 +126,16 @@ multi-monitor manager (and deduplicates `dicey.displays` if both IDs appear in
 - Drag displays on the canvas; they snap edge to edge and gaps close.
 - Pick resolution and refresh rate separately via side-by-side dropdowns, plus
   scale, adaptive sync and HDR (for displays that report HDR support).
-- **Remember** applies the change and remembers every setting per monitor
-  (mode, scale, adaptive sync, HDR, brightness, text size, night light, and
-  DDC input watch), plus the layout for this combination of connected
-  monitors. Plugging a monitor back in restores what you used last time with
-  it, and a monitor in a new combination is placed beside the display it was
-  last next to.
+- **Apply** applies the change and remembers every per-monitor setting (mode,
+  scale, adaptive sync, HDR, brightness, and DDC input watch), plus the layout
+  and text size for this combination of connected monitors. Plugging a monitor
+  back in restores what you used last time with it, and a monitor in a new
+  combination is placed beside the display it was last next to.
 - Changing a mode or turning a display on or off asks you to keep the change
   and reverts on its own after 10 seconds.
-- Brightness, text size and night light preview immediately while editing and
-  are saved per monitor when you press **Remember** (or reverted on **Discard**).
+- Text size and night light are OS-wide across all displays (use **Scale** for
+  per-monitor sizing); text size is remembered per monitor combination on
+  **Apply** and reverted on **Discard**.
 - **Switch away / power off** (external monitors) reads the monitor's input
   over DDC/CI every 5 seconds. When the monitor shows another input or stops
   answering, it is turned off and the layout is rearranged without it; it comes

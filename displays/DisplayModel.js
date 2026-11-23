@@ -391,21 +391,17 @@ function sameNightLight(a, b) {
   return a.enabled === b.enabled && a.kelvin === b.kelvin
 }
 
-// Pick which enabled monitor drives desktop-wide properties (text size / night
-// light) that Omarchy stores once across the session: an explicit index from
-// the panel wins, otherwise an active external monitor wins over the built-in
-// panel so docking/undocking switches cleanly.
-function primaryActiveOutput(plan, preferredIndex) {
-  if (!Array.isArray(plan) || !plan.length) return null
-  if (preferredIndex !== undefined && preferredIndex !== null
-      && preferredIndex >= 0 && preferredIndex < plan.length) {
-    var picked = plan[preferredIndex]
-    if (picked && picked.enabled && !picked.autoOff) return picked
-  }
-  for (var i = 0; i < plan.length; i++)
-    if (plan[i] && plan[i].enabled && !plan[i].autoOff && !plan[i].internal) return plan[i]
-  for (var j = 0; j < plan.length; j++)
-    if (plan[j] && plan[j].enabled && !plan[j].autoOff) return plan[j]
+// Remembered text size for the active combination of monitors (e.g. laptop-only
+// vs docked desk). Omarchy's text size is OS-wide across all outputs, so
+// storing it per monitor topology restores the right desk size on dock/undock
+// without pretending two simultaneous monitors can have different system fonts.
+function layoutTextSize(memory, plan) {
+  var mem = normalizeMemory(memory)
+  var active = (Array.isArray(plan) ? plan : []).filter(function(o) { return o && !o.autoOff })
+  if (!active.length) return null
+  var exact = mem.layouts[layoutKey(active.map(function(o) { return o.fp }))]
+  if (exact && exact.textSize !== undefined && exact.textSize !== null)
+    return cleanTextSize(exact.textSize)
   return null
 }
 
@@ -591,12 +587,17 @@ function copyMemory(memory) {
 }
 
 // The memory after the user presses Apply on `plan`: every monitor's own
-// settings, and the arrangement for this set of monitors.
-function remember(memory, plan, now) {
+// settings, and the arrangement (plus optional OS-wide text size) for this
+// combination of monitors.
+function remember(memory, plan, now, options) {
   var mem = copyMemory(memory)
+  var opts = options && typeof options === "object" ? options : {}
   var members = plan.filter(function(o) { return !o.autoOff })
   var key = layoutKey(members.map(function(o) { return o.fp }))
+  var prevLayout = mem.layouts[key] || {}
   var layout = { members: members.map(function(o) { return o.fp }).sort(), lastUsed: String(now || ""), outputs: {} }
+  var savedTextSize = cleanTextSize(opts.textSize !== undefined ? opts.textSize : prevLayout.textSize)
+  if (savedTextSize !== null) layout.textSize = savedTextSize
   for (var i = 0; i < plan.length; i++) {
     var o = plan[i]
     var previous = mem.monitors[o.fp] || {}
@@ -619,12 +620,8 @@ function remember(memory, plan, now) {
       hdr: o.hdr === true,
       ddcWatch: o.ddcWatch === true
     }
-    var textSize = cleanTextSize(o.textSize !== null && o.textSize !== undefined ? o.textSize : previous.textSize)
-    if (textSize !== null) profile.textSize = textSize
     var brightness = cleanBrightness(o.brightness !== null && o.brightness !== undefined ? o.brightness : previous.brightness)
     if (brightness !== null) profile.brightness = brightness
-    var nightLight = cleanNightLight(o.nightLight ? o.nightLight : previous.nightLight)
-    if (nightLight !== null) profile.nightLight = nightLight
     // The input a watched monitor is expected on is learned when the watch is
     // switched on, and kept while it stays on.
     if (profile.ddcWatch && previous.ddcWatch && previous.ddcInput) profile.ddcInput = previous.ddcInput

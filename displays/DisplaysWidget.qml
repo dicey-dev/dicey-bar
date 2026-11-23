@@ -8,9 +8,10 @@ import qs.Commons as Commons
 import "DisplayModel.js" as Model
 
 // Unified Displays bar widget (replaces stock `omarchy.monitor` and answers
-// `dicey.displays`). Drag monitors into place, select any monitor to edit its
-// own mode, scale, adaptive sync, HDR, brightness, text size, night light and
-// auto-disable settings, and press Remember to apply and persist them.
+// `dicey.displays`). Per-monitor settings (position, resolution, refresh rate,
+// scale, adaptive sync, HDR, brightness, auto-disable) are scoped to the
+// selected monitor; OS-wide controls (text size and night light) sit in a
+// dedicated All Displays card so their scope is never ambiguous.
 Panel {
   id: root
   moduleName: "omarchy.monitor"
@@ -21,25 +22,24 @@ Panel {
   readonly property var live: service ? service.livePlan : []
   readonly property var liveMonitors: service ? service.monitors : []
 
-  // The arrangement being edited; it becomes the plan on Remember.
+  // The arrangement being edited; it becomes the plan on Apply.
   property var draft: []
   property int selected: 0
   property bool edited: false
 
-  // Opening values for live-previewed desktop properties so Discard reverts cleanly.
+  // OS-wide text size draft (remembered per monitor combination on Apply;
+  // reverted on Discard if previewed live).
   property int openedTextSize: 0
-  property bool textSizePreviewed: false
-  property var openedNightLight: null
-  property bool nightLightPreviewed: false
+  property int draftTextSize: 0
+  property bool textSizeEdited: false
 
   readonly property bool dirty: {
     if (!draft.length || draft.length !== live.length) return false
+    if (textSizeEdited && draftTextSize !== openedTextSize) return true
     if (!Model.planMatchesLive(draft, live)) return true
     for (var i = 0; i < draft.length; i++) {
       if (draft[i].ddcWatch !== live[i].ddcWatch) return true
-      if ((draft[i].textSize || null) !== (live[i].textSize || null)) return true
       if ((draft[i].brightness || null) !== (live[i].brightness || null)) return true
-      if (!Model.sameNightLight(draft[i].nightLight, live[i].nightLight)) return true
     }
     return false
   }
@@ -84,24 +84,7 @@ Panel {
     for (var i = 0; i < draft.length; i++) if (draft[i].enabled && !draft[i].autoOff) n++
     return n
   }
-  readonly property int currentTextSize: {
-    if (current && current.textSize !== null && current.textSize !== undefined)
-      return Math.round(Number(current.textSize))
-    return Style.font.baseSize
-  }
-  readonly property bool currentNightLightOn: {
-    if (current && current.nightLight) return current.nightLight.enabled === true
-    return !!nightlight && nightlight.enabled
-  }
-  readonly property int currentNightLightKelvin: {
-    if (current && current.nightLight && current.nightLight.kelvin)
-      return Math.round(Number(current.nightLight.kelvin))
-    if (nightlight && nightlight.enabled && nightlight.temperature) {
-      var t = Math.round(Number(nightlight.temperature))
-      if (isFinite(t) && t >= 1500 && t <= 6500) return t
-    }
-    return 4000
-  }
+  readonly property int shownTextSize: textSizeEdited && draftTextSize >= 9 ? draftTextSize : Style.font.baseSize
 
   // Theme-derived palette — strictly Commons.Color tokens so theme swaps apply live.
   readonly property color fg: bar ? bar.foreground : Commons.Color.foreground
@@ -138,19 +121,11 @@ Panel {
   }
 
   function discardDraft() {
-    if (textSizePreviewed && openedTextSize >= 9 && openedTextSize <= 20) {
+    if (textSizeEdited && openedTextSize >= 9 && openedTextSize <= 20) {
       applyTextSizeLive(openedTextSize)
-      textSizePreviewed = false
     }
-    if (nightLightPreviewed && openedNightLight && nightlight) {
-      if (openedNightLight.enabled) {
-        if (typeof nightlight.applyTemperature === "function") nightlight.applyTemperature(openedNightLight.kelvin)
-        else nightlight.setNightlight(true)
-      } else {
-        nightlight.setNightlight(false)
-      }
-      nightLightPreviewed = false
-    }
+    textSizeEdited = false
+    draftTextSize = openedTextSize
     resetDraft()
   }
 
@@ -158,7 +133,6 @@ Panel {
     var c = {}
     for (var k in o) c[k] = o[k]
     if (o.mode) c.mode = { w: o.mode.w, h: o.mode.h, hz: o.mode.hz }
-    if (o.nightLight) c.nightLight = { enabled: o.nightLight.enabled === true, kelvin: o.nightLight.kelvin }
     return c
   }
 
@@ -197,25 +171,12 @@ Panel {
     }
   }
 
-  function setMonitorTextSize(index, px) {
+  function pickTextSize(px) {
     var clean = Model.cleanTextSize(px)
     if (clean === null) return
-    update(index, { textSize: clean }, false)
-    textSizePreviewed = true
+    draftTextSize = clean
+    textSizeEdited = true
     applyTextSizeLive(clean)
-  }
-
-  function setMonitorNightLight(index, enabled, kelvin) {
-    var nl = { enabled: enabled === true, kelvin: Math.round(Number(kelvin) || 4000) }
-    update(index, { nightLight: nl }, false)
-    nightLightPreviewed = true
-    if (!nightlight) return
-    if (nl.enabled) {
-      if (typeof nightlight.applyTemperature === "function") nightlight.applyTemperature(nl.kelvin)
-      else nightlight.setNightlight(true)
-    } else {
-      nightlight.setNightlight(false)
-    }
   }
 
   function canTurnOff(index) {
@@ -226,10 +187,11 @@ Panel {
   function apply() {
     if (!service || !dirty || service.confirming) return
     var plan = Model.solve(draft)
+    var options = textSizeEdited ? { textSize: draftTextSize } : { textSize: Style.font.baseSize }
     edited = false
-    textSizePreviewed = false
-    nightLightPreviewed = false
-    service.applyFromPanel(plan, selected)
+    textSizeEdited = false
+    openedTextSize = options.textSize
+    service.applyFromPanel(plan, options)
   }
 
   function offText(o) {
@@ -290,11 +252,8 @@ Panel {
   onOpenedChanged: {
     if (!opened) return
     openedTextSize = Style.font.baseSize
-    textSizePreviewed = false
-    openedNightLight = nightlight
-      ? { enabled: nightlight.enabled === true, kelvin: Math.round(Number(nightlight.temperature) || 4000) }
-      : null
-    nightLightPreviewed = false
+    draftTextSize = Style.font.baseSize
+    textSizeEdited = false
     resetDraft()
     if (service) service.refresh()
     if (nightlight && typeof nightlight.refresh === "function") nightlight.refresh()
@@ -368,7 +327,7 @@ Panel {
     onTriggered: root.setBrightness(root.brightness, true)
   }
 
-  // ---------------------------------------------------------------- text size (per monitor)
+  // ---------------------------------------------------------------- text size (OS-wide, remembered per setup)
   readonly property var textSizeStops: [9, 10, 11, 12, 14, 16, 20]
   Process { id: textSizeProc }
 
@@ -377,16 +336,23 @@ Panel {
     if (!textSizeProc.running) textSizeProc.running = true
   }
 
-  // ---------------------------------------------------------------- night light (per monitor)
+  // ---------------------------------------------------------------- night light (OS-wide via hyprsunset)
   readonly property var nightlight: bar && bar.shell ? bar.shell.firstPartyServiceFor("omarchy.nightlight") : null
-  property int pendingKelvin: 4000
+  property int desiredKelvin: 4000
+  readonly property int activeKelvin: {
+    if (nightlight && nightlight.enabled && nightlight.temperature) {
+      var t = Math.round(Number(nightlight.temperature))
+      if (isFinite(t) && t >= 1500 && t <= 6500) return t
+    }
+    return desiredKelvin
+  }
 
   Timer {
     id: kelvinDebounce
     interval: 120
     onTriggered: {
-      if (root.current && root.currentNightLightOn)
-        root.setMonitorNightLight(root.selected, true, root.pendingKelvin)
+      if (root.nightlight && root.nightlight.enabled && typeof root.nightlight.applyTemperature === "function")
+        root.nightlight.applyTemperature(root.desiredKelvin)
     }
   }
 
@@ -465,7 +431,7 @@ Panel {
                 return f.name + " fell back to " + f.actual + " instead of " + f.wanted
               }
               if (s.confirming) return "Confirming changes (" + s.confirmSeconds + "s)"
-              if (root.dirty) return "Unsaved changes · press Remember to apply & save"
+              if (root.dirty) return "Unsaved changes · press Apply to save"
               return "Synced with monitors.lua · auto-applies on reconnect"
             }
             color: {
@@ -517,13 +483,13 @@ Panel {
             }
 
             Rectangle {
-              id: rememberBtn
+              id: applyBtn
               readonly property bool canApply: root.dirty && !!root.service && !root.service.confirming
-              implicitWidth: rememberLabel.implicitWidth + Style.space(22)
+              implicitWidth: applyLabel.implicitWidth + Style.space(22)
               implicitHeight: Style.space(28)
               radius: Style.cornerRadius
               color: canApply
-                ? (rememberMouse.containsMouse ? Qt.lighter(root.accent, 1.08) : root.accent)
+                ? (applyMouse.containsMouse ? Qt.lighter(root.accent, 1.08) : root.accent)
                 : root.trackBg
               border.color: canApply ? root.accent : root.cardBorder
               border.width: 1
@@ -532,20 +498,20 @@ Panel {
               Behavior on color { ColorAnimation { duration: Style.duration(120) } }
 
               Text {
-                id: rememberLabel
+                id: applyLabel
                 anchors.centerIn: parent
                 textFormat: Text.PlainText
-                text: "Remember"
-                color: rememberBtn.canApply ? root.accentInk : root.muted
+                text: "Apply"
+                color: applyBtn.canApply ? root.accentInk : root.muted
                 font.family: root.fontName
                 font.pixelSize: Style.font.caption
                 font.bold: true
               }
 
               MouseArea {
-                id: rememberMouse
+                id: applyMouse
                 anchors.fill: parent
-                enabled: rememberBtn.canApply
+                enabled: applyBtn.canApply
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.apply()
@@ -665,7 +631,7 @@ Panel {
           // ---------- Interactive Layout Canvas ----------
           LayoutCanvas {
             width: parent.width
-            height: Style.space(184)
+            height: Style.space(176)
           }
 
           // ---------- Display Selector Strip ----------
@@ -746,12 +712,11 @@ Panel {
           }
 
           // ---------- Selected Monitor Scope Banner ----------
-          // Clearly scopes every setting in both cards below to this monitor.
           Rectangle {
             id: monitorBanner
             width: parent.width
             visible: root.current !== null
-            implicitHeight: bannerRow.implicitHeight + Style.space(18)
+            implicitHeight: bannerRow.implicitHeight + Style.space(16)
             radius: Style.cornerRadius
             color: root.cardBg
             border.color: root.accentBorder
@@ -867,14 +832,14 @@ Panel {
               wrapMode: Text.Wrap
               text: root.current && root.current.autoOff
                 ? "This display is paused (" + root.offText(root.current).toLowerCase() + ") and will restore automatically when available."
-                : "This display is turned off. Flip the switch above and press Remember to re-enable it."
+                : "This display is turned off. Flip the switch above and press Apply to re-enable it."
               color: root.muted
               font.family: root.fontName
               font.pixelSize: Style.font.caption
             }
           }
 
-          // ---------- Two-Column Bordered Cards (Both Scoped to Selected Monitor) ----------
+          // ---------- Two-Column Per-Monitor Cards (Strictly Scoped to Selected Monitor) ----------
           Item {
             id: cardsContainer
             width: parent.width
@@ -887,7 +852,7 @@ Panel {
               : 0
             height: implicitHeight
 
-            // ========== LEFT CARD: MODE & SIGNAL ==========
+            // ========== LEFT CARD: MODE & SCALE (PER MONITOR) ==========
             CardBox {
               id: displayCard
               x: 0
@@ -902,7 +867,7 @@ Panel {
 
                 Text {
                   textFormat: Text.PlainText
-                  text: "MODE & SIGNAL"
+                  text: "MODE & SCALE"
                   color: root.muted
                   font.family: root.fontName
                   font.pixelSize: Math.max(9, Style.font.caption - 1)
@@ -1024,57 +989,10 @@ Panel {
                     onPicked: function(val) { root.update(root.selected, { vrr: val }, false) }
                   }
                 }
-
-                Rectangle { width: parent.width; height: 1; color: root.hairline }
-
-                // Per-monitor HDR
-                Item {
-                  width: parent.width
-                  implicitHeight: Math.max(hdrCol.implicitHeight, hdrSwitch.implicitHeight)
-
-                  Column {
-                    id: hdrCol
-                    anchors.left: parent.left
-                    anchors.right: hdrSwitch.left
-                    anchors.rightMargin: Style.space(8)
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: Style.space(1)
-
-                    Text {
-                      textFormat: Text.PlainText
-                      text: "HDR"
-                      color: root.fg
-                      font.family: root.fontName
-                      font.pixelSize: Style.font.caption
-                      font.bold: true
-                    }
-
-                    Text {
-                      width: parent.width
-                      textFormat: Text.PlainText
-                      text: root.currentMonitor && root.currentMonitor.hdrCapable
-                        ? (root.current && root.current.hdr ? "10-bit PQ enabled" : "HDR capable · 10-bit PQ")
-                        : "Not reported by display"
-                      color: root.current && root.current.hdr ? root.accent : root.muted
-                      font.family: root.fontName
-                      font.pixelSize: Math.max(9, Style.font.caption - 1)
-                      elide: Text.ElideRight
-                    }
-                  }
-
-                  AccentSwitch {
-                    id: hdrSwitch
-                    anchors.right: parent.right
-                    anchors.verticalCenter: parent.verticalCenter
-                    checked: !!root.current && root.current.hdr
-                    interactive: !!root.currentMonitor && root.currentMonitor.hdrCapable === true
-                    onToggled: root.update(root.selected, { hdr: !root.current.hdr }, false)
-                  }
-                }
               }
             }
 
-            // ========== RIGHT CARD: PICTURE & AUTOMATION ==========
+            // ========== RIGHT CARD: BRIGHTNESS, HDR & AUTOMATION (PER MONITOR) ==========
             CardBox {
               id: pictureCard
               x: column.twoColumn ? (cardsContainer.cardWidth + cardsContainer.gap) : 0
@@ -1184,20 +1102,22 @@ Panel {
 
                 Rectangle { width: parent.width; height: 1; color: root.hairline }
 
-                // Per-monitor Text Size
-                Column {
+                // Per-monitor HDR
+                Item {
                   width: parent.width
-                  spacing: Style.space(5)
+                  implicitHeight: Math.max(hdrCol.implicitHeight, hdrSwitch.implicitHeight)
 
-                  Item {
-                    width: parent.width
-                    implicitHeight: textSzTitle.implicitHeight
+                  Column {
+                    id: hdrCol
+                    anchors.left: parent.left
+                    anchors.right: hdrSwitch.left
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(1)
 
                     Text {
-                      id: textSzTitle
-                      anchors.left: parent.left
                       textFormat: Text.PlainText
-                      text: "Text size"
+                      text: "HDR"
                       color: root.fg
                       font.family: root.fontName
                       font.pixelSize: Style.font.caption
@@ -1205,104 +1125,25 @@ Panel {
                     }
 
                     Text {
-                      anchors.right: parent.right
+                      width: parent.width
                       textFormat: Text.PlainText
-                      text: root.currentTextSize + "px · " + Math.round(root.currentTextSize * 9 / 12) + "pt term"
-                      color: root.accent
+                      text: root.currentMonitor && root.currentMonitor.hdrCapable
+                        ? (root.current && root.current.hdr ? "10-bit PQ enabled" : "HDR capable · 10-bit PQ")
+                        : "Not reported by display"
+                      color: root.current && root.current.hdr ? root.accent : root.muted
                       font.family: root.fontName
-                      font.pixelSize: Style.font.caption
-                      font.bold: true
+                      font.pixelSize: Math.max(9, Style.font.caption - 1)
+                      elide: Text.ElideRight
                     }
                   }
 
-                  SegmentedBar {
-                    width: parent.width
-                    options: {
-                      var out = []
-                      for (var i = 0; i < root.textSizeStops.length; i++)
-                        out.push({ value: root.textSizeStops[i], label: String(root.textSizeStops[i]) })
-                      return out
-                    }
-                    currentValue: root.currentTextSize
-                    onPicked: function(val) { root.setMonitorTextSize(root.selected, val) }
-                  }
-                }
-
-                Rectangle { width: parent.width; height: 1; color: root.hairline; visible: root.nightlight !== null }
-
-                // Per-monitor Night Light (toggle + warm Kelvin slider)
-                Column {
-                  width: parent.width
-                  spacing: Style.space(5)
-                  visible: root.nightlight !== null
-
-                  Item {
-                    width: parent.width
-                    implicitHeight: Math.max(nlLeft.implicitHeight, nlRight.implicitHeight)
-
-                    Row {
-                      id: nlLeft
-                      anchors.left: parent.left
-                      anchors.verticalCenter: parent.verticalCenter
-                      spacing: Style.space(6)
-
-                      Text {
-                        textFormat: Text.PlainText
-                        text: "Night Light"
-                        color: root.fg
-                        font.family: root.fontName
-                        font.pixelSize: Style.font.caption
-                        font.bold: true
-                        anchors.verticalCenter: parent.verticalCenter
-                      }
-
-                      Text {
-                        textFormat: Text.PlainText
-                        text: root.currentNightLightOn
-                          ? (Math.round(kelvinSlider.dragging ? kelvinSlider.liveValue : root.currentNightLightKelvin) + "K")
-                          : "Off"
-                        color: root.currentNightLightOn ? root.alertColor : root.muted
-                        font.family: root.fontName
-                        font.pixelSize: Style.font.caption
-                        font.bold: root.currentNightLightOn
-                        anchors.verticalCenter: parent.verticalCenter
-                      }
-                    }
-
-                    AccentSwitch {
-                      id: nlRight
-                      anchors.right: parent.right
-                      anchors.verticalCenter: parent.verticalCenter
-                      activeColor: root.alertColor
-                      checked: root.currentNightLightOn
-                      onToggled: root.setMonitorNightLight(root.selected, !root.currentNightLightOn, root.currentNightLightKelvin)
-                    }
-                  }
-
-                  PanelSlider {
-                    id: kelvinSlider
-                    bar: root.bar
-                    width: parent.width
-                    enabled: root.currentNightLightOn
-                    opacity: enabled ? 1 : 0.38
-                    minimum: 1800
-                    maximum: 6000
-                    step: 100
-                    integer: true
-                    value: root.currentNightLightKelvin
-                    trackColor: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.14)
-                    fillColor: root.alertColor
-                    knobColor: root.alertColor
-                    onMoved: function(v) {
-                      root.pendingKelvin = Math.round(v)
-                      kelvinDebounce.restart()
-                    }
-                    onReleased: function(v) {
-                      kelvinDebounce.stop()
-                      root.pendingKelvin = Math.round(v)
-                      if (root.currentNightLightOn)
-                        root.setMonitorNightLight(root.selected, true, root.pendingKelvin)
-                    }
+                  AccentSwitch {
+                    id: hdrSwitch
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    checked: !!root.current && root.current.hdr
+                    interactive: !!root.currentMonitor && root.currentMonitor.hdrCapable === true
+                    onToggled: root.update(root.selected, { hdr: !root.current.hdr }, false)
                   }
                 }
 
@@ -1408,6 +1249,180 @@ Panel {
                         font.family: root.fontName
                         font.pixelSize: Math.max(9, Style.font.caption - 1)
                       }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // ---------- All Displays Card (OS-wide settings in Omarchy/Hyprland) ----------
+          CardBox {
+            width: parent.width
+
+            Column {
+              width: parent.width
+              spacing: Style.space(8)
+
+              Item {
+                width: parent.width
+                implicitHeight: allDispHead.implicitHeight
+
+                Text {
+                  id: allDispHead
+                  anchors.left: parent.left
+                  textFormat: Text.PlainText
+                  text: "ALL DISPLAYS"
+                  color: root.muted
+                  font.family: root.fontName
+                  font.pixelSize: Math.max(9, Style.font.caption - 1)
+                  font.bold: true
+                  font.letterSpacing: 1.0
+                }
+
+                Text {
+                  anchors.right: parent.right
+                  textFormat: Text.PlainText
+                  text: "OS-wide · use Scale above for per-monitor size"
+                  color: root.muted
+                  font.family: root.fontName
+                  font.pixelSize: Math.max(9, Style.font.caption - 1)
+                }
+              }
+
+              Item {
+                id: globalRow
+                width: parent.width
+                readonly property int gap: Style.space(12)
+                readonly property bool split: column.twoColumn && root.nightlight !== null
+                readonly property real halfW: split ? Math.floor((width - gap) / 2) : width
+                implicitHeight: split
+                  ? Math.max(textSizeCol.implicitHeight, nightLightCol.implicitHeight)
+                  : (textSizeCol.implicitHeight + (root.nightlight !== null ? gap + nightLightCol.implicitHeight : 0))
+                height: implicitHeight
+
+                // Text size (remembered per monitor combination on Apply)
+                Column {
+                  id: textSizeCol
+                  x: 0
+                  y: 0
+                  width: globalRow.halfW
+                  spacing: Style.space(5)
+
+                  Item {
+                    width: parent.width
+                    implicitHeight: textSzTitle.implicitHeight
+
+                    Text {
+                      id: textSzTitle
+                      anchors.left: parent.left
+                      textFormat: Text.PlainText
+                      text: "Text size"
+                      color: root.fg
+                      font.family: root.fontName
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+
+                    Text {
+                      anchors.right: parent.right
+                      textFormat: Text.PlainText
+                      text: root.shownTextSize + "px · " + Math.round(root.shownTextSize * 9 / 12) + "pt term"
+                      color: root.accent
+                      font.family: root.fontName
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                  }
+
+                  SegmentedBar {
+                    width: parent.width
+                    options: {
+                      var out = []
+                      for (var i = 0; i < root.textSizeStops.length; i++)
+                        out.push({ value: root.textSizeStops[i], label: String(root.textSizeStops[i]) })
+                      return out
+                    }
+                    currentValue: root.shownTextSize
+                    onPicked: function(val) { root.pickTextSize(val) }
+                  }
+                }
+
+                // Night Light (hyprsunset)
+                Column {
+                  id: nightLightCol
+                  visible: root.nightlight !== null
+                  x: globalRow.split ? (globalRow.halfW + globalRow.gap) : 0
+                  y: globalRow.split ? 0 : (textSizeCol.implicitHeight + globalRow.gap)
+                  width: globalRow.halfW
+                  spacing: Style.space(5)
+
+                  Item {
+                    width: parent.width
+                    implicitHeight: Math.max(nlLeft.implicitHeight, nlRight.implicitHeight)
+
+                    Row {
+                      id: nlLeft
+                      anchors.left: parent.left
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(6)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: "Night Light"
+                        color: root.fg
+                        font.family: root.fontName
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: root.nightlight && root.nightlight.enabled
+                          ? (Math.round(kelvinSlider.dragging ? kelvinSlider.liveValue : root.activeKelvin) + "K")
+                          : "Off"
+                        color: root.nightlight && root.nightlight.enabled ? root.alertColor : root.muted
+                        font.family: root.fontName
+                        font.pixelSize: Style.font.caption
+                        font.bold: !!root.nightlight && root.nightlight.enabled
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                    }
+
+                    AccentSwitch {
+                      id: nlRight
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      activeColor: root.alertColor
+                      checked: !!root.nightlight && root.nightlight.enabled
+                      onToggled: if (root.nightlight) root.nightlight.setNightlight(!root.nightlight.enabled)
+                    }
+                  }
+
+                  PanelSlider {
+                    id: kelvinSlider
+                    bar: root.bar
+                    width: parent.width
+                    enabled: !!root.nightlight && root.nightlight.enabled
+                    opacity: enabled ? 1 : 0.38
+                    minimum: 1800
+                    maximum: 6000
+                    step: 100
+                    integer: true
+                    value: root.activeKelvin
+                    trackColor: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.14)
+                    fillColor: root.alertColor
+                    knobColor: root.alertColor
+                    onMoved: function(v) {
+                      root.desiredKelvin = Math.round(v)
+                      kelvinDebounce.restart()
+                    }
+                    onReleased: function(v) {
+                      kelvinDebounce.stop()
+                      root.desiredKelvin = Math.round(v)
+                      if (root.nightlight && root.nightlight.enabled && typeof root.nightlight.applyTemperature === "function")
+                        root.nightlight.applyTemperature(root.desiredKelvin)
                     }
                   }
                 }
