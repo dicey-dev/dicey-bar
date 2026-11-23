@@ -141,6 +141,56 @@ Item {
     ddcMisses = misses
   }
 
+  // ---------------------------------------------------------------- per-monitor side effects
+  property var brightnessRestoreQueue: []
+
+  Process { id: textSizeApplyProc }
+  Process {
+    id: brightnessRestoreProc
+    onRunningChanged: if (!running) service.pumpBrightnessRestore()
+  }
+
+  function pumpBrightnessRestore() {
+    if (brightnessRestoreProc.running || brightnessRestoreQueue.length === 0) return
+    var next = brightnessRestoreQueue[0]
+    brightnessRestoreQueue = brightnessRestoreQueue.slice(1)
+    brightnessRestoreProc.command = ["omarchy-brightness-display", "--no-osd", "--monitor", next.name, next.pct + "%"]
+    brightnessRestoreProc.running = true
+  }
+
+  // Apply per-monitor remembered brightness, text size and night light after a
+  // hotplug reconcile or panel Remember commit.
+  function applyMonitorPreferences(plan, preferredIndex, restoreBrightness) {
+    if (!Array.isArray(plan) || !plan.length) return
+    if (restoreBrightness) {
+      var queue = []
+      for (var i = 0; i < plan.length; i++) {
+        var o = plan[i]
+        if (o && o.enabled && !o.autoOff && o.brightness !== null && o.brightness !== undefined)
+          queue.push({ name: o.name, pct: Math.round(Number(o.brightness)) })
+      }
+      if (queue.length) {
+        brightnessRestoreQueue = queue
+        pumpBrightnessRestore()
+      }
+    }
+    var lead = Model.primaryActiveOutput(plan, preferredIndex)
+    if (!lead) return
+    if (lead.textSize !== null && lead.textSize !== undefined && Number(lead.textSize) !== Style.font.baseSize) {
+      textSizeApplyProc.command = ["omarchy-display-text-size", String(Math.round(Number(lead.textSize)))]
+      if (!textSizeApplyProc.running) textSizeApplyProc.running = true
+    }
+    var nl = bar && bar.shell ? bar.shell.firstPartyServiceFor("omarchy.nightlight") : null
+    if (nl && lead.nightLight) {
+      if (lead.nightLight.enabled) {
+        if (typeof nl.applyTemperature === "function") nl.applyTemperature(lead.nightLight.kelvin)
+        else if (typeof nl.setNightlight === "function") nl.setNightlight(true)
+      } else if (nl.enabled && typeof nl.setNightlight === "function") {
+        nl.setNightlight(false)
+      }
+    }
+  }
+
   // ---------------------------------------------------------------- automatic
   function reconcile() {
     if (!loaded || confirming || !Model.hasMemory(memory) || monitors.length === 0) return
@@ -154,8 +204,11 @@ Item {
       service.fallbacks = data && Array.isArray(data.fallbacks) ? data.fallbacks : []
       service.lastError = code === 0 ? "" : service.errorText(data, stderr)
       // Keep monitors.lua in step so a config reload shows the same layout.
-      // The memory itself only changes on Apply.
-      if (code === 0) service.run(["persist"], JSON.stringify({ plan: plan }), null)
+      // The memory itself only changes on Remember.
+      if (code === 0) {
+        service.applyMonitorPreferences(plan, -1, true)
+        service.run(["persist"], JSON.stringify({ plan: plan }), null)
+      }
       service.refresh()
     })
   }
@@ -234,7 +287,7 @@ Item {
   // `plan` is the panel's full arrangement. Applying it saves each monitor's
   // settings and this combination's layout; a mode change first waits for
   // the user to keep it.
-  function applyFromPanel(plan) {
+  function applyFromPanel(plan, preferredIndex) {
     if (confirming || !plan || !plan.length) return
     var before = livePlan
     var mustConfirm = Model.needsConfirmation(plan, before)
@@ -249,20 +302,21 @@ Item {
       }
       service.lastError = ""
       if (mustConfirm) {
-        service.pendingCommit = { plan: plan, memory: nextMemory }
+        service.pendingCommit = { plan: plan, memory: nextMemory, preferredIndex: preferredIndex }
         service.revertPlan = before
         service.confirmSeconds = 10
         service.confirming = true
         confirmTimer.restart()
         service.refresh()
       } else {
-        service.commit(plan, nextMemory)
+        service.commit(plan, nextMemory, preferredIndex)
       }
     })
   }
 
-  function commit(plan, nextMemory) {
+  function commit(plan, nextMemory, preferredIndex) {
     memory = nextMemory
+    applyMonitorPreferences(plan, preferredIndex, false)
     run(["persist"], JSON.stringify({ plan: plan, memory: nextMemory }), function(code, data, stderr) {
       service.lastError = code === 0 ? "" : service.errorText(data, stderr)
       service.refresh()
@@ -276,7 +330,7 @@ Item {
     var pending = pendingCommit
     pendingCommit = null
     revertPlan = null
-    if (pending) commit(pending.plan, pending.memory)
+    if (pending) commit(pending.plan, pending.memory, pending.preferredIndex)
   }
 
   function revert() {

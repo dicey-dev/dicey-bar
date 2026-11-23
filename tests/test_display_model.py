@@ -259,6 +259,32 @@ TestCase {
         memory = Model.remember(memory, plan, "t3")
         compare(memory.monitors[plan[0].fp].ddcInput, undefined)
     }
+
+    function test_per_monitor_text_size_brightness_and_night_light_are_remembered() {
+        var plan = Model.derive([laptop(), benq()], {}, {})
+        byName(plan, "eDP-1").textSize = 14
+        byName(plan, "eDP-1").brightness = 55
+        byName(plan, "eDP-1").nightLight = { enabled: true, kelvin: 3400 }
+        byName(plan, "HDMI-A-1").textSize = 11
+        byName(plan, "HDMI-A-1").brightness = 82
+        byName(plan, "HDMI-A-1").nightLight = { enabled: false, kelvin: 4000 }
+        var memory = Model.remember({}, plan, "t")
+
+        var docked = Model.derive([laptop(), benq()], memory, {})
+        compare(byName(docked, "eDP-1").textSize, 14)
+        compare(byName(docked, "eDP-1").brightness, 55)
+        compare(byName(docked, "eDP-1").nightLight, { enabled: true, kelvin: 3400 })
+        compare(byName(docked, "HDMI-A-1").textSize, 11)
+        compare(byName(docked, "HDMI-A-1").brightness, 82)
+        compare(byName(docked, "HDMI-A-1").nightLight, { enabled: false, kelvin: 4000 })
+        // Docked: external monitor leads desktop-wide text size / night light.
+        compare(Model.primaryActiveOutput(docked).name, "HDMI-A-1")
+
+        // Undocked: laptop panel leads with its own remembered text size & night light.
+        var undocked = Model.derive([laptop()], memory, {})
+        compare(Model.primaryActiveOutput(undocked).name, "eDP-1")
+        compare(Model.primaryActiveOutput(undocked).textSize, 14)
+    }
 }
 """
 
