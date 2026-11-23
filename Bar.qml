@@ -47,7 +47,7 @@ Item {
     position: "top",
     transparent: false,
     centerAnchor: "omarchy.clock",
-    layout: { left: [], center: [], right: [] }
+    layout: { left: [], centerBegin: [], center: [], centerEnd: [], right: [], tray: [] }
   })
   property var layoutConfig: fallbackBarConfig.layout
   property string centerAnchor: ""
@@ -339,6 +339,48 @@ Item {
     if (activePopout === owner) activePopout = null
   }
 
+  // Where the open panel's card stands, and in which section of the bar, so
+  // a panel taking over in the same section can start its card from there.
+  property var popoutCard: null
+
+  // The section a panel's widget sits in, the center island's pieces counted
+  // as one, as keyboard switching between panels counts them.
+  function popoutSectionOf(owner) {
+    for (var i = 0; i < moduleSlots.length; i++) {
+      var slot = moduleSlots[i]
+      if (slot && slot.activeItem === owner) return BarModel.navigationRegions(slot.region).join(" ")
+    }
+    return ""
+  }
+
+  // Reported by the open panel. Only a screen name and four numbers are kept,
+  // whoever reports them; the section comes from the bar's own layout.
+  function notePopoutCard(card) {
+    popoutCard = card ? { screen: String(card.screen || ""), section: popoutSectionOf(activePopout),
+                          x: Number(card.x) || 0, y: Number(card.y) || 0,
+                          width: Number(card.width) || 0, height: Number(card.height) || 0 } : null
+  }
+
+  // The last card, copied, for a panel taking over in the same section: one
+  // switching across the bar opens fresh instead of flying the card over it.
+  function popoutCardFor(owner) {
+    var card = popoutCard
+    if (!card || !card.section || card.section !== popoutSectionOf(owner)) return null
+    return { screen: card.screen, x: card.x, y: card.y, width: card.width, height: card.height }
+  }
+
+  // An open panel from a widget in the tray section keeps the tray's drawer
+  // open, so the panel's widget stays on screen under it.
+  readonly property bool traySectionPopoutOpen: {
+    var owner = activePopout
+    if (!owner) return false
+    for (var i = 0; i < moduleSlots.length; i++) {
+      var slot = moduleSlots[i]
+      if (slot && slot.activeItem === owner) return slot.region === "tray"
+    }
+    return false
+  }
+
   readonly property bool vertical: position === "left" || position === "right"
   readonly property int barSize: vertical ? Style.bar.sizeVertical : Style.bar.sizeHorizontal
   // Separate the floating islands from the top edge, matching the old Waybar
@@ -350,14 +392,19 @@ Item {
   }
 
   // Apply tray-pinning on top of the shared layout normalization so the
-  // bar host and scriptable config helpers can't drift on entry shape.
+  // bar host and scriptable config helpers can't drift on entry shape. Every
+  // section current Omarchy writes is kept: centerBegin and centerEnd are the
+  // center island's flanks, and tray is drawn inside the tray's drawer.
   function normalizeLayout(layout) {
     var normalized = Util.normalizeLayout(Util.isPlainObject(layout) ? layout : fallbackBarConfig.layout)
-    return {
-      left:   pinTrayToInner(normalized.left,   "left"),
-      center: pinTrayToInner(normalized.center, "center"),
-      right:  pinTrayToInner(normalized.right,  "right")
+    var out = {}
+    for (var i = 0; i < BarModel.sections.length; i++) {
+      var section = BarModel.sections[i]
+      var entries = Array.isArray(normalized[section]) ? normalized[section] : []
+      out[section] = section === "left" || section === "center" || section === "right"
+        ? pinTrayToInner(entries, section) : entries
     }
+    return out
   }
 
   // The tray drawer reveals inward (away from the bar edge). Place it at the
@@ -392,7 +439,16 @@ Item {
   function applySettingsDelta(delta) {
     for (var i = 0; i < delta.length; i++) {
       var change = delta[i]
+      var previous = layoutConfig[change.region][change.index]
       layoutConfig[change.region][change.index] = change.entry
+      // The center island's lists (centerIsland) hold the same entry objects;
+      // swap the new one in there too, so slots built later see it. Edited in
+      // place, so no list is rebuilt.
+      var lists = [root.centerIsland.before.entries, root.centerIsland.anchor, root.centerIsland.after.entries]
+      for (var l = 0; l < lists.length; l++) {
+        var at = lists[l].indexOf(previous)
+        if (at !== -1) lists[l][at] = change.entry
+      }
       var settings = entrySettings(change.entry)
       for (var s = 0; s < moduleSlots.length; s++) {
         var slot = moduleSlots[s]
@@ -411,23 +467,34 @@ Item {
     return Array.isArray(entries) ? entries : []
   }
 
+  // The center island's anchor group and hover-revealed flanks
+  // (BarModel.centerIsland), rebuilt only when the layout itself changes.
+  readonly property var centerIsland: {
+    var serial = barConfigSerial
+    return BarModel.centerIsland(layoutConfig, centerAnchor)
+  }
+
   // Tab order for the panels in one bar region. Scoped to a single bar surface
   // so tabbing walks the bar the open panel belongs to instead of hopping the
   // panel to another monitor's copy of the same widget.
+  // The center island's sections count as one, in the order they read.
   function panelNavigationSlots(region, window) {
-    var entries = layoutEntries(region)
+    var regions = BarModel.navigationRegions(region)
     var slots = []
-    for (var i = 0; i < entries.length; i++) {
-      var id = entryId(entries[i])
-      for (var j = 0; j < moduleSlots.length; j++) {
-        var slot = moduleSlots[j]
-        if (!slot || slot.region !== region || slot.moduleName !== id) continue
-        if (window && !sameWindow(slotWindow(slot), window)) continue
-        var item = slot.activeItem
-        if (!item || item.visible !== true || slot.visible !== true || slot.width <= 0 || slot.height <= 0) continue
-        if (typeof item.open !== "function" || typeof item.close !== "function" || item.opened === undefined) continue
-        slots.push(slot)
-        break
+    for (var r = 0; r < regions.length; r++) {
+      var entries = layoutEntries(regions[r])
+      for (var i = 0; i < entries.length; i++) {
+        var id = entryId(entries[i])
+        for (var j = 0; j < moduleSlots.length; j++) {
+          var slot = moduleSlots[j]
+          if (!slot || slot.region !== regions[r] || slot.moduleName !== id) continue
+          if (window && !sameWindow(slotWindow(slot), window)) continue
+          var item = slot.activeItem
+          if (!item || item.visible !== true || slot.visible !== true || slot.width <= 0 || slot.height <= 0) continue
+          if (typeof item.open !== "function" || typeof item.close !== "function" || item.opened === undefined) continue
+          slots.push(slot)
+          break
+        }
       }
     }
     return slots
@@ -525,8 +592,9 @@ Item {
       if (typeof item.open !== "function" || typeof item.close !== "function" || item.opened === undefined) continue
       candidates.push({ slot: slot, screenName: slotScreenName(slot), opened: item.opened === true })
     }
-    // One copy per monitor, plus a zero-size placeholder for anchored center
-    // modules. See BarModel.pickPanelSlot for which one a hotkey acts on.
+    // One copy per monitor; a center flank's copy is zero-size while the
+    // island is collapsed. See BarModel.pickPanelSlot for which one a hotkey
+    // acts on.
     var chosen = BarModel.pickPanelSlot(candidates, focusedScreenName())
     return chosen ? chosen.activeItem : null
   }
@@ -560,18 +628,6 @@ Item {
 
   function moduleString(entry, key, fallback) {
     return BarModel.moduleString(entry, key, fallback)
-  }
-
-  function entryIndex(entries, name) {
-    return BarModel.entryIndex(entries, name)
-  }
-
-  function entriesBefore(entries, name) {
-    return BarModel.entriesBefore(entries, name)
-  }
-
-  function entriesAfter(entries, name) {
-    return BarModel.entriesAfter(entries, name)
   }
 
   function canonicalWidgetId(name) {
@@ -693,6 +749,7 @@ Item {
 
   function dropBarModule(source, toRegion, beforeName) {
     if (!source || !source.region || !source.moduleName || !toRegion) return false
+    if (toRegion === "tray" && source.hostsTraySection) return false
     if (source.region === toRegion && source.moduleName === beforeName) return false
     if (!root.shell || typeof root.shell.mutateShellConfig !== "function") return false
 
@@ -716,6 +773,10 @@ Item {
     for (var i = 0; i < moduleSlots.length; i++) {
       var slot = moduleSlots[i]
       if (!slot || slot === sourceSlot || !slot.visible || slot.width <= 0 || slot.height <= 0) continue
+      // The tray section sits inside the tray's drawer, which stays laid out
+      // (and so hit-testable) while it is folded shut. A drop there would be
+      // out of sight, and the tray itself would vanish into its own drawer.
+      if (slot.region === "tray") continue
       if (sourceWindow && !root.sameWindow(root.slotWindow(slot), sourceWindow)) continue
 
       var slotPoint = { x: slot.x, y: slot.y }
@@ -787,21 +848,28 @@ Item {
       var target = clickTargets[i]
       if (!moduleTargetClickable(target)) continue
 
-      var targetPoint = { x: localX, y: localY }
+      // Honors clipping: a folded tray drawer keeps its widgets laid out
+      // under the icons beside it.
       try {
-        targetPoint = slot.mapToItem(target, localX, localY)
+        if (itemContainsPoint(target, slot, localX, localY)) return target
       } catch (e) {
         continue
-      }
-
-      if (targetPoint.x >= 0 && targetPoint.x <= target.width &&
-          targetPoint.y >= 0 && targetPoint.y <= target.height) {
-        return target
       }
     }
 
     if (moduleTargetClickable(slot.activeItem)) return slot.activeItem
     return null
+  }
+
+  // Manual hit tests must honor the clipping Qt's own hit test does. Omarchy
+  // 4.5 has this as Util.itemContainsPoint; 4.0.6 does not.
+  function itemContainsPoint(target, source, x, y) {
+    if (!target || !target.contains(target.mapFromItem(source, x, y))) return false
+    for (var item = target; item; item = item.parent) {
+      if (!item.visible || item.opacity === 0 || !item.enabled) return false
+      if (item.clip && !item.contains(item.mapFromItem(source, x, y))) return false
+    }
+    return true
   }
 
   function pressModuleClickTarget(slot, button, localX, localY) {
@@ -971,6 +1039,33 @@ Item {
     onFileChanged: barHiddenProbe.running = true
   }
 
+  // The directory watch can permanently stop delivering events after flag
+  // changes land in quick succession, stranding the bar off screen until the
+  // shell restarts. `omarchy-toggle-bar` nudges the active bar through this
+  // target after flipping the flag, so the probe re-reads it even when the
+  // watch has gone quiet.
+  // A plain IpcHandler rather than Omarchy 4.5's ShellIpc, which 4.0.6 does
+  // not have; omarchy-shell falls back to qs ipc for it.
+  IpcHandler {
+    target: "omarchy.bar"
+
+    // Start rather than restart: a probe already in flight was launched by the
+    // directory watch after the flag flipped, so its answer is current, and
+    // killing it here can swallow the result entirely.
+    function syncHidden(): void {
+      barHiddenProbe.running = true
+    }
+  }
+
+  // Hyprland's window list does not follow fullscreen on its own, and each
+  // BarPanel reads it to drop its input under a fullscreen window.
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) {
+      if (event && String(event.name) === "fullscreen") Hyprland.refreshToplevels()
+    }
+  }
+
   Variants {
     model: root.hostReady ? Quickshell.screens : []
 
@@ -1019,6 +1114,28 @@ Item {
     // keeps the surface alive, so showing is only a margin change.
     visible: !remapGuard.remapping
     exclusionMode: root.barHidden ? ExclusionMode.Ignore : ExclusionMode.Auto
+
+    // While this window's widget or bar-move drag is live, keep its input.
+    readonly property bool dragActive: (root.barDragSource !== null && root.sameWindow(root.barDragWindow, barWindow)) ||
+      (root.barMoveActive && root.sameWindow(root.barMoveWindow, barWindow))
+
+    // Whether the active workspace on this screen holds a real fullscreen
+    // window.
+    readonly property bool underFullscreen: {
+      var monitor = Hyprland.monitorFor(screen)
+      var workspace = monitor ? monitor.activeWorkspace : null
+      return !!workspace && BarModel.fullscreenOn(Hyprland.toplevels.values, workspace.id)
+    }
+
+    // Under a fullscreen window the bar takes no input. Hyprland 0.56 lifts
+    // every layer on the monitor back above fullscreen whenever a window on
+    // any other workspace leaves fullscreen, or the layer remaps, and the bar
+    // would then take the clicks meant for the top of the fullscreen window.
+    mask: underFullscreen && !dragActive ? noInputRegion : null
+
+    Region {
+      id: noInputRegion
+    }
 
     ScaleSafeRemap {
       id: remapGuard
@@ -1232,6 +1349,18 @@ Item {
 
   Component { id: emptyModuleComponent; Item { implicitWidth: 0; implicitHeight: 0; visible: false } }
 
+  // The tray section's widgets, drawn inside the tray's drawer by the slot
+  // that holds the tray (ModuleSlot.hostsTraySection). Declared out here: a
+  // module list holds module slots, so one declared inside ModuleSlot would
+  // make the types a cycle.
+  Component {
+    id: traySectionComponent
+    ModuleList {
+      entries: root.layoutEntries("tray")
+      region: "tray"
+    }
+  }
+
   component DragGhostPanel: PanelWindow {
     id: ghostWindow
 
@@ -1353,12 +1482,6 @@ Item {
     }
   }
 
-  function findCenterAnchorEntry() {
-    var entries = root.layoutEntries("center")
-    var idx = root.entryIndex(entries, root.centerAnchor)
-    return idx === -1 ? null : entries[idx]
-  }
-
   component LeftModules: ModuleList {
     entries: root.layoutEntries("left")
     region: "left"
@@ -1369,131 +1492,64 @@ Item {
     region: "right"
   }
 
+  // The center sections on a vertical bar: the anchor group centered, the
+  // flanks (BarModel.centerIsland) above and below it, always shown.
   component CenterModules: Item {
     id: centerRoot
 
-    property var entries: root.layoutEntries("center")
-    readonly property bool hasAnchor: root.entryIndex(entries, root.centerAnchor) !== -1
-    readonly property var anchorEntry: root.findCenterAnchorEntry()
+    readonly property var island: root.centerIsland
 
-    Loader {
-      anchors.fill: parent
-      sourceComponent: root.vertical ? verticalCenterModules : horizontalCenterModules
+    CenterGestureArea { anchors.fill: parent }
+
+    HoverHandler {
+      onHoveredChanged: root.setCenterSectionHovered(hovered)
     }
 
-    Component {
-      id: horizontalCenterModules
-
-      Item {
-        anchors.fill: parent
-
-        CenterGestureArea { anchors.fill: parent }
-
-        HoverHandler {
-          onHoveredChanged: root.setCenterSectionHovered(hovered)
-        }
-
-        ModuleList {
-          layoutVisible: !centerRoot.hasAnchor
-          entries: centerRoot.entries
-          region: "center"
-          anchors.centerIn: parent
-        }
-
-        ModuleList {
-          layoutVisible: centerRoot.hasAnchor
-          entries: root.entriesBefore(centerRoot.entries, root.centerAnchor)
-          region: "center"
-          anchors.right: centerAnchorModule.left
-          anchors.verticalCenter: centerAnchorModule.verticalCenter
-        }
-
-        ModuleSlot {
-          id: centerAnchorModule
-          visible: centerRoot.hasAnchor
-          entry: centerRoot.anchorEntry
-          region: "center"
-          anchors.centerIn: parent
-        }
-
-        ModuleList {
-          layoutVisible: centerRoot.hasAnchor
-          entries: root.entriesAfter(centerRoot.entries, root.centerAnchor)
-          region: "center"
-          anchors.left: centerAnchorModule.right
-          anchors.verticalCenter: centerAnchorModule.verticalCenter
-        }
-      }
+    ModuleList {
+      id: verticalBefore
+      entries: centerRoot.island.before.entries
+      regions: centerRoot.island.before.regions
+      region: "center"
+      anchors.bottom: verticalAnchor.top
+      anchors.horizontalCenter: verticalAnchor.horizontalCenter
     }
 
-    Component {
-      id: verticalCenterModules
+    ModuleList {
+      id: verticalAnchor
+      entries: centerRoot.island.anchor
+      region: "center"
+      anchors.centerIn: parent
+    }
 
-      Item {
-        anchors.fill: parent
-
-        CenterGestureArea { anchors.fill: parent }
-
-        HoverHandler {
-          onHoveredChanged: root.setCenterSectionHovered(hovered)
-        }
-
-        ModuleList {
-          layoutVisible: !centerRoot.hasAnchor
-          entries: centerRoot.entries
-          region: "center"
-          anchors.centerIn: parent
-        }
-
-        ModuleList {
-          layoutVisible: centerRoot.hasAnchor
-          entries: root.entriesBefore(centerRoot.entries, root.centerAnchor)
-          region: "center"
-          anchors.bottom: centerAnchorModule.top
-          anchors.horizontalCenter: centerAnchorModule.horizontalCenter
-        }
-
-        ModuleSlot {
-          id: centerAnchorModule
-          visible: centerRoot.hasAnchor
-          entry: centerRoot.anchorEntry
-          region: "center"
-          anchors.centerIn: parent
-        }
-
-        ModuleList {
-          layoutVisible: centerRoot.hasAnchor
-          entries: root.entriesAfter(centerRoot.entries, root.centerAnchor)
-          region: "center"
-          anchors.top: centerAnchorModule.bottom
-          anchors.horizontalCenter: centerAnchorModule.horizontalCenter
-        }
-      }
+    ModuleList {
+      entries: centerRoot.island.after.entries
+      regions: centerRoot.island.after.regions
+      region: "center"
+      anchors.top: verticalAnchor.bottom
+      anchors.horizontalCenter: verticalAnchor.horizontalCenter
     }
   }
 
   // A compact variant of CenterModules for the floating island. Unlike the
   // stock full-width center region, this item sizes itself to its widgets. It
-  // still gives the configured centerAnchor equal room on either side, so the
-  // anchor (normally the clock) stays at the physical center of the display.
+  // still gives the anchor group (normally the clock) equal room on either
+  // side, so it stays at the physical center of the display.
   component IslandCenterModules: Item {
     id: islandCenterRoot
 
-    property var entries: root.layoutEntries("center")
-    readonly property bool hasAnchor: root.entryIndex(entries, root.centerAnchor) !== -1
-    readonly property var anchorEntry: root.findCenterAnchorEntry()
-    // At rest the island hugs the center anchor. Once the anchor is hovered,
-    // reveal equal room on both sides so it can grow around the flanking
-    // modules without moving the clock off the physical display center.
-    readonly property bool flanksRevealed: root.centerSectionRevealHeld
+    readonly property var island: root.centerIsland
+    // Every entry the island can show, so it hides only when all are gone.
+    readonly property var entries: island.before.entries.concat(island.anchor, island.after.entries)
+    // At rest the island hugs the anchor group. Once it is hovered, reveal
+    // equal room on both sides so the island can grow around the flanking
+    // modules without moving the anchor off the physical display center.
+    // With no anchor drawn (none configured, or its widget hidden or
+    // missing) there is nothing to hover, so the flanks always show.
+    readonly property bool flanksRevealed: root.centerSectionRevealHeld || centerAnchorModules.width <= 0
     readonly property real flankWidth: flanksRevealed ? Math.max(beforeAnchor.width, afterAnchor.width) : 0
 
-    implicitWidth: hasAnchor
-      ? flankWidth * 2 + centerAnchorModule.width
-      : allCenterModules.width
-    implicitHeight: hasAnchor
-      ? Math.max(beforeAnchor.height, centerAnchorModule.height, afterAnchor.height)
-      : allCenterModules.height
+    implicitWidth: flankWidth * 2 + centerAnchorModules.width
+    implicitHeight: Math.max(beforeAnchor.height, centerAnchorModules.height, afterAnchor.height)
     width: implicitWidth
     height: implicitHeight
 
@@ -1507,27 +1563,21 @@ Item {
     }
 
     ModuleList {
-      id: allCenterModules
-      layoutVisible: !islandCenterRoot.hasAnchor
-      entries: islandCenterRoot.entries
+      id: beforeAnchor
+      layoutVisible: islandCenterRoot.flanksRevealed
+      // Load providers such as Weather before hover so their first icon paint
+      // is immediate, while the hidden Loader keeps the resting island compact.
+      keepLoaded: true
+      entries: islandCenterRoot.island.before.entries
+      regions: islandCenterRoot.island.before.regions
       region: "center"
-      anchors.centerIn: parent
+      anchors.right: centerAnchorModules.left
+      anchors.verticalCenter: parent.verticalCenter
     }
 
     ModuleList {
-      id: beforeAnchor
-      layoutVisible: islandCenterRoot.hasAnchor && islandCenterRoot.flanksRevealed
-      keepLoaded: islandCenterRoot.hasAnchor
-      entries: root.entriesBefore(islandCenterRoot.entries, root.centerAnchor)
-      region: "center"
-      anchors.right: centerAnchorModule.left
-      anchors.verticalCenter: centerAnchorModule.verticalCenter
-    }
-
-    ModuleSlot {
-      id: centerAnchorModule
-      visible: islandCenterRoot.hasAnchor
-      entry: islandCenterRoot.anchorEntry
+      id: centerAnchorModules
+      entries: islandCenterRoot.island.anchor
       region: "center"
       anchors.horizontalCenter: parent.horizontalCenter
       anchors.verticalCenter: parent.verticalCenter
@@ -1535,14 +1585,13 @@ Item {
 
     ModuleList {
       id: afterAnchor
-      layoutVisible: islandCenterRoot.hasAnchor && islandCenterRoot.flanksRevealed
-      // Load providers such as Weather before hover so their first icon paint
-      // is immediate, while the hidden Loader keeps the resting island compact.
-      keepLoaded: islandCenterRoot.hasAnchor
-      entries: root.entriesAfter(islandCenterRoot.entries, root.centerAnchor)
+      layoutVisible: islandCenterRoot.flanksRevealed
+      keepLoaded: true
+      entries: islandCenterRoot.island.after.entries
+      regions: islandCenterRoot.island.after.regions
       region: "center"
-      anchors.left: centerAnchorModule.right
-      anchors.verticalCenter: centerAnchorModule.verticalCenter
+      anchors.left: centerAnchorModules.right
+      anchors.verticalCenter: parent.verticalCenter
     }
   }
 
@@ -1629,15 +1678,17 @@ Item {
     id: moduleListRoot
 
     property var entries: []
+    // Each entry's own section, where a list mixes them (the center island's
+    // flanks); `region` otherwise.
+    property var regions: []
     property string region: ""
     property bool keepLoaded: false
     property bool layoutVisible: true
 
     visible: layoutVisible && entries.length > 0
-    // Most hidden lists must not build their modules: the center section
-    // declares both anchored and unanchored arrangements, so loading both
-    // would mount every module twice. The compact island flanks opt in to
-    // keepLoaded so provider-backed icons are ready when hover reveals them.
+    // Hidden lists do not build their modules unless they opt in: the
+    // compact island flanks set keepLoaded so provider-backed icons are ready
+    // when hover reveals them.
     // Effective visibility also changes when a monitor remaps its bar surface.
     // Keep widget instances and their pending confirmation alive during that.
     active: (layoutVisible || keepLoaded) && entries.length > 0
@@ -1656,8 +1707,9 @@ Item {
 
           ModuleSlot {
             required property var modelData
+            required property int index
             entry: modelData
-            region: moduleListRoot.region
+            region: moduleListRoot.regions[index] || moduleListRoot.region
           }
         }
       }
@@ -1674,8 +1726,9 @@ Item {
 
           ModuleSlot {
             required property var modelData
+            required property int index
             entry: modelData
-            region: moduleListRoot.region
+            region: moduleListRoot.regions[index] || moduleListRoot.region
           }
         }
       }
@@ -1780,6 +1833,22 @@ Item {
       }
     }
 
+    // The tray widget offers an area in its drawer for the tray section
+    // (`sectionHost`); fill it with that section's widgets.
+    readonly property bool hostsTraySection: region !== "tray" && !!activeItem && "sectionHost" in activeItem
+
+    function traySectionContains(x, y) {
+      var area = hostsTraySection ? activeItem.sectionHost : null
+      return !!area && area.width > 0 && area.height > 0 && root.itemContainsPoint(area, slot, x, y)
+    }
+    Loader {
+      id: traySectionLoader
+      readonly property Item host: slot.hostsTraySection ? slot.activeItem.sectionHost : null
+      parent: host || slot
+      active: !!host
+      sourceComponent: traySectionComponent
+    }
+
     Rectangle {
       id: openPanelIndicator
 
@@ -1828,6 +1897,12 @@ Item {
       // make neighboring modules overlap after a small aborted drag.
 
       onPressed: function(mouse) {
+        // A press on a widget in the tray's drawer belongs to that widget's
+        // own slot, underneath this one, so it drags that widget, not the tray.
+        if (slot.traySectionContains(mouse.x, mouse.y)) {
+          mouse.accepted = false
+          return
+        }
         dragging = false
         suppressClick = false
         pressedX = mouse.x
