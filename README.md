@@ -57,6 +57,10 @@ from separate widget plugins rather than from Dicey Bar itself.
 - **Drop-in and reversible.** You can switch back to the stock bar with one
   command. There is no build step, daemon, privileged helper or second
   Quickshell process.
+- **Displays panel.** An optional `dicey.displays` widget arranges monitors
+  by drag and drop, sets each one's resolution, refresh rate, scale, adaptive
+  sync, HDR and brightness, and remembers it all per monitor when you press
+  Apply. See [Displays panel](#displays-panel).
 - **Plain-text rendering.** Window titles, tray tooltips and command output are
   always drawn as plain text, never as rich text or markup.
 
@@ -112,6 +116,42 @@ are revealed on hover.
 See [Design and behavior](docs/dicey-bar.md) for what Dicey Bar changes
 compared with the stock bar.
 
+## Displays panel
+
+Dicey Bar ships an optional monitor manager. Add it to any bar section by
+editing `~/.config/omarchy/shell.json` (`omarchy bar put` only accepts
+installed widget plugins, and this widget belongs to the bar itself):
+
+```json
+"right": [{ "id": "dicey.displays" }, { "id": "omarchy.audio" }]
+```
+
+- Drag displays on the canvas; they snap edge to edge and gaps close.
+- Pick resolution and refresh rate separately, plus scale, adaptive sync and
+  HDR (for displays that report HDR support).
+- **Apply** applies the change and remembers it. Each monitor keeps its own
+  settings, and each combination of connected monitors keeps its own
+  layout, so plugging a monitor back in restores what you used last time
+  with it. A monitor in a new combination is placed beside the display it
+  was last next to.
+- Changing a mode or turning a display on or off asks you to keep the change
+  and reverts on its own after 10 seconds.
+- Brightness, text size and night light apply straight away.
+- **Turn off when switched away** (external monitors) reads the monitor's
+  input over DDC/CI every 5 seconds. When the monitor shows another input or
+  stops answering, it is turned off and the layout is rearranged without it;
+  it comes back when the monitor returns to this computer's input. This
+  needs `ddcutil` and a monitor with DDC/CI enabled.
+- Closing the laptop lid is left to Omarchy's own clamshell handling.
+
+Settings are stored in `~/.local/state/dicey-bar/displays.json`. The panel
+writes its rules into a marked block in `~/.config/hypr/monitors.lua` so they
+also apply at login, keeping a one-time backup at
+`monitors.lua.dicey-bar-backup`. Use one monitor manager at a time: remove
+other plugins that write `monitors.lua` (such as `im0001gt.screens`) before
+using this panel. The panel takes over their block and keeps its other
+settings.
+
 ## Requirements and updates
 
 Tested on **Omarchy 4.0.6 and 4.5.0 / Quattro, Qt 6.12 and Quickshell 0.3.2**. Use an
@@ -119,6 +159,7 @@ Omarchy installation with its matching shell imports, Bash, Git and
 `jq`. Configured widgets use Omarchy's normal helper commands; keyboard-layout
 descriptions additionally use `xkbcli` (`libxkbcommon`), recording status uses
 `pgrep` (`procps-ng`), and optional dictation uses Omarchy's Voxtype integration.
+The Displays panel uses `python3` and, for input switching, `ddcutil`.
 Only enable helpers you have installed. User-configured custom modules execute
 their configured shell commands with your permissions. No installer/build,
 privileged helper, external service, download or remote build is required.
