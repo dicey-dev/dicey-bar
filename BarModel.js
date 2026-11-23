@@ -47,6 +47,41 @@ function pinTrayToInner(entries, section) {
   return result
 }
 
+// Dicey Bar's built-in Displays panel takes over `omarchy.monitor` so the bar
+// shows one unified display icon. If a config also lists the legacy
+// `dicey.displays` id alongside `omarchy.monitor`, drop the duplicate so both
+// icons never appear side by side.
+function mergeDisplayEntries(layout) {
+  if (!isPlainObject(layout)) return layout
+  var hasStock = false
+  var hasDicey = false
+  for (var i = 0; i < sections.length; i++) {
+    var list = layout[sections[i]]
+    if (!Array.isArray(list)) continue
+    for (var j = 0; j < list.length; j++) {
+      var id = entryId(list[j])
+      if (id === "omarchy.monitor") hasStock = true
+      else if (id === "dicey.displays") hasDicey = true
+    }
+  }
+  if (!hasStock || !hasDicey) return layout
+  var out = {}
+  for (var s = 0; s < sections.length; s++) {
+    var sec = sections[s]
+    var entries = layout[sec]
+    if (!Array.isArray(entries)) {
+      out[sec] = entries
+      continue
+    }
+    var kept = []
+    for (var k = 0; k < entries.length; k++) {
+      if (entryId(entries[k]) !== "dicey.displays") kept.push(entries[k])
+    }
+    out[sec] = kept
+  }
+  return out
+}
+
 function moduleString(entry, key, fallback) {
   var settings = entrySettings(entry)
   var value = settings[key]
@@ -267,6 +302,7 @@ if (typeof module !== "undefined") {
     entrySettings: entrySettings,
     entryId: entryId,
     pinTrayToInner: pinTrayToInner,
+    mergeDisplayEntries: mergeDisplayEntries,
     moduleString: moduleString,
     entryIndex: entryIndex,
     sections: sections,

@@ -407,8 +407,12 @@ Item {
         implicitHeight: confirmColumn.implicitHeight + Style.space(40)
         radius: Style.cornerRadius
         color: Commons.Color.popups.background
-        border.color: Commons.Color.popups.border
-        border.width: Math.max(1, Style.space(2))
+        border.color: Commons.Color.accent
+        border.width: Math.max(2, Style.space(2))
+
+        readonly property real _accentLuma: 0.2126 * Commons.Color.accent.r
+          + 0.7152 * Commons.Color.accent.g + 0.0722 * Commons.Color.accent.b
+        readonly property color _accentInk: _accentLuma > 0.45 ? Commons.Color.background : Commons.Color.foreground
 
         Column {
           id: confirmColumn
@@ -429,9 +433,10 @@ Item {
             anchors.horizontalCenter: parent.horizontalCenter
             textFormat: Text.PlainText
             text: "Reverting in " + service.confirmSeconds + "s"
-            color: Qt.darker(Commons.Color.popups.text, 1.4)
+            color: Commons.Color.accent
             font.family: service.overlayFont
             font.pixelSize: Style.font.body
+            font.bold: true
           }
 
           Row {
@@ -446,13 +451,31 @@ Item {
               onClicked: service.revert()
             }
 
-            Button {
-              text: "Keep"
-              bordered: true
-              active: true
-              foreground: Commons.Color.popups.text
-              fontFamily: service.overlayFont
-              onClicked: service.keep()
+            Rectangle {
+              id: keepPill
+              implicitWidth: keepLabel.implicitWidth + Style.space(24)
+              implicitHeight: keepLabel.implicitHeight + Style.space(12)
+              radius: Style.cornerRadius
+              color: keepMouse.containsMouse ? Qt.lighter(Commons.Color.accent, 1.08) : Commons.Color.accent
+
+              Text {
+                id: keepLabel
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: "Keep"
+                color: confirmCard._accentInk
+                font.family: service.overlayFont
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
+
+              MouseArea {
+                id: keepMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: service.keep()
+              }
             }
           }
         }

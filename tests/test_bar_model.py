@@ -92,6 +92,28 @@ TestCase {
         compare(BarModel.fullscreenOn(toplevels, 3), false)
         compare(BarModel.fullscreenOn(null, 2), false)
     }
+
+    function test_merge_display_entries_deduplicates_when_both_exist() {
+        var both = BarModel.mergeDisplayEntries({
+            left: [], centerBegin: [], center: [], centerEnd: [],
+            right: [{ id: "omarchy.audio" }, { id: "omarchy.monitor" }, { id: "dicey.displays" }, { id: "omarchy.power" }],
+            tray: []
+        })
+        compare(both.right.map(BarModel.entryId), ["omarchy.audio", "omarchy.monitor", "omarchy.power"])
+
+        var across = BarModel.mergeDisplayEntries({
+            left: [{ id: "dicey.displays" }], centerBegin: [], center: [], centerEnd: [],
+            right: [{ id: "omarchy.monitor" }], tray: []
+        })
+        compare(across.left.map(BarModel.entryId), [])
+        compare(across.right.map(BarModel.entryId), ["omarchy.monitor"])
+
+        var onlyDicey = BarModel.mergeDisplayEntries({
+            left: [], centerBegin: [], center: [], centerEnd: [],
+            right: [{ id: "dicey.displays" }], tray: []
+        })
+        compare(onlyDicey.right.map(BarModel.entryId), ["dicey.displays"])
+    }
 }
 """
 
