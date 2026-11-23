@@ -9,9 +9,10 @@ import "DisplayModel.js" as Model
 
 // Unified Displays bar widget (replaces stock `omarchy.monitor` and answers
 // `dicey.displays`). Per-monitor settings (position, resolution, refresh rate,
-// scale, adaptive sync, HDR, brightness, auto-disable) are scoped to the
-// selected monitor; OS-wide controls (text size and night light) sit in a
-// dedicated All Displays card so their scope is never ambiguous.
+// scale, orientation, adaptive sync, HDR + SDR tuning, brightness, DDC/CI
+// input watch/switching) are scoped to the selected monitor; OS-wide controls
+// (text size and night light) sit in a dedicated All Displays card with a
+// separating bar so their scope is never ambiguous.
 Panel {
   id: root
   moduleName: "omarchy.monitor"
@@ -27,15 +28,32 @@ Panel {
   property int selected: 0
   property bool edited: false
 
+  // Transient confirmation text in the footer (e.g. Forget, Sync all, Re-learn).
+  property string noticeText: ""
+
   // OS-wide text size draft (remembered per monitor combination on Apply;
   // reverted on Discard if previewed live).
   property int openedTextSize: 0
   property int draftTextSize: 0
   property bool textSizeEdited: false
 
+  // OS-wide Night Light draft (controlled via hyprsunset; remembered per
+  // monitor combination on Apply and reverted on Discard).
+  property var openedNightLight: ({ enabled: false, kelvin: 4000 })
+  property var draftNightLight: ({ enabled: false, kelvin: 4000 })
+  property bool nightLightEdited: false
+
+  // Per-monitor DDC/CI input probing state (lazy-loaded on click).
+  property string ddcProbeFor: ""
+  property bool ddcProbing: false
+  property string ddcCurrentInput: ""
+  property var ddcAvailableInputs: []
+  property string ddcProbeError: ""
+
   readonly property bool dirty: {
     if (!draft.length || draft.length !== live.length) return false
     if (textSizeEdited && draftTextSize !== openedTextSize) return true
+    if (nightLightEdited && !Model.sameNightLight(draftNightLight, openedNightLight)) return true
     if (!Model.planMatchesLive(draft, live)) return true
     for (var i = 0; i < draft.length; i++) {
       if (draft[i].ddcWatch !== live[i].ddcWatch) return true
@@ -84,7 +102,41 @@ Panel {
     for (var i = 0; i < draft.length; i++) if (draft[i].enabled && !draft[i].autoOff) n++
     return n
   }
+  readonly property int availableMonitorCount: {
+    var n = 0
+    for (var i = 0; i < draft.length; i++) if (!draft[i].autoOff) n++
+    return n
+  }
+  readonly property bool hasInternalAvailable: {
+    for (var i = 0; i < draft.length; i++) if (!draft[i].autoOff && draft[i].internal) return true
+    return false
+  }
+  readonly property bool hasExternalAvailable: {
+    for (var i = 0; i < draft.length; i++) if (!draft[i].autoOff && !draft[i].internal) return true
+    return false
+  }
+  readonly property var layoutPresetOptions: {
+    if (availableMonitorCount < 2) return []
+    var out = [{ value: "extend", label: "Extend" }]
+    if (hasInternalAvailable && hasExternalAvailable) {
+      out.push({ value: "external", label: "External only" })
+      out.push({ value: "internal", label: "Laptop only" })
+    }
+    out.push({ value: "mirror", label: "Mirror" })
+    return out
+  }
+  readonly property string activePreset: Model.activeLayoutPreset(draft)
   readonly property int shownTextSize: textSizeEdited && draftTextSize >= 9 ? draftTextSize : Style.font.baseSize
+  readonly property bool shownNightLightOn: nightLightEdited
+    ? !!draftNightLight.enabled
+    : !!(service && service.liveNightLight && service.liveNightLight.enabled)
+  readonly property int shownKelvin: {
+    var src = nightLightEdited ? draftNightLight : (service ? service.liveNightLight : null)
+    var k = src ? Math.round(Number(src.kelvin)) : 4000
+    return (isFinite(k) && k >= 1500 && k <= 6400) ? k : 4000
+  }
+  readonly property bool currentHasSavedProfile: !!(service && current && service.hasSavedProfile(current.fp))
+  readonly property string currentLearnedDdcInput: (service && current) ? service.savedDdcInput(current.fp) : ""
 
   // Theme-derived palette — strictly Commons.Color tokens so theme swaps apply live.
   readonly property color fg: bar ? bar.foreground : Commons.Color.foreground
@@ -105,6 +157,45 @@ Panel {
   readonly property color accentInk: accentLuma > 0.45 ? Commons.Color.background : Commons.Color.foreground
   readonly property string fontName: bar ? bar.fontFamily : Style.font.family
 
+  Timer {
+    id: noticeTimer
+    interval: 4000
+    onTriggered: root.noticeText = ""
+  }
+
+  function showNotice(msg) {
+    noticeText = String(msg || "")
+    if (noticeText) noticeTimer.restart()
+    else noticeTimer.stop()
+  }
+
+  function ddcInputLabel(code) {
+    var c = String(code || "").toLowerCase()
+    var map = {
+      "0x01": "VGA-1", "0x02": "VGA-2", "0x03": "DVI-1", "0x04": "DVI-2",
+      "0x0f": "DP-1", "0x10": "DP-2", "0x11": "HDMI-1", "0x12": "HDMI-2",
+      "0x19": "USB-C-1", "0x1b": "USB-C"
+    }
+    return map[c] ? (map[c] + " (" + c + ")") : c
+  }
+
+  function transformDegrees(t) {
+    var n = Number(t) || 0
+    if (n === 1) return "90°"
+    if (n === 2) return "180°"
+    if (n === 3) return "270°"
+    return "0°"
+  }
+
+  function mirrorsOf(name) {
+    var out = []
+    for (var i = 0; i < draft.length; i++) {
+      var o = draft[i]
+      if (o && o.enabled && !o.autoOff && o.mirrorOf === name) out.push(o.name)
+    }
+    return out
+  }
+
   function shortModelName(index) {
     var m = index >= 0 && index < liveMonitors.length ? liveMonitors[index] : null
     if (!m) return draft[index] ? draft[index].name : ""
@@ -120,13 +211,28 @@ Panel {
     if (selected >= draft.length) selected = 0
   }
 
+  function syncNightLightFromService() {
+    if (nightLightEdited) return
+    var nl = service && service.liveNightLight ? service.liveNightLight : { enabled: false, kelvin: 4000 }
+    var k = Math.round(Number(nl.kelvin))
+    if (!isFinite(k) || k < 1500 || k > 6400) k = 4000
+    openedNightLight = { enabled: !!nl.enabled, kelvin: k }
+    draftNightLight = { enabled: !!nl.enabled, kelvin: k }
+  }
+
   function discardDraft() {
     if (textSizeEdited && openedTextSize >= 9 && openedTextSize <= 20) {
       applyTextSizeLive(openedTextSize)
     }
+    if (nightLightEdited && service) {
+      service.setNightLight(openedNightLight.enabled, openedNightLight.kelvin, null)
+    }
     textSizeEdited = false
     draftTextSize = openedTextSize
+    nightLightEdited = false
+    draftNightLight = { enabled: openedNightLight.enabled, kelvin: openedNightLight.kelvin }
     resetDraft()
+    showNotice("Discarded unsaved changes")
   }
 
   function copyOutput(o) {
@@ -141,6 +247,12 @@ Panel {
     var next = draft.map(copyOutput)
     for (var k in changes) next[index][k] = changes[k]
     draft = rearrange ? Model.solve(next) : next
+    edited = true
+  }
+
+  function applyPreset(preset) {
+    if (!draft.length) return
+    draft = Model.applyLayoutPreset(draft, preset)
     edited = true
   }
 
@@ -179,18 +291,113 @@ Panel {
     applyTextSizeLive(clean)
   }
 
+  function setNightLightDraft(enabled, kelvin, immediate) {
+    var k = Math.max(1500, Math.min(6400, Math.round(Number(kelvin) || shownKelvin || 4000)))
+    draftNightLight = { enabled: !!enabled, kelvin: k }
+    nightLightEdited = true
+    if (immediate) {
+      kelvinDebounce.stop()
+      if (service) service.setNightLight(draftNightLight.enabled, draftNightLight.kelvin, null)
+    } else {
+      kelvinDebounce.restart()
+    }
+  }
+
+  function syncBrightnessToAll() {
+    if (!brightnessAvailable || !service || enabledCount < 2) return
+    var pct = Math.max(1, Math.min(100, Math.round(brightness)))
+    var next = draft.map(copyOutput)
+    for (var i = 0; i < next.length; i++) {
+      if (next[i].enabled && !next[i].autoOff) next[i].brightness = pct
+    }
+    draft = next
+    edited = true
+    service.setAllBrightness(pct, draft)
+    showNotice("Synced brightness to " + pct + "% across all displays")
+  }
+
+  function forgetSelectedMonitor() {
+    if (!service || !current) return
+    var name = current.name
+    var fp = current.fp
+    service.forgetMonitor(fp, function(ok) {
+      if (ok) showNotice("Forgot saved profile for " + name)
+    })
+  }
+
+  function relearnSelectedDdc() {
+    if (!service || !current) return
+    var name = current.name
+    var fp = current.fp
+    showNotice("Reading DDC/CI input for " + name + "…")
+    service.relearnDdcInput(name, fp, function(ok, data) {
+      if (ok && data && data.ddcInput) {
+        showNotice("Learned input " + root.ddcInputLabel(data.ddcInput) + " for " + name)
+      } else {
+        showNotice((data && data.error) ? data.error : ("Could not read input for " + name))
+      }
+    })
+  }
+
+  function probeSelectedInputs() {
+    if (!service || !current || ddcProbing) return
+    var name = current.name
+    ddcProbeFor = name
+    ddcProbing = true
+    ddcProbeError = ""
+    ddcAvailableInputs = []
+    ddcCurrentInput = ""
+    service.probeDdcInputs(name, function(ok, data) {
+      if (root.ddcProbeFor !== name) return
+      root.ddcProbing = false
+      if (ok && data) {
+        root.ddcCurrentInput = String(data.current || "")
+        root.ddcAvailableInputs = Array.isArray(data.inputs) ? data.inputs : []
+        root.ddcProbeError = ""
+      } else {
+        root.ddcProbeError = (data && data.error) ? data.error : "No DDC/CI inputs reported"
+      }
+    })
+  }
+
+  function switchSelectedInput(code, label) {
+    if (!service || !current) return
+    var name = current.name
+    showNotice("Switching " + name + " to " + label + "…")
+    service.setDdcInput(name, code, function(ok, data) {
+      if (ok) {
+        root.ddcCurrentInput = code
+        showNotice("Switched " + name + " to " + label)
+      } else {
+        showNotice((data && data.error) ? data.error : ("Failed to switch " + name))
+      }
+    })
+  }
+
   function canTurnOff(index) {
     var o = draft[index]
-    return !!o && (!o.enabled || enabledCount > 1)
+    if (!o) return false
+    if (!o.enabled) return true
+    var activeNonMirror = 0
+    for (var i = 0; i < draft.length; i++) {
+      if (i !== index && draft[i].enabled && !draft[i].autoOff && !draft[i].mirrorOf) activeNonMirror++
+    }
+    return activeNonMirror > 0
   }
 
   function apply() {
     if (!service || !dirty || service.confirming) return
     var plan = Model.solve(draft)
-    var options = textSizeEdited ? { textSize: draftTextSize } : { textSize: Style.font.baseSize }
+    var options = {
+      textSize: textSizeEdited ? draftTextSize : Style.font.baseSize,
+      nightLight: { enabled: shownNightLightOn, kelvin: shownKelvin }
+    }
     edited = false
     textSizeEdited = false
     openedTextSize = options.textSize
+    nightLightEdited = false
+    openedNightLight = { enabled: options.nightLight.enabled, kelvin: options.nightLight.kelvin }
+    noticeText = ""
     service.applyFromPanel(plan, options)
   }
 
@@ -204,7 +411,9 @@ Panel {
   function statusBadgeText(o) {
     if (!o) return ""
     if (o.autoOff) return o.offReason === "lid" ? "Lid closed" : "Switched away"
-    return o.enabled ? "Active" : "Disabled"
+    if (!o.enabled) return "Disabled"
+    if (o.mirrorOf) return "Mirroring"
+    return "Active"
   }
 
   function focusedOutputName() {
@@ -246,7 +455,10 @@ Panel {
 
   Connections {
     target: root.service
-    function onRefreshed() { if (!root.edited) root.resetDraft() }
+    function onRefreshed() {
+      if (!root.edited) root.resetDraft()
+      root.syncNightLightFromService()
+    }
   }
 
   onOpenedChanged: {
@@ -254,12 +466,26 @@ Panel {
     openedTextSize = Style.font.baseSize
     draftTextSize = Style.font.baseSize
     textSizeEdited = false
+    nightLightEdited = false
+    noticeText = ""
+    ddcProbeFor = ""
+    ddcProbing = false
+    ddcAvailableInputs = []
+    ddcCurrentInput = ""
+    ddcProbeError = ""
+    syncNightLightFromService()
     resetDraft()
     if (service) service.refresh()
-    if (nightlight && typeof nightlight.refresh === "function") nightlight.refresh()
     readBrightness()
   }
-  onSelectedChanged: readBrightness()
+  onSelectedChanged: {
+    ddcProbeFor = ""
+    ddcProbing = false
+    ddcAvailableInputs = []
+    ddcCurrentInput = ""
+    ddcProbeError = ""
+    readBrightness()
+  }
 
   // ---------------------------------------------------------------- brightness (per monitor)
   property int brightness: 0
@@ -337,22 +563,18 @@ Panel {
   }
 
   // ---------------------------------------------------------------- night light (OS-wide via hyprsunset)
-  readonly property var nightlight: bar && bar.shell ? bar.shell.firstPartyServiceFor("omarchy.nightlight") : null
-  property int desiredKelvin: 4000
-  readonly property int activeKelvin: {
-    if (nightlight && nightlight.enabled && nightlight.temperature) {
-      var t = Math.round(Number(nightlight.temperature))
-      if (isFinite(t) && t >= 1500 && t <= 6500) return t
-    }
-    return desiredKelvin
-  }
+  readonly property var nightLightPresets: [
+    { kelvin: 3000, label: "3000K" },
+    { kelvin: 4000, label: "4000K" },
+    { kelvin: 5000, label: "5000K" }
+  ]
 
   Timer {
     id: kelvinDebounce
     interval: 120
     onTriggered: {
-      if (root.nightlight && root.nightlight.enabled && typeof root.nightlight.applyTemperature === "function")
-        root.nightlight.applyTemperature(root.desiredKelvin)
+      if (root.service && root.draftNightLight.enabled)
+        root.service.setNightLight(true, root.draftNightLight.kelvin, null)
     }
   }
 
@@ -376,18 +598,55 @@ Panel {
     open: root.opened
     focusTarget: panel.loadedContent
     contentWidth: panel.fittedContentWidth(Style.space(620))
-    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(760))
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(800))
 
     content: PanelKeyCatcher {
       id: keyCatcher
       implicitHeight: column.implicitHeight + footer.implicitHeight + Style.space(14)
       anchors.fill: parent
+
+      function scrollBy(delta) {
+        var flick = scrollArea.contentItem
+        if (!flick) return
+        var maxY = Math.max(0, flick.contentHeight - flick.height)
+        flick.contentY = Math.max(0, Math.min(maxY, flick.contentY + delta))
+      }
+
       onCloseRequested: {
         if (resDropdown.popupOpen) resDropdown.close()
         else if (hzDropdown.popupOpen) hzDropdown.close()
         else root.close()
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
+      onMoveRequested: function(dx, dy) {
+        if (dx !== 0 && root.draft.length > 1) {
+          root.selected = (root.selected + dx + root.draft.length) % root.draft.length
+        } else if (dy !== 0) {
+          scrollBy(dy * Style.space(56))
+        }
+      }
+      onReturnRequested: {
+        if (root.service && root.service.confirming) root.service.keep()
+        else if (root.dirty) root.apply()
+      }
+      onTextKey: function(t, modifiers) {
+        if (t >= "1" && t <= "9") {
+          var idx = parseInt(t, 10) - 1
+          if (idx >= 0 && idx < root.draft.length) root.selected = idx
+          return
+        }
+        var lower = t.toLowerCase()
+        if (lower === "r") {
+          if (root.service) root.service.refresh()
+          root.readBrightness()
+        } else if (lower === "i") {
+          if (root.service) root.service.identify()
+        } else if ((t === "[" || t === "-") && root.brightnessAvailable) {
+          root.setBrightness(root.brightness - 5, true)
+        } else if ((t === "]" || t === "+" || t === "=") && root.brightnessAvailable) {
+          root.setBrightness(root.brightness + 5, true)
+        }
+      }
 
       // ---------- Sticky Footer ----------
       Item {
@@ -430,14 +689,15 @@ Panel {
                 var f = s.fallbacks[0]
                 return f.name + " fell back to " + f.actual + " instead of " + f.wanted
               }
-              if (s.confirming) return "Confirming changes (" + s.confirmSeconds + "s)"
-              if (root.dirty) return "Unsaved changes · press Apply to save"
+              if (s.confirming) return "Confirming changes (" + s.confirmSeconds + "s) · Enter to keep"
+              if (root.noticeText) return root.noticeText
+              if (root.dirty) return "Unsaved changes · Apply or press Enter"
               return "Synced with monitors.lua · auto-applies on reconnect"
             }
             color: {
               var s = root.service
               if (s && (s.lastError || s.fallbacks.length)) return root.alertColor
-              if (root.dirty || (s && s.confirming)) return root.accent
+              if (root.dirty || root.noticeText || (s && s.confirming)) return root.accent
               return root.muted
             }
             font.family: root.fontName
@@ -631,7 +891,16 @@ Panel {
           // ---------- Interactive Layout Canvas ----------
           LayoutCanvas {
             width: parent.width
-            height: Style.space(176)
+            height: Style.space(170)
+          }
+
+          // ---------- Quick Layout Modes (shown with 2+ available monitors) ----------
+          SegmentedBar {
+            width: parent.width
+            visible: root.layoutPresetOptions.length > 0
+            options: root.layoutPresetOptions
+            currentValue: root.activePreset
+            onPicked: function(val) { root.applyPreset(val) }
           }
 
           // ---------- Display Selector Strip ----------
@@ -648,6 +917,7 @@ Panel {
                 required property int index
                 readonly property bool isSelected: root.selected === index
                 readonly property bool isActive: modelData.enabled && !modelData.autoOff
+                readonly property bool isMirrored: isActive && !!modelData.mirrorOf
 
                 implicitWidth: pillRow.implicitWidth + Style.space(16)
                 implicitHeight: Style.space(26)
@@ -689,10 +959,12 @@ Panel {
                   }
 
                   Text {
-                    visible: !tabPill.isActive
+                    visible: !tabPill.isActive || tabPill.isMirrored
                     textFormat: Text.PlainText
-                    text: tabPill.modelData.autoOff ? "AUTO OFF" : "OFF"
-                    color: tabPill.modelData.autoOff ? root.alertColor : root.muted
+                    text: tabPill.modelData.autoOff ? "AUTO OFF" : (!tabPill.isActive ? "OFF" : "MIRROR")
+                    color: tabPill.modelData.autoOff
+                      ? root.alertColor
+                      : (tabPill.isMirrored ? root.accent : root.muted)
                     font.family: root.fontName
                     font.pixelSize: Math.max(8, Style.font.caption - 1)
                     font.bold: true
@@ -767,11 +1039,13 @@ Panel {
                     if (!root.current) return ""
                     var off = root.offText(root.current)
                     if (off) return root.current.name + " · " + off
+                    if (root.current.mirrorOf) return root.current.name + " · Mirroring " + root.current.mirrorOf
                     var mode = root.current.mode
                       ? (root.current.mode.w + "×" + root.current.mode.h + " @ " + Model.formatHz(root.current.mode.hz) + " Hz")
                       : ""
                     var sc = Commons.I18n.formatNumber(root.current.scale) + "×"
-                    return root.current.name + (mode ? " · " + mode : "") + " · " + sc
+                    var rot = root.current.transform ? (" · " + root.transformDegrees(root.current.transform)) : ""
+                    return root.current.name + (mode ? " · " + mode : "") + " · " + sc + rot
                   }
                   color: root.current && root.current.autoOff ? root.alertColor : root.muted
                   font.family: root.fontName
@@ -784,7 +1058,14 @@ Panel {
                 id: bannerControls
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(8)
+                spacing: Style.space(6)
+
+                MiniActionButton {
+                  visible: root.currentHasSavedProfile
+                  text: "Forget"
+                  anchors.verticalCenter: parent.verticalCenter
+                  onClicked: root.forgetSelectedMonitor()
+                }
 
                 Rectangle {
                   id: statusPill
@@ -836,6 +1117,40 @@ Panel {
               color: root.muted
               font.family: root.fontName
               font.pixelSize: Style.font.caption
+            }
+          }
+
+          // ---------- Mirrored Notice ----------
+          CardBox {
+            width: parent.width
+            visible: !!root.current && root.current.enabled && !root.current.autoOff && !!root.current.mirrorOf
+
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(mirrorNoticeText.implicitHeight, unmirrorBtn.implicitHeight)
+
+              Text {
+                id: mirrorNoticeText
+                anchors.left: parent.left
+                anchors.right: unmirrorBtn.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                text: root.current ? ("Mirroring " + root.current.mirrorOf + " · drag layout is paused while mirrored.") : ""
+                color: root.muted
+                font.family: root.fontName
+                font.pixelSize: Style.font.caption
+              }
+
+              MiniActionButton {
+                id: unmirrorBtn
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Unmirror"
+                accented: true
+                onClicked: root.update(root.selected, { mirrorOf: "" }, true)
+              }
             }
           }
 
@@ -964,6 +1279,50 @@ Panel {
                   }
                 }
 
+                // Per-monitor Orientation / Rotation
+                Column {
+                  width: parent.width
+                  spacing: Style.space(5)
+
+                  Item {
+                    width: parent.width
+                    implicitHeight: rotTitle.implicitHeight
+
+                    Text {
+                      id: rotTitle
+                      anchors.left: parent.left
+                      textFormat: Text.PlainText
+                      text: "Orientation"
+                      color: root.fg
+                      font.family: root.fontName
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+
+                    Text {
+                      anchors.right: parent.right
+                      textFormat: Text.PlainText
+                      text: root.current ? root.transformDegrees(root.current.transform) : "0°"
+                      color: root.accent
+                      font.family: root.fontName
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                  }
+
+                  SegmentedBar {
+                    width: parent.width
+                    options: [
+                      { value: 0, label: "0°" },
+                      { value: 1, label: "90°" },
+                      { value: 2, label: "180°" },
+                      { value: 3, label: "270°" }
+                    ]
+                    currentValue: root.current ? (Number(root.current.transform) % 4) : 0
+                    onPicked: function(val) { root.update(root.selected, { transform: val }, true) }
+                  }
+                }
+
                 // Per-monitor Adaptive Sync (VRR)
                 Column {
                   width: parent.width
@@ -1015,14 +1374,14 @@ Panel {
                   font.letterSpacing: 1.0
                 }
 
-                // Per-monitor Brightness
+                // Per-monitor Brightness + Sync All
                 Column {
                   width: parent.width
                   spacing: Style.space(5)
 
                   Item {
                     width: parent.width
-                    implicitHeight: Math.max(brightHead.implicitHeight, brightPct.implicitHeight)
+                    implicitHeight: Math.max(brightHead.implicitHeight, brightRight.implicitHeight)
 
                     Row {
                       id: brightHead
@@ -1050,18 +1409,31 @@ Panel {
                       }
                     }
 
-                    Text {
-                      id: brightPct
+                    Row {
+                      id: brightRight
                       anchors.right: parent.right
                       anchors.verticalCenter: parent.verticalCenter
-                      textFormat: Text.PlainText
-                      text: root.brightnessAvailable
-                        ? Math.round(brightnessSlider.dragging ? brightnessSlider.liveValue : root.brightness) + "%"
-                        : "N/A"
-                      color: root.brightnessAvailable ? root.accent : root.muted
-                      font.family: root.fontName
-                      font.pixelSize: Style.font.caption
-                      font.bold: true
+                      spacing: Style.space(6)
+
+                      TinyChipButton {
+                        visible: root.brightnessAvailable && root.enabledCount > 1
+                        text: "Sync all"
+                        anchors.verticalCenter: parent.verticalCenter
+                        onClicked: root.syncBrightnessToAll()
+                      }
+
+                      Text {
+                        id: brightPct
+                        anchors.verticalCenter: parent.verticalCenter
+                        textFormat: Text.PlainText
+                        text: root.brightnessAvailable
+                          ? Math.round(brightnessSlider.dragging ? brightnessSlider.liveValue : root.brightness) + "%"
+                          : "N/A"
+                        color: root.brightnessAvailable ? root.accent : root.muted
+                        font.family: root.fontName
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
                     }
                   }
 
@@ -1102,54 +1474,152 @@ Panel {
 
                 Rectangle { width: parent.width; height: 1; color: root.hairline }
 
-                // Per-monitor HDR
-                Item {
+                // Per-monitor HDR + Conditional SDR Brightness & Saturation tuning
+                Column {
                   width: parent.width
-                  implicitHeight: Math.max(hdrCol.implicitHeight, hdrSwitch.implicitHeight)
+                  spacing: Style.space(6)
 
-                  Column {
-                    id: hdrCol
-                    anchors.left: parent.left
-                    anchors.right: hdrSwitch.left
-                    anchors.rightMargin: Style.space(8)
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: Style.space(1)
+                  Item {
+                    width: parent.width
+                    implicitHeight: Math.max(hdrCol.implicitHeight, hdrSwitch.implicitHeight)
 
-                    Text {
-                      textFormat: Text.PlainText
-                      text: "HDR"
-                      color: root.fg
-                      font.family: root.fontName
-                      font.pixelSize: Style.font.caption
-                      font.bold: true
+                    Column {
+                      id: hdrCol
+                      anchors.left: parent.left
+                      anchors.right: hdrSwitch.left
+                      anchors.rightMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(1)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: "HDR"
+                        color: root.fg
+                        font.family: root.fontName
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
+
+                      Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        text: root.currentMonitor && root.currentMonitor.hdrCapable
+                          ? (root.current && root.current.hdr ? "10-bit PQ enabled" : "HDR capable · 10-bit PQ")
+                          : "Not reported by display"
+                        color: root.current && root.current.hdr ? root.accent : root.muted
+                        font.family: root.fontName
+                        font.pixelSize: Math.max(9, Style.font.caption - 1)
+                        elide: Text.ElideRight
+                      }
                     }
 
-                    Text {
-                      width: parent.width
-                      textFormat: Text.PlainText
-                      text: root.currentMonitor && root.currentMonitor.hdrCapable
-                        ? (root.current && root.current.hdr ? "10-bit PQ enabled" : "HDR capable · 10-bit PQ")
-                        : "Not reported by display"
-                      color: root.current && root.current.hdr ? root.accent : root.muted
-                      font.family: root.fontName
-                      font.pixelSize: Math.max(9, Style.font.caption - 1)
-                      elide: Text.ElideRight
+                    AccentSwitch {
+                      id: hdrSwitch
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      checked: !!root.current && root.current.hdr
+                      interactive: !!root.currentMonitor && root.currentMonitor.hdrCapable === true
+                      onToggled: root.update(root.selected, { hdr: !root.current.hdr }, false)
                     }
                   }
 
-                  AccentSwitch {
-                    id: hdrSwitch
-                    anchors.right: parent.right
-                    anchors.verticalCenter: parent.verticalCenter
-                    checked: !!root.current && root.current.hdr
-                    interactive: !!root.currentMonitor && root.currentMonitor.hdrCapable === true
-                    onToggled: root.update(root.selected, { hdr: !root.current.hdr }, false)
+                  // Conditional SDR-in-HDR controls (zero clutter when HDR is off)
+                  Column {
+                    width: parent.width
+                    visible: !!root.current && root.current.hdr
+                    spacing: Style.space(5)
+
+                    Item {
+                      width: parent.width
+                      implicitHeight: sdrBTitle.implicitHeight
+
+                      Text {
+                        id: sdrBTitle
+                        anchors.left: parent.left
+                        textFormat: Text.PlainText
+                        text: "SDR brightness"
+                        color: root.muted
+                        font.family: root.fontName
+                        font.pixelSize: Math.max(9, Style.font.caption - 1)
+                        font.bold: true
+                      }
+
+                      Text {
+                        anchors.right: parent.right
+                        textFormat: Text.PlainText
+                        text: (sdrBSlider.dragging ? (Math.round(sdrBSlider.liveValue * 20) / 20) : (root.current ? root.current.sdrBrightness : 1)).toFixed(2) + "×"
+                        color: root.accent
+                        font.family: root.fontName
+                        font.pixelSize: Math.max(9, Style.font.caption - 1)
+                        font.bold: true
+                      }
+                    }
+
+                    PanelSlider {
+                      id: sdrBSlider
+                      bar: root.bar
+                      width: parent.width
+                      minimum: 0.5
+                      maximum: 2.0
+                      step: 0.05
+                      integer: false
+                      value: root.current ? root.current.sdrBrightness : 1.0
+                      trackColor: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.14)
+                      fillColor: root.accent
+                      knobColor: root.accent
+                      onReleased: function(v) {
+                        root.update(root.selected, { sdrBrightness: Model.cleanSdrBrightness(Math.round(v * 20) / 20) }, false)
+                      }
+                    }
+
+                    Item {
+                      width: parent.width
+                      implicitHeight: sdrSTitle.implicitHeight
+
+                      Text {
+                        id: sdrSTitle
+                        anchors.left: parent.left
+                        textFormat: Text.PlainText
+                        text: "SDR saturation"
+                        color: root.muted
+                        font.family: root.fontName
+                        font.pixelSize: Math.max(9, Style.font.caption - 1)
+                        font.bold: true
+                      }
+
+                      Text {
+                        anchors.right: parent.right
+                        textFormat: Text.PlainText
+                        text: (sdrSSlider.dragging ? (Math.round(sdrSSlider.liveValue * 20) / 20) : (root.current ? root.current.sdrSaturation : 1)).toFixed(2) + "×"
+                        color: root.accent
+                        font.family: root.fontName
+                        font.pixelSize: Math.max(9, Style.font.caption - 1)
+                        font.bold: true
+                      }
+                    }
+
+                    PanelSlider {
+                      id: sdrSSlider
+                      bar: root.bar
+                      width: parent.width
+                      minimum: 0.5
+                      maximum: 1.5
+                      step: 0.05
+                      integer: false
+                      value: root.current ? root.current.sdrSaturation : 1.0
+                      trackColor: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.14)
+                      fillColor: root.accent
+                      knobColor: root.accent
+                      onReleased: function(v) {
+                        root.update(root.selected, { sdrSaturation: Model.cleanSdrSaturation(Math.round(v * 20) / 20) }, false)
+                      }
+                    }
                   }
                 }
 
                 Rectangle { width: parent.width; height: 1; color: root.hairline }
 
-                // Per-monitor Auto-Disable
+                // Per-monitor Auto-Disable & DDC/CI Input Switcher
                 Column {
                   width: parent.width
                   spacing: Style.space(6)
@@ -1157,7 +1627,7 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: "AUTO-DISABLE"
+                    text: "AUTO-DISABLE & INPUT"
                     color: root.muted
                     font.family: root.fontName
                     font.pixelSize: Math.max(9, Style.font.caption - 1)
@@ -1165,50 +1635,103 @@ Panel {
                     font.letterSpacing: 1.0
                   }
 
-                  // External display: DDC/CI input & power-off switch
-                  Item {
+                  // External display: DDC/CI input watch + Re-learn + Input switcher
+                  Column {
                     width: parent.width
                     visible: !!root.current && !root.current.internal
-                    implicitHeight: Math.max(ddcCol.implicitHeight, ddcSwitch.implicitHeight)
+                    spacing: Style.space(6)
 
-                    Column {
-                      id: ddcCol
-                      anchors.left: parent.left
-                      anchors.right: ddcSwitch.left
-                      anchors.rightMargin: Style.space(8)
-                      anchors.verticalCenter: parent.verticalCenter
-                      spacing: Style.space(2)
+                    Item {
+                      width: parent.width
+                      implicitHeight: Math.max(ddcCol.implicitHeight, ddcSwitch.implicitHeight)
 
-                      Text {
-                        width: parent.width
-                        textFormat: Text.PlainText
-                        text: "Switch away / power off"
-                        color: root.fg
-                        font.family: root.fontName
-                        font.pixelSize: Style.font.caption
-                        font.bold: true
-                        elide: Text.ElideRight
+                      Column {
+                        id: ddcCol
+                        anchors.left: parent.left
+                        anchors.right: ddcSwitch.left
+                        anchors.rightMargin: Style.space(8)
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: Style.space(2)
+
+                        Text {
+                          width: parent.width
+                          textFormat: Text.PlainText
+                          text: "Switch away / power off"
+                          color: root.fg
+                          font.family: root.fontName
+                          font.pixelSize: Style.font.caption
+                          font.bold: true
+                          elide: Text.ElideRight
+                        }
+
+                        Text {
+                          width: parent.width
+                          textFormat: Text.PlainText
+                          wrapMode: Text.Wrap
+                          text: {
+                            if (!root.current || !root.current.ddcWatch)
+                              return "Auto-disable when monitor switches HDMI/DP input"
+                            return root.currentLearnedDdcInput
+                              ? ("Watching " + root.ddcInputLabel(root.currentLearnedDdcInput))
+                              : "Will learn active DDC/CI input on Apply"
+                          }
+                          color: root.current && root.current.ddcWatch ? root.accent : root.muted
+                          font.family: root.fontName
+                          font.pixelSize: Math.max(9, Style.font.caption - 1)
+                        }
                       }
 
-                      Text {
-                        width: parent.width
-                        textFormat: Text.PlainText
-                        wrapMode: Text.Wrap
-                        text: root.current && root.current.ddcWatch
-                          ? "Watching input via DDC/CI (VCP 0x60)"
-                          : "Auto-disable when monitor switches HDMI/DP input"
-                        color: root.current && root.current.ddcWatch ? root.accent : root.muted
-                        font.family: root.fontName
-                        font.pixelSize: Math.max(9, Style.font.caption - 1)
+                      AccentSwitch {
+                        id: ddcSwitch
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        checked: !!root.current && root.current.ddcWatch
+                        onToggled: root.update(root.selected, { ddcWatch: !root.current.ddcWatch }, false)
                       }
                     }
 
-                    AccentSwitch {
-                      id: ddcSwitch
-                      anchors.right: parent.right
-                      anchors.verticalCenter: parent.verticalCenter
-                      checked: !!root.current && root.current.ddcWatch
-                      onToggled: root.update(root.selected, { ddcWatch: !root.current.ddcWatch }, false)
+                    Row {
+                      spacing: Style.space(6)
+
+                      TinyChipButton {
+                        visible: !!root.current && root.current.ddcWatch
+                        text: "Re-learn input"
+                        onClicked: root.relearnSelectedDdc()
+                      }
+
+                      TinyChipButton {
+                        text: root.ddcProbing ? "Probing…" : (root.ddcAvailableInputs.length ? "Refresh inputs" : "Switch input")
+                        accented: root.ddcAvailableInputs.length > 0
+                        onClicked: root.probeSelectedInputs()
+                      }
+                    }
+
+                    Flow {
+                      width: parent.width
+                      visible: root.ddcAvailableInputs.length > 0
+                      spacing: Style.space(4)
+
+                      Repeater {
+                        model: root.ddcAvailableInputs
+
+                        TinyChipButton {
+                          required property var modelData
+                          text: String(modelData.label || modelData.code)
+                          accented: root.ddcCurrentInput !== "" && String(modelData.code).toLowerCase() === root.ddcCurrentInput.toLowerCase()
+                          onClicked: root.switchSelectedInput(String(modelData.code), String(modelData.label || modelData.code))
+                        }
+                      }
+                    }
+
+                    Text {
+                      visible: root.ddcProbeError !== ""
+                      width: parent.width
+                      textFormat: Text.PlainText
+                      wrapMode: Text.Wrap
+                      text: root.ddcProbeError
+                      color: root.alertColor
+                      font.family: root.fontName
+                      font.pixelSize: Math.max(9, Style.font.caption - 1)
                     }
                   }
 
@@ -1283,7 +1806,7 @@ Panel {
                 Text {
                   anchors.right: parent.right
                   textFormat: Text.PlainText
-                  text: "OS-wide · use Scale above for per-monitor size"
+                  text: "OS-wide · remembered per setup on Apply"
                   color: root.muted
                   font.family: root.fontName
                   font.pixelSize: Math.max(9, Style.font.caption - 1)
@@ -1293,12 +1816,13 @@ Panel {
               Item {
                 id: globalRow
                 width: parent.width
-                readonly property int gap: Style.space(12)
-                readonly property bool split: column.twoColumn && root.nightlight !== null
+                readonly property int sideGap: Style.space(10)
+                readonly property int gap: sideGap * 2 + 1
+                readonly property bool split: column.twoColumn
                 readonly property real halfW: split ? Math.floor((width - gap) / 2) : width
                 implicitHeight: split
                   ? Math.max(textSizeCol.implicitHeight, nightLightCol.implicitHeight)
-                  : (textSizeCol.implicitHeight + (root.nightlight !== null ? gap + nightLightCol.implicitHeight : 0))
+                  : (textSizeCol.implicitHeight + gap + nightLightCol.implicitHeight)
                 height: implicitHeight
 
                 // Text size (remembered per monitor combination on Apply)
@@ -1346,12 +1870,30 @@ Panel {
                     currentValue: root.shownTextSize
                     onPicked: function(val) { root.pickTextSize(val) }
                   }
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: "Use Scale above for per-monitor size"
+                    color: root.muted
+                    font.family: root.fontName
+                    font.pixelSize: Math.max(9, Style.font.caption - 1)
+                    elide: Text.ElideRight
+                  }
                 }
 
-                // Night Light (hyprsunset)
+                // Separating bar between All Displays options
+                Rectangle {
+                  x: globalRow.split ? (globalRow.halfW + globalRow.sideGap) : 0
+                  y: globalRow.split ? Style.space(2) : (textSizeCol.implicitHeight + globalRow.sideGap)
+                  width: globalRow.split ? 1 : parent.width
+                  height: globalRow.split ? Math.max(0, globalRow.height - Style.space(4)) : 1
+                  color: root.cardBorder
+                }
+
+                // Night Light (real hyprsunset Kelvin control + quick warmth presets)
                 Column {
                   id: nightLightCol
-                  visible: root.nightlight !== null
                   x: globalRow.split ? (globalRow.halfW + globalRow.gap) : 0
                   y: globalRow.split ? 0 : (textSizeCol.implicitHeight + globalRow.gap)
                   width: globalRow.halfW
@@ -1379,13 +1921,13 @@ Panel {
 
                       Text {
                         textFormat: Text.PlainText
-                        text: root.nightlight && root.nightlight.enabled
-                          ? (Math.round(kelvinSlider.dragging ? kelvinSlider.liveValue : root.activeKelvin) + "K")
+                        text: root.shownNightLightOn
+                          ? ((kelvinSlider.dragging ? Math.round(kelvinSlider.liveValue / 100) * 100 : root.shownKelvin) + "K")
                           : "Off"
-                        color: root.nightlight && root.nightlight.enabled ? root.alertColor : root.muted
+                        color: root.shownNightLightOn ? root.alertColor : root.muted
                         font.family: root.fontName
                         font.pixelSize: Style.font.caption
-                        font.bold: !!root.nightlight && root.nightlight.enabled
+                        font.bold: root.shownNightLightOn
                         anchors.verticalCenter: parent.verticalCenter
                       }
                     }
@@ -1395,8 +1937,8 @@ Panel {
                       anchors.right: parent.right
                       anchors.verticalCenter: parent.verticalCenter
                       activeColor: root.alertColor
-                      checked: !!root.nightlight && root.nightlight.enabled
-                      onToggled: if (root.nightlight) root.nightlight.setNightlight(!root.nightlight.enabled)
+                      checked: root.shownNightLightOn
+                      onToggled: root.setNightLightDraft(!root.shownNightLightOn, root.shownKelvin, true)
                     }
                   }
 
@@ -1404,25 +1946,37 @@ Panel {
                     id: kelvinSlider
                     bar: root.bar
                     width: parent.width
-                    enabled: !!root.nightlight && root.nightlight.enabled
+                    enabled: root.shownNightLightOn
                     opacity: enabled ? 1 : 0.38
                     minimum: 1800
                     maximum: 6000
                     step: 100
                     integer: true
-                    value: root.activeKelvin
+                    value: root.shownKelvin
                     trackColor: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.14)
                     fillColor: root.alertColor
                     knobColor: root.alertColor
                     onMoved: function(v) {
-                      root.desiredKelvin = Math.round(v)
-                      kelvinDebounce.restart()
+                      root.setNightLightDraft(true, Math.round(v / 100) * 100, false)
                     }
                     onReleased: function(v) {
-                      kelvinDebounce.stop()
-                      root.desiredKelvin = Math.round(v)
-                      if (root.nightlight && root.nightlight.enabled && typeof root.nightlight.applyTemperature === "function")
-                        root.nightlight.applyTemperature(root.desiredKelvin)
+                      root.setNightLightDraft(true, Math.round(v / 100) * 100, true)
+                    }
+                  }
+
+                  Row {
+                    spacing: Style.space(5)
+
+                    Repeater {
+                      model: root.nightLightPresets
+
+                      TinyChipButton {
+                        required property var modelData
+                        text: modelData.label
+                        accented: root.shownNightLightOn && Math.abs(root.shownKelvin - modelData.kelvin) < 60
+                        useAlertColor: true
+                        onClicked: root.setNightLightDraft(true, modelData.kelvin, true)
+                      }
                     }
                   }
                 }
@@ -1492,6 +2046,46 @@ Panel {
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       onClicked: miniBtn.clicked()
+    }
+  }
+
+  component TinyChipButton: Rectangle {
+    id: chipBtn
+    property string text: ""
+    property bool accented: false
+    property bool useAlertColor: false
+    signal clicked()
+
+    readonly property color hlColor: useAlertColor ? root.alertColor : root.accent
+    readonly property color hlSoft: useAlertColor ? root.alertSoft : root.accentSoft
+    readonly property color hlBorder: useAlertColor ? root.alertBorder : root.accentBorder
+
+    implicitWidth: chipLbl.implicitWidth + Style.space(10)
+    implicitHeight: Math.max(Style.space(20), chipLbl.implicitHeight + Style.space(4))
+    radius: Math.min(Style.cornerRadius, Style.space(5))
+    color: accented ? hlSoft : (chipMouse.containsMouse ? root.trackBg : "transparent")
+    border.color: accented || chipMouse.containsMouse ? hlBorder : root.cardBorder
+    border.width: 1
+
+    Behavior on color { ColorAnimation { duration: Style.duration(110) } }
+
+    Text {
+      id: chipLbl
+      anchors.centerIn: parent
+      textFormat: Text.PlainText
+      text: chipBtn.text
+      color: chipBtn.accented || chipMouse.containsMouse ? chipBtn.hlColor : root.muted
+      font.family: root.fontName
+      font.pixelSize: Math.max(9, Style.font.caption - 1)
+      font.bold: chipBtn.accented
+    }
+
+    MouseArea {
+      id: chipMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: chipBtn.clicked()
     }
   }
 
@@ -1623,7 +2217,7 @@ Panel {
     function viewFor(outputs) {
       var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
       for (var i = 0; i < outputs.length; i++) {
-        if (!outputs[i].enabled || outputs[i].autoOff) continue
+        if (!outputs[i].enabled || outputs[i].autoOff || outputs[i].mirrorOf) continue
         var r = Model.rectOf(outputs[i])
         minX = Math.min(minX, r.x)
         minY = Math.min(minY, r.y)
@@ -1647,7 +2241,8 @@ Panel {
     function others(index) {
       var list = []
       for (var i = 0; i < root.draft.length; i++)
-        if (i !== index && root.draft[i].enabled && !root.draft[i].autoOff) list.push(Model.rectOf(root.draft[i]))
+        if (i !== index && root.draft[i].enabled && !root.draft[i].autoOff && !root.draft[i].mirrorOf)
+          list.push(Model.rectOf(root.draft[i]))
       return list
     }
 
@@ -1688,10 +2283,11 @@ Panel {
         id: tile
         required property var modelData
         required property int index
-        readonly property bool shown: modelData.enabled && !modelData.autoOff
+        readonly property bool shown: modelData.enabled && !modelData.autoOff && !modelData.mirrorOf
         readonly property var rect: canvas.dragIndex === index && canvas.dragRect ? canvas.dragRect : Model.rectOf(modelData)
         readonly property bool chosen: root.selected === index
         readonly property bool draggingThis: canvas.dragIndex === index
+        readonly property var mirroredBy: root.mirrorsOf(modelData.name)
 
         visible: shown
         x: Math.round(canvas.view.ox + (rect.x - canvas.view.minX) * canvas.view.k)
@@ -1753,10 +2349,13 @@ Panel {
           anchors.leftMargin: Style.space(6)
           anchors.rightMargin: Style.space(6)
           textFormat: Text.PlainText
-          text: root.shortModelName(tile.index)
-          color: root.muted
+          text: tile.mirroredBy.length
+            ? ("⇄ Mirrored by " + tile.mirroredBy.join(", "))
+            : root.shortModelName(tile.index)
+          color: tile.mirroredBy.length ? root.accent : root.muted
           font.family: root.fontName
           font.pixelSize: Math.max(9, Style.font.caption - 1)
+          font.bold: tile.mirroredBy.length > 0
           elide: Text.ElideRight
         }
 
@@ -1862,7 +2461,7 @@ Panel {
         anchors.right: canvasCoord.left
         anchors.rightMargin: Style.space(8)
         textFormat: Text.PlainText
-        text: "Drag tiles to arrange · edges snap flush"
+        text: "Drag tiles · 1-9 select · ←/→ switch · Enter apply"
         color: root.muted
         font.family: root.fontName
         font.pixelSize: Math.max(9, Style.font.caption - 1)
@@ -1876,8 +2475,10 @@ Panel {
         text: {
           if (canvas.dragIndex >= 0 && canvas.dragRect && root.draft[canvas.dragIndex])
             return root.draft[canvas.dragIndex].name + " @ " + canvas.dragRect.x + ", " + canvas.dragRect.y
-          if (root.current)
+          if (root.current) {
+            if (root.current.mirrorOf) return root.current.name + " ⇄ " + root.current.mirrorOf
             return root.current.name + " @ " + Math.round(root.current.x) + ", " + Math.round(root.current.y)
+          }
           return ""
         }
         color: root.accent

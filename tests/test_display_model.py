@@ -278,6 +278,99 @@ TestCase {
         compare(byName(undocked, "eDP-1").brightness, 55)
         compare(Model.layoutTextSize(memory, undocked), 14)
     }
+
+    function test_rotation_persists_and_rotates_canvas_geometry() {
+        var plan = Model.derive([laptop(), benq()], {}, {})
+        byName(plan, "HDMI-A-1").transform = 1
+        var solved = Model.solve(plan)
+        var b = byName(solved, "HDMI-A-1")
+        compare(Model.logicalSize(b), { w: 1440, h: 2560 })
+        var live = Model.planFromLive([laptop(), benq()], {})
+        verify(!Model.planMatchesLive(solved, live))
+        verify(Model.needsConfirmation(solved, live))
+
+        var memory = Model.remember({}, solved, "2026-11-23T12:00:00Z")
+        var restored = Model.derive([laptop(), benq()], memory, {})
+        compare(byName(restored, "HDMI-A-1").transform, 1)
+    }
+
+    function test_layout_presets_and_mirror_invariants() {
+        var base = Model.derive([laptop(), benq()], {}, {})
+        compare(Model.activeLayoutPreset(base), "extend")
+
+        var extOnly = Model.applyLayoutPreset(base, "external")
+        compare(byName(extOnly, "eDP-1").enabled, false)
+        compare(byName(extOnly, "HDMI-A-1").enabled, true)
+        compare(Model.activeLayoutPreset(extOnly), "external")
+
+        var lapOnly = Model.applyLayoutPreset(base, "internal")
+        compare(byName(lapOnly, "eDP-1").enabled, true)
+        compare(byName(lapOnly, "HDMI-A-1").enabled, false)
+        compare(Model.activeLayoutPreset(lapOnly), "internal")
+
+        var mirrored = Model.applyLayoutPreset(base, "mirror")
+        compare(byName(mirrored, "eDP-1").mirrorOf, "")
+        compare(byName(mirrored, "HDMI-A-1").mirrorOf, "eDP-1")
+        compare(Model.activeLayoutPreset(mirrored), "mirror")
+
+        // Remember mirror by target fingerprint and restore on reconnect
+        var memory = Model.remember({}, mirrored, "2026-11-23T12:00:00Z")
+        var restored = Model.derive([laptop(), benq()], memory, {})
+        compare(byName(restored, "HDMI-A-1").mirrorOf, "eDP-1")
+        compare(Model.activeLayoutPreset(restored), "mirror")
+
+        // Sanitizer blocks self-mirror and mirror-of-mirror chains
+        var broken = Model.derive([laptop(), benq(), dell()], {}, {})
+        byName(broken, "eDP-1").mirrorOf = "eDP-1"
+        byName(broken, "HDMI-A-1").mirrorOf = "eDP-1"
+        byName(broken, "DP-3").mirrorOf = "HDMI-A-1"
+        var clean = Model.solve(broken)
+        compare(byName(clean, "eDP-1").mirrorOf, "")
+        compare(byName(clean, "HDMI-A-1").mirrorOf, "eDP-1")
+        compare(byName(clean, "DP-3").mirrorOf, "")
+    }
+
+    function test_hdr_sdr_tuning_remembered_and_diffed() {
+        var hdrMonitor = benq()
+        hdrMonitor.hdrCapable = true
+        hdrMonitor.colorManagementPreset = "hdr"
+        hdrMonitor.sdrBrightness = 1.0
+        hdrMonitor.sdrSaturation = 1.0
+        var live = Model.planFromLive([hdrMonitor], {})
+        var plan = Model.derive([hdrMonitor], {}, {})
+        plan[0].hdr = true
+        plan[0].sdrBrightness = 1.35
+        plan[0].sdrSaturation = 1.1
+        verify(!Model.planMatchesLive(plan, live))
+        var memory = Model.remember({}, plan, "2026-11-23T12:00:00Z")
+        var restored = Model.derive([hdrMonitor], memory, {})
+        compare(restored[0].hdr, true)
+        compare(restored[0].sdrBrightness, 1.35)
+        compare(restored[0].sdrSaturation, 1.1)
+    }
+
+    function test_per_setup_night_light_and_forget_monitor() {
+        var docked = Model.derive([laptop(), benq()], {}, {})
+        var memory = Model.remember({}, docked, "t1", {
+            textSize: 12,
+            nightLight: { enabled: true, kelvin: 3200 }
+        })
+        var undocked = Model.derive([laptop()], memory, {})
+        memory = Model.remember(memory, undocked, "t2", {
+            textSize: 14,
+            nightLight: { enabled: false, kelvin: 4000 }
+        })
+
+        compare(Model.layoutNightLight(memory, docked), { enabled: true, kelvin: 3200 })
+        compare(Model.layoutNightLight(memory, undocked), { enabled: false, kelvin: 4000 })
+
+        var benqFp = byName(docked, "HDMI-A-1").fp
+        var afterForget = Model.forgetMonitor(memory, benqFp)
+        compare(afterForget.monitors[benqFp], undefined)
+        compare(Model.layoutNightLight(afterForget, docked), null)
+        // Unrelated laptop-only layout survives forgetting BenQ
+        compare(Model.layoutNightLight(afterForget, undocked), { enabled: false, kelvin: 4000 })
+    }
 }
 """
 

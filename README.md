@@ -124,23 +124,32 @@ multi-monitor manager (and deduplicates `dicey.displays` if both IDs appear in
 `~/.config/omarchy/shell.json`, so only one display icon sits in the bar).
 
 - Drag displays on the canvas; they snap edge to edge and gaps close.
+- Quick multi-monitor presets (**Extend**, **External only**, **Laptop only**,
+  and **Mirror**).
 - Pick resolution and refresh rate separately via side-by-side dropdowns, plus
-  scale, adaptive sync and HDR (for displays that report HDR support).
+  scale, orientation (`0°`–`270°`), adaptive sync, and HDR (with conditional
+  SDR brightness & saturation sliders when HDR is enabled).
+- Per-monitor brightness (backlight / DDC/CI) with one-click **Sync all** across
+  active displays.
 - **Apply** applies the change and remembers every per-monitor setting (mode,
-  scale, adaptive sync, HDR, brightness, and DDC input watch), plus the layout
-  and text size for this combination of connected monitors. Plugging a monitor
-  back in restores what you used last time with it, and a monitor in a new
-  combination is placed beside the display it was last next to.
-- Changing a mode or turning a display on or off asks you to keep the change
-  and reverts on its own after 10 seconds.
-- Text size and night light are OS-wide across all displays (use **Scale** for
-  per-monitor sizing); text size is remembered per monitor combination on
-  **Apply** and reverted on **Discard**.
+  scale, orientation, adaptive sync, HDR + SDR tuning, brightness, and DDC input
+  watch), plus the layout, mirroring, text size, and night light for this
+  combination of connected monitors. Plugging a monitor back in restores what
+  you used last time with it, and **Forget** clears a monitor's saved profile.
+- Changing a mode, rotation, HDR, mirror state, or turning a display on or off
+  asks you to keep the change and reverts on its own after 10 seconds.
+- Text size and night light (with live `hyprsunset` Kelvin slider and quick
+  warmth presets) are OS-wide across all displays (use **Scale** for per-monitor
+  sizing); both are remembered per monitor combination on **Apply** and reverted
+  on **Discard**.
 - **Switch away / power off** (external monitors) reads the monitor's input
-  over DDC/CI every 5 seconds. When the monitor shows another input or stops
-  answering, it is turned off and the layout is rearranged without it; it comes
-  back when the monitor returns to this computer's input. This needs `ddcutil`
-  and a monitor with DDC/CI enabled.
+  over DDC/CI every 5 seconds, with one-click **Re-learn input** and a
+  **Switch input** picker (`VCP 0x60`). When the monitor shows another input or
+  stops answering, it is turned off and the layout is rearranged without it; it
+  comes back when the monitor returns to this computer's input. This needs
+  `ddcutil` and a monitor with DDC/CI enabled.
+- Keyboard shortcuts: `1`–`9` or `←`/`→` select displays, `↑`/`↓` scroll,
+  `[`/`]` step brightness, `R` re-probes, `I` identifies, and `Enter` applies.
 - Closing the laptop lid is handled by Omarchy's clamshell guard.
 
 Settings are stored in `~/.local/state/dicey-bar/displays.json`. The panel

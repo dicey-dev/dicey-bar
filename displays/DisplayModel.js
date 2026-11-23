@@ -2,18 +2,19 @@
 
 // Pure display-layout logic for the Displays panel and its hotplug service.
 // Nothing here touches Hyprland or the filesystem, so tests run it through
-// Qt's own JavaScript engine. display-ctl.py turns the plans built here into
+// Qt's own JavaScript engine. display_ctl.py turns the plans built here into
 // Hyprland rules.
 //
 // A plan is a list of outputs:
 //   { name, fp, selector, internal, enabled, autoOff, offReason,
-//     mode: { w, h, hz }, x, y, scale, vrr, hdr, transform, ddcWatch }
+//     mode: { w, h, hz }, x, y, scale, vrr, hdr, sdrBrightness, sdrSaturation,
+//     transform, mirrorOf, ddcWatch, brightness }
 // `autoOff` marks a monitor that is connected but off for now: "lid" (the
 // laptop is shut; Omarchy's clamshell handling owns the panel) or "input"
 // (it was switched to another input, or off; this bar turns it off and on).
 // Memory (displays.json) keeps two things apart:
 //   monitors[fp]  settings that belong to one monitor wherever it is plugged in
-//   layouts[key]  positions and on/off state for one set of monitors
+//   layouts[key]  positions, on/off, mirror, text size & night light for one set
 
 var SCALE_PRESETS = [1, 1.25, 1.5, 1.6, 2, 3]
 var MAX_LAYOUTS = 64
@@ -26,6 +27,29 @@ function isInternalName(name) {
 
 function clean(value) {
   return String(value === undefined || value === null ? "" : value).trim()
+}
+
+function cleanTransform(value) {
+  var n = Math.round(Number(value))
+  return (isFinite(n) && n >= 0 && n <= 7) ? n : 0
+}
+
+function cleanSdrBrightness(value) {
+  var n = Number(value)
+  if (!isFinite(n) || n <= 0) return 1
+  return Math.round(Math.max(0.5, Math.min(2.0, n)) * 100) / 100
+}
+
+function cleanSdrSaturation(value) {
+  var n = Number(value)
+  if (!isFinite(n) || n <= 0) return 1
+  return Math.round(Math.max(0.5, Math.min(1.5, n)) * 100) / 100
+}
+
+function cleanMirrorOf(value) {
+  var s = clean(value)
+  if (!s || s.toLowerCase() === "none") return ""
+  return s
 }
 
 // Hardware identity: EDID make, model and serial, so a monitor keeps its
@@ -198,6 +222,35 @@ function clamp(value, low, high) {
   return Math.max(low, Math.min(high, value))
 }
 
+// Guarantees Hyprland mirror invariants: an output cannot mirror itself,
+// cannot mirror a disabled/autoOff output, and cannot mirror another mirror.
+function sanitizeMirrors(outputs) {
+  var byName = {}
+  for (var i = 0; i < outputs.length; i++) {
+    outputs[i].mirrorOf = cleanMirrorOf(outputs[i].mirrorOf)
+    byName[outputs[i].name] = outputs[i]
+  }
+  for (var j = 0; j < outputs.length; j++) {
+    var o = outputs[j]
+    if (!o.mirrorOf) continue
+    if (!o.enabled || o.autoOff) {
+      o.mirrorOf = ""
+      continue
+    }
+    var target = byName[o.mirrorOf]
+    if (!target || target === o || !target.enabled || target.autoOff) {
+      o.mirrorOf = ""
+    }
+  }
+  for (var k = 0; k < outputs.length; k++) {
+    var m = outputs[k]
+    if (m.mirrorOf && byName[m.mirrorOf] && byName[m.mirrorOf].mirrorOf) {
+      m.mirrorOf = ""
+    }
+  }
+  return outputs
+}
+
 // Moves `rect` the shortest distance to a spot where it touches the placed
 // rectangles along an edge without covering any of them. Hyprland lets the
 // pointer fall into gaps between monitors, so every monitor must touch the
@@ -263,18 +316,21 @@ function byPosition(a, b) {
   return (a.x - b.x) || (a.y - b.y)
 }
 
-// Closes gaps and removes overlaps among the enabled outputs, moving each as
-// little as possible, then puts the layout's top-left corner at 0,0. `fixed`
-// (an index) is the output the user is dragging: it is placed last so the
-// others hold still and it snaps against them.
+// Closes gaps and removes overlaps among the enabled, non-mirrored outputs,
+// moving each as little as possible, then puts the layout's top-left corner
+// at 0,0. `fixed` (an index) is the output the user is dragging: it is placed
+// last so the others hold still and it snaps against them.
 function solve(outputs, fixed, alignWithin) {
   var result = outputs.map(function(o) {
     var copy = {}
     for (var k in o) copy[k] = o[k]
+    if (o.mode) copy.mode = { w: o.mode.w, h: o.mode.h, hz: o.mode.hz }
     return copy
   })
+  sanitizeMirrors(result)
   var order = []
-  for (var i = 0; i < result.length; i++) if (result[i].enabled) order.push(i)
+  for (var i = 0; i < result.length; i++)
+    if (result[i].enabled && !result[i].autoOff && !result[i].mirrorOf) order.push(i)
   order.sort(function(a, b) {
     if (a === fixed) return 1
     if (b === fixed) return -1
@@ -300,18 +356,87 @@ function solve(outputs, fixed, alignWithin) {
       result[order[e]].y -= minY
     }
   }
+  var byName = {}
+  for (var b = 0; b < result.length; b++) byName[result[b].name] = result[b]
+  for (var m = 0; m < result.length; m++) {
+    if (result[m].mirrorOf && byName[result[m].mirrorOf]) {
+      result[m].x = byName[result[m].mirrorOf].x
+      result[m].y = byName[result[m].mirrorOf].y
+    }
+  }
   return result
+}
+
+// One-click multi-monitor layout presets: "extend", "external", "internal", "mirror".
+function applyLayoutPreset(outputs, preset) {
+  var list = (Array.isArray(outputs) ? outputs : []).map(function(o) {
+    var c = {}
+    for (var k in o) c[k] = o[k]
+    if (o.mode) c.mode = { w: o.mode.w, h: o.mode.h, hz: o.mode.hz }
+    return c
+  })
+  var avail = list.filter(function(o) { return !o.autoOff })
+  if (avail.length < 2) return solve(list)
+
+  var hasInternal = avail.some(function(o) { return o.internal })
+  var hasExternal = avail.some(function(o) { return !o.internal })
+
+  if (preset === "extend") {
+    for (var i = 0; i < avail.length; i++) {
+      avail[i].enabled = true
+      avail[i].mirrorOf = ""
+    }
+  } else if (preset === "external" && hasExternal) {
+    for (var j = 0; j < avail.length; j++) {
+      avail[j].enabled = !avail[j].internal
+      avail[j].mirrorOf = ""
+    }
+  } else if (preset === "internal" && hasInternal) {
+    for (var k = 0; k < avail.length; k++) {
+      avail[k].enabled = !!avail[k].internal
+      avail[k].mirrorOf = ""
+    }
+  } else if (preset === "mirror") {
+    var source = avail.filter(function(o) { return o.internal })[0] || avail[0]
+    for (var m = 0; m < avail.length; m++) {
+      avail[m].enabled = true
+      avail[m].mirrorOf = avail[m] === source ? "" : source.name
+    }
+  }
+  return solve(list)
+}
+
+function activeLayoutPreset(outputs) {
+  var avail = (Array.isArray(outputs) ? outputs : []).filter(function(o) { return o && !o.autoOff })
+  if (avail.length < 2) return ""
+  var enabled = avail.filter(function(o) { return o.enabled })
+  if (!enabled.length) return ""
+  var mirrored = enabled.filter(function(o) { return !!cleanMirrorOf(o.mirrorOf) })
+  if (mirrored.length > 0 && mirrored.length === enabled.length - 1 && enabled.length === avail.length)
+    return "mirror"
+  if (mirrored.length > 0) return ""
+  var hasInternal = avail.some(function(o) { return o.internal })
+  var hasExternal = avail.some(function(o) { return !o.internal })
+  if (hasInternal && hasExternal) {
+    var allExtOn = avail.every(function(o) { return o.internal ? !o.enabled : o.enabled })
+    if (allExtOn) return "external"
+    var allIntOn = avail.every(function(o) { return o.internal ? o.enabled : !o.enabled })
+    if (allIntOn) return "internal"
+  }
+  if (enabled.length === avail.length) return "extend"
+  return ""
 }
 
 // Which side of `other` an output sits on, and its offset along that edge, so
 // a monitor can return beside the same neighbour in a combination it has not
 // been used in before.
 function neighbourOf(output, outputs) {
+  if (output.mirrorOf) return null
   var mine = rectOf(output)
   var best = null
   for (var i = 0; i < outputs.length; i++) {
     var other = outputs[i]
-    if (other === output || !other.enabled || other.fp === output.fp) continue
+    if (other === output || !other.enabled || other.mirrorOf || other.fp === output.fp) continue
     var theirs = rectOf(other)
     var shared = sharedEdge(mine, theirs)
     if (shared <= 0 || (best && shared <= best.shared)) continue
@@ -388,13 +513,13 @@ function cleanNightLight(value) {
 function sameNightLight(a, b) {
   if (!a && !b) return true
   if (!a || !b) return false
-  return a.enabled === b.enabled && a.kelvin === b.kelvin
+  if (a.enabled !== b.enabled) return false
+  return !a.enabled || Math.abs(Number(a.kelvin) - Number(b.kelvin)) < 50
 }
 
 // Remembered text size for the active combination of monitors (e.g. laptop-only
 // vs docked desk). Omarchy's text size is OS-wide across all outputs, so
-// storing it per monitor topology restores the right desk size on dock/undock
-// without pretending two simultaneous monitors can have different system fonts.
+// storing it per monitor topology restores the right desk size on dock/undock.
 function layoutTextSize(memory, plan) {
   var mem = normalizeMemory(memory)
   var active = (Array.isArray(plan) ? plan : []).filter(function(o) { return o && !o.autoOff })
@@ -403,6 +528,39 @@ function layoutTextSize(memory, plan) {
   if (exact && exact.textSize !== undefined && exact.textSize !== null)
     return cleanTextSize(exact.textSize)
   return null
+}
+
+// Remembered Night Light state for the active monitor combination.
+function layoutNightLight(memory, plan) {
+  var mem = normalizeMemory(memory)
+  var active = (Array.isArray(plan) ? plan : []).filter(function(o) { return o && !o.autoOff })
+  if (!active.length) return null
+  var exact = mem.layouts[layoutKey(active.map(function(o) { return o.fp }))]
+  if (exact && exact.nightLight) return cleanNightLight(exact.nightLight)
+  return null
+}
+
+// Removes a monitor's saved profile and any saved layouts that included it.
+function forgetMonitor(memory, fp) {
+  var mem = copyMemory(memory)
+  var target = clean(fp)
+  if (!target) return mem
+  delete mem.monitors[target]
+  for (var key in mem.layouts) {
+    var layout = mem.layouts[key]
+    var members = layout && Array.isArray(layout.members) ? layout.members : []
+    var inOutputs = layout && layout.outputs && Object.prototype.hasOwnProperty.call(layout.outputs, target)
+    if (members.indexOf(target) !== -1 || inOutputs) delete mem.layouts[key]
+  }
+  return mem
+}
+
+function forgetLayout(memory, plan) {
+  var mem = copyMemory(memory)
+  var active = (Array.isArray(plan) ? plan : []).filter(function(o) { return o && !o.autoOff })
+  if (!active.length) return mem
+  delete mem.layouts[layoutKey(active.map(function(o) { return o.fp }))]
+  return mem
 }
 
 function liveOutput(monitor, id) {
@@ -421,7 +579,10 @@ function liveOutput(monitor, id) {
     scale: Number(monitor.scale) > 0 ? Number(monitor.scale) : 1,
     vrr: monitor.vrr === true ? 1 : Number(monitor.vrr) || 0,
     hdr: /^hdr/i.test(String(monitor.colorManagementPreset || "")),
-    transform: Number(monitor.transform) || 0,
+    sdrBrightness: cleanSdrBrightness(monitor.sdrBrightness),
+    sdrSaturation: cleanSdrSaturation(monitor.sdrSaturation),
+    transform: cleanTransform(monitor.transform),
+    mirrorOf: cleanMirrorOf(monitor.mirrorOf),
     ddcWatch: false,
     textSize: null,
     brightness: null,
@@ -446,6 +607,10 @@ function planFromLive(monitors, memory, autoOff) {
       out.textSize = cleanTextSize(profile.textSize)
       out.brightness = cleanBrightness(profile.brightness)
       out.nightLight = cleanNightLight(profile.nightLight)
+      if (!out.hdr) {
+        if (profile.sdrBrightness !== undefined) out.sdrBrightness = cleanSdrBrightness(profile.sdrBrightness)
+        if (profile.sdrSaturation !== undefined) out.sdrSaturation = cleanSdrSaturation(profile.sdrSaturation)
+      }
     }
     if (off[out.fp]) {
       out.autoOff = true
@@ -468,11 +633,14 @@ function derive(monitors, memory, autoOff) {
     var out = liveOutput(m, ids[i])
     var profile = mem.monitors[out.fp] || {}
     out.mode = pickMode(m.availableModes, profile.mode || null) || out.mode
-    // A monitor with no memory keeps the scale Hyprland chose for it.
+    // A monitor with no memory keeps the scale & orientation Hyprland chose.
     var scale = Number(profile.scale) > 0 ? Number(profile.scale) : out.scale
     out.scale = cleanScale(scale, out.mode.w, out.mode.h)
     out.vrr = [0, 1, 2].indexOf(Number(profile.vrr)) !== -1 ? Number(profile.vrr) : 0
     out.hdr = profile.hdr === true && m.hdrCapable !== false
+    out.sdrBrightness = profile.sdrBrightness !== undefined ? cleanSdrBrightness(profile.sdrBrightness) : out.sdrBrightness
+    out.sdrSaturation = profile.sdrSaturation !== undefined ? cleanSdrSaturation(profile.sdrSaturation) : out.sdrSaturation
+    out.transform = profile.transform !== undefined ? cleanTransform(profile.transform) : out.transform
     out.ddcWatch = profile.ddcWatch === true
     out.textSize = cleanTextSize(profile.textSize)
     out.brightness = cleanBrightness(profile.brightness)
@@ -480,6 +648,7 @@ function derive(monitors, memory, autoOff) {
     out.autoOff = !!off[out.fp]
     out.offReason = off[out.fp] ? String(off[out.fp]) : ""
     out.enabled = true
+    out.mirrorOf = ""
     outputs.push(out)
   }
 
@@ -493,19 +662,33 @@ function derive(monitors, memory, autoOff) {
     active = [keep]
   }
   var fps = active.map(function(o) { return o.fp })
+  var byFp = {}
+  for (var f = 0; f < active.length; f++) byFp[active[f].fp] = active[f]
+
   var exact = mem.layouts[layoutKey(fps)]
   var source = exact && exact.outputs ? exact : closestLayout(mem, fps)
 
   var known = {}
   // With nothing saved that shares a monitor, the arrangement Hyprland has
   // now is the starting point.
-  if (!source) for (var l = 0; l < active.length; l++) known[active[l].fp] = true
+  if (!source) {
+    for (var l = 0; l < active.length; l++) {
+      known[active[l].fp] = true
+      var origMonitor = monitors[outputs.indexOf(active[l])]
+      active[l].mirrorOf = cleanMirrorOf(origMonitor ? origMonitor.mirrorOf : "")
+    }
+  }
   for (var a = 0; source && a < active.length; a++) {
     var saved = source && source.outputs ? source.outputs[active[a].fp] : null
     if (!saved) continue
     active[a].x = Number(saved.x) || 0
     active[a].y = Number(saved.y) || 0
     active[a].enabled = saved.enabled !== false
+    if (saved.mirrorTargetFp && byFp[saved.mirrorTargetFp]) {
+      active[a].mirrorOf = byFp[saved.mirrorTargetFp].name
+    } else if (saved.mirrorOf) {
+      active[a].mirrorOf = cleanMirrorOf(saved.mirrorOf)
+    }
     known[active[a].fp] = true
   }
   // Monitors the chosen layout does not know return beside the neighbour they
@@ -517,7 +700,7 @@ function derive(monitors, memory, autoOff) {
     var memo = (mem.monitors[output.fp] || {}).lastNeighbour
     var neighbour = null
     for (var k = 0; memo && k < active.length; k++)
-      if (active[k].fp === memo.fp && known[active[k].fp] && active[k].enabled) neighbour = active[k]
+      if (active[k].fp === memo.fp && known[active[k].fp] && active[k].enabled && !active[k].mirrorOf) neighbour = active[k]
     if (neighbour) {
       var spot = placeBeside(output, neighbour, memo.edge, Number(memo.offset) || 0)
       output.x = spot.x
@@ -526,7 +709,7 @@ function derive(monitors, memory, autoOff) {
       var right = 0
       var top = Infinity
       for (var r = 0; r < active.length; r++) {
-        if (!known[active[r].fp] || !active[r].enabled) continue
+        if (!known[active[r].fp] || !active[r].enabled || active[r].mirrorOf) continue
         var rect = rectOf(active[r])
         right = Math.max(right, rect.x + rect.w)
         top = Math.min(top, rect.y)
@@ -553,9 +736,20 @@ function outputMatchesLive(output, live) {
   if (output.autoOff) return output.offReason !== "input" || live.enabled === false
   if (output.enabled !== live.enabled) return false
   if (!output.enabled) return true
-  return sameMode(output.mode, live.mode) && output.x === live.x && output.y === live.y
-    && Math.abs(output.scale - live.scale) < 0.001 && output.vrr === live.vrr
-    && output.hdr === live.hdr
+  var mirrorA = cleanMirrorOf(output.mirrorOf)
+  var mirrorB = cleanMirrorOf(live.mirrorOf)
+  if (mirrorA !== mirrorB) return false
+  if (!mirrorA && (output.x !== live.x || output.y !== live.y)) return false
+  if (!sameMode(output.mode, live.mode)) return false
+  if (Math.abs(output.scale - live.scale) >= 0.001) return false
+  if (output.vrr !== live.vrr) return false
+  if (cleanTransform(output.transform) !== cleanTransform(live.transform)) return false
+  if (output.hdr !== live.hdr) return false
+  if (output.hdr) {
+    if (Math.abs(cleanSdrBrightness(output.sdrBrightness) - cleanSdrBrightness(live.sdrBrightness)) >= 0.015) return false
+    if (Math.abs(cleanSdrSaturation(output.sdrSaturation) - cleanSdrSaturation(live.sdrSaturation)) >= 0.015) return false
+  }
+  return true
 }
 
 // True when applying `plan` would change nothing Hyprland shows.
@@ -568,16 +762,20 @@ function planMatchesLive(plan, livePlan) {
   return true
 }
 
-// Applying a new mode can leave a monitor black, so the panel asks for a
-// confirmation (and reverts on its own) only when a mode or an output's
-// on/off state changes.
+// Applying a new mode, rotation, HDR, power, or mirror change can leave a
+// monitor unreadable, so the panel asks for confirmation and reverts if missed.
 function needsConfirmation(plan, livePlan) {
   for (var i = 0; i < plan.length; i++) {
     var live = null
     for (var j = 0; j < livePlan.length; j++) if (livePlan[j].name === plan[i].name) live = livePlan[j]
     if (!live || plan[i].autoOff) continue
     if (plan[i].enabled !== live.enabled) return true
-    if (plan[i].enabled && (!sameMode(plan[i].mode, live.mode) || plan[i].hdr !== live.hdr)) return true
+    if (plan[i].enabled && (
+      !sameMode(plan[i].mode, live.mode)
+      || plan[i].hdr !== live.hdr
+      || cleanTransform(plan[i].transform) !== cleanTransform(live.transform)
+      || cleanMirrorOf(plan[i].mirrorOf) !== cleanMirrorOf(live.mirrorOf)
+    )) return true
   }
   return false
 }
@@ -587,21 +785,33 @@ function copyMemory(memory) {
 }
 
 // The memory after the user presses Apply on `plan`: every monitor's own
-// settings, and the arrangement (plus optional OS-wide text size) for this
-// combination of monitors.
+// settings, and the arrangement (plus optional OS-wide text size & night light)
+// for this combination of monitors.
 function remember(memory, plan, now, options) {
   var mem = copyMemory(memory)
   var opts = options && typeof options === "object" ? options : {}
   var members = plan.filter(function(o) { return !o.autoOff })
+  var byName = {}
+  for (var m = 0; m < members.length; m++) byName[members[m].name] = members[m]
   var key = layoutKey(members.map(function(o) { return o.fp }))
   var prevLayout = mem.layouts[key] || {}
   var layout = { members: members.map(function(o) { return o.fp }).sort(), lastUsed: String(now || ""), outputs: {} }
   var savedTextSize = cleanTextSize(opts.textSize !== undefined ? opts.textSize : prevLayout.textSize)
   if (savedTextSize !== null) layout.textSize = savedTextSize
+  var savedNightLight = cleanNightLight(opts.nightLight !== undefined ? opts.nightLight : prevLayout.nightLight)
+  if (savedNightLight !== null) layout.nightLight = savedNightLight
   for (var i = 0; i < plan.length; i++) {
     var o = plan[i]
     var previous = mem.monitors[o.fp] || {}
-    if (!o.autoOff) layout.outputs[o.fp] = { x: o.x, y: o.y, enabled: o.enabled }
+    if (!o.autoOff) {
+      var outEntry = { x: o.x, y: o.y, enabled: o.enabled }
+      var mirrorName = cleanMirrorOf(o.mirrorOf)
+      if (mirrorName && byName[mirrorName]) {
+        outEntry.mirrorOf = mirrorName
+        outEntry.mirrorTargetFp = byName[mirrorName].fp
+      }
+      layout.outputs[o.fp] = outEntry
+    }
     // An output that is off reports the last mode it ran, which is not a new
     // choice; keep what was saved for it.
     if (!o.enabled || o.autoOff) {
@@ -618,6 +828,9 @@ function remember(memory, plan, now, options) {
       scale: o.scale,
       vrr: o.vrr,
       hdr: o.hdr === true,
+      sdrBrightness: cleanSdrBrightness(o.sdrBrightness !== undefined ? o.sdrBrightness : previous.sdrBrightness),
+      sdrSaturation: cleanSdrSaturation(o.sdrSaturation !== undefined ? o.sdrSaturation : previous.sdrSaturation),
+      transform: cleanTransform(o.transform),
       ddcWatch: o.ddcWatch === true
     }
     var brightness = cleanBrightness(o.brightness !== null && o.brightness !== undefined ? o.brightness : previous.brightness)
@@ -625,7 +838,7 @@ function remember(memory, plan, now, options) {
     // The input a watched monitor is expected on is learned when the watch is
     // switched on, and kept while it stays on.
     if (profile.ddcWatch && previous.ddcWatch && previous.ddcInput) profile.ddcInput = previous.ddcInput
-    var neighbour = o.enabled && !o.autoOff ? neighbourOf(o, members) : null
+    var neighbour = o.enabled && !o.autoOff && !o.mirrorOf ? neighbourOf(o, members) : null
     if (neighbour) profile.lastNeighbour = neighbour
     else if (previous.lastNeighbour) profile.lastNeighbour = previous.lastNeighbour
     mem.monitors[o.fp] = profile
