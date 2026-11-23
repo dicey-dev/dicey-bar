@@ -1072,6 +1072,17 @@ Item {
       implicitWidth: Math.ceil(tooltipBubble.implicitWidth)
       implicitHeight: Math.ceil(tooltipBubble.implicitHeight)
 
+      // Each show maps a fresh surface at a whole-number scale before Qt receives
+      // the output's fractional one. Keep the bubble transparent until it matches the bar.
+      readonly property bool scaleReady: visible && Math.round(devicePixelRatio * 120) === Math.round(barWindow.devicePixelRatio * 120)
+      property bool revealed: false
+
+      // Only hiding resets it: at a whole-number scale the ratio dips to 1 after the first frame.
+      onVisibleChanged: if (!visible) revealed = false
+      onScaleReadyChanged: if (scaleReady) Qt.callLater(function() {
+        if (tooltipWindow.scaleReady) tooltipWindow.revealed = true
+      })
+
       anchor {
         id: tooltipAnchor
         window: barWindow
@@ -1108,6 +1119,7 @@ Item {
 
       BorderSurface {
         id: tooltipBubble
+        opacity: tooltipWindow.revealed ? 1 : 0
         implicitWidth: tooltipLabel.implicitWidth + 20
         implicitHeight: tooltipLabel.implicitHeight + 14
         color: Commons.Color.tooltip.background
@@ -1137,6 +1149,10 @@ Item {
         // Use configured entries for island visibility. A child's effective
         // visible becomes false when this window unmaps; binding its parent
         // back to that value latches the whole island off after remapping.
+        // Paint an island only once its widgets have width, though: while the
+        // bar is built or its widgets reload, an island with nothing loaded
+        // yet would otherwise flash as an empty pill. Color, unlike visible,
+        // leaves the children's effective visibility alone, so it cannot latch.
         // Keep the three Waybar-era groups visually distinct while retaining
         // the Quickshell widgets and their popouts. The padding, radius, and
         // edge offsets intentionally match the saved island-style Waybar CSS.
@@ -1146,7 +1162,7 @@ Item {
           width: leftModules.width + Style.space(20)
           height: parent.height - Style.space(2)
           radius: Style.space(6)
-          color: root.islandBackground
+          color: leftModules.width > 0 ? root.islandBackground : "transparent"
           anchors.left: parent.left
           anchors.leftMargin: Style.space(10)
           anchors.verticalCenter: parent.verticalCenter
@@ -1163,7 +1179,7 @@ Item {
           width: centerModules.width + Style.space(20)
           height: parent.height - Style.space(2)
           radius: Style.space(6)
-          color: root.islandBackground
+          color: centerModules.width > 0 ? root.islandBackground : "transparent"
           anchors.centerIn: parent
 
           IslandCenterModules {
@@ -1178,7 +1194,7 @@ Item {
           width: rightModules.width + Style.space(20)
           height: parent.height - Style.space(2)
           radius: Style.space(6)
-          color: root.islandBackground
+          color: rightModules.width > 0 ? root.islandBackground : "transparent"
           anchors.right: parent.right
           anchors.rightMargin: Style.space(10)
           anchors.verticalCenter: parent.verticalCenter
