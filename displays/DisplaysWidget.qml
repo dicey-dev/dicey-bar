@@ -2600,9 +2600,9 @@ Panel {
         textFormat: Text.PlainText
         text: canvas.dragIndex >= 0
           ? (canvas.shiftFreeMove
-              ? "Free placement (Shift held)"
-              : (canvas.activeSnap ? (canvas.activeSnap.label + " · hold Shift for free move") : "Drag to place · hold Shift for free move"))
-          : "Drag tiles (Shift free) · 1-9 select · ←/→ switch · Enter apply"
+              ? "Fine drag (Shift held)"
+              : (canvas.activeSnap ? (canvas.activeSnap.label + " · hold Shift for finer drag") : "Drag to place · hold Shift for finer drag"))
+          : "Drag tiles · hold Shift for finer drag · 1-9 / ←→ · Enter apply"
         color: canvas.dragIndex >= 0 && (canvas.activeSnap || canvas.shiftFreeMove) ? root.accent : root.muted
         font.family: root.fontName
         font.pixelSize: Math.max(9, Style.font.caption - 1)
