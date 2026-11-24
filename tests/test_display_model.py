@@ -434,6 +434,23 @@ TestCase {
         var recovered = Model.ensureEnabledMode(byName(live, "HDMI-A-1"), off.availableModes, null)
         compare(recovered, { w: 2560, h: 1440, hz: 100 })
     }
+
+    function test_numeric_mirror_id_resolves_to_connector_name() {
+        var m0 = laptop(); m0.id = 0
+        var m1 = benq(); m1.id = 1; m1.mirrorOf = "0"
+        var live = Model.planFromLive([m0, m1], {})
+        compare(byName(live, "HDMI-A-1").mirrorOf, "eDP-1")
+    }
+
+    function test_unprofiled_monitor_leaves_vrr_unmanaged_and_memory_prefix_checked() {
+        var m1 = monitor("DP-1", "ACME", "Pro", "1", 1920, 1080, 60, 0, 0)
+        var mem = Model.remember({}, Model.derive([m1], {}, {}), "t1")
+        // Plugging in "ACME Pro 10" later must detect prefix collision against remembered "ACME Pro 1"
+        var m2 = monitor("DP-2", "ACME", "Pro", "10", 1920, 1080, 60, 1920, 0)
+        var plan = Model.derive([m2], mem, {})
+        compare(plan[0].selector, "DP-2")
+        compare(plan[0].vrrManaged, false)
+    }
 }
 """
 

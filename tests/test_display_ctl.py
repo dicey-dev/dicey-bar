@@ -74,8 +74,13 @@ class LuaTest(unittest.TestCase):
         self.assertNotIn("desc:", connector_rule)
 
     def test_disabled_rule(self):
+        # Disabled rules always address exact connector name so desc: prefix
+        # matching can never disable a newly hotplugged display.
         self.assertEqual(ctl.monitor_rule(output(enabled=False)),
-                         'hl.monitor({ output = "desc:BNQ BenQ GW2790Q ET97T00426087", disabled = true })')
+                         'hl.monitor({ output = "HDMI-A-1", disabled = true })')
+        # Unprofiled monitors omit `vrr` so Hyprland preserves fullscreen VRR policy.
+        unmanaged = ctl.monitor_rule(output(vrrManaged=False))
+        self.assertNotIn("vrr =", unmanaged)
 
     def test_validation_rejects_bad_values(self):
         for bad in ({"x": 1.5}, {"scale": 0}, {"vrr": 3}, {"transform": True},
@@ -136,6 +141,27 @@ class LuaTest(unittest.TestCase):
         self.assertTrue(safe[0]["enabled"])
         self.assertEqual(safe[0]["mirrorOf"], "")
 
+        # Completely replaced disabled monitor reporting 0x0 still yields preferred mode
+        replacement = [{"name": "DP-9", "id": 3, "width": 0, "height": 0, "refreshRate": 0, "disabled": True}]
+        safe_rep = ctl.safe_revert_plan(previous_plan, replacement, lid_is_closed=False)
+        self.assertEqual(len(safe_rep), 1)
+        self.assertEqual(safe_rep[0]["name"], "DP-9")
+        self.assertTrue(safe_rep[0]["enabled"])
+        self.assertIsNone(safe_rep[0]["mode"])
+        self.assertIn('mode = "preferred"', ctl.monitor_rule(safe_rep[0]))
+
+        # Numeric mirrorOf ID ("0") resolves against connected monitor id=0 -> "eDP-1"
+        mirrored_prev = [
+            output(**LAPTOP, enabled=True),
+            output(name="HDMI-A-1", selector="HDMI-A-1", enabled=True, mirrorOf="0"),
+        ]
+        live_both = [
+            {"id": 0, "name": "eDP-1", "width": 1920, "height": 1080, "refreshRate": 60},
+            {"id": 1, "name": "HDMI-A-1", "width": 2560, "height": 1440, "refreshRate": 100},
+        ]
+        safe_mir = ctl.safe_revert_plan(mirrored_prev, live_both)
+        self.assertEqual(safe_mir[1]["mirrorOf"], "eDP-1")
+
 
 class MonitorsLuaTest(unittest.TestCase):
     def test_takes_over_the_foreign_block_and_keeps_its_other_settings(self):
@@ -165,6 +191,7 @@ hl.config({
     render = { cm_auto_hdr = 0 },
 })
 hl.workspace_rule({ workspace = 1, monitor = "DP-1" })
+hl.env("TEST_FLAG", "foo --bar hl.monitor({})")
 -- END im0001gt.screens
 """
         first = ctl.splice_block(multiline_foreign, [output()])
@@ -173,6 +200,7 @@ hl.workspace_rule({ workspace = 1, monitor = "DP-1" })
         self.assertIn("hl.config({", second)
         self.assertIn("render = { cm_auto_hdr = 0 }", second)
         self.assertIn("hl.workspace_rule(", second)
+        self.assertIn('hl.env("TEST_FLAG", "foo --bar hl.monitor({})")', second)
         self.assertIn('position = "1920x0"', second)
         ctl.validate_lua_syntax(second)
 
@@ -314,6 +342,20 @@ class PersistTest(unittest.TestCase):
                 # After 60s, a fresh detect is allowed
                 ctl.cached_buses(["HDMI-A-1", "DP-2"], now=1065.0)
                 self.assertEqual(detect.call_count, 2)
+
+    def test_ddc_poll_keeps_bus_across_transient_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"XDG_RUNTIME_DIR": tmp}
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(ctl, "ddc_buses", return_value={"HDMI-A-1": "3"}) as detect, \
+                    mock.patch.object(ctl, "ddc_input", side_effect=[None, "0x11"]) as read:
+                r1 = ctl.ddc_poll(["HDMI-A-1"], now=1000.0)
+                # Next poll 5s later must still use cached bus "3" and recover immediately
+                r2 = ctl.ddc_poll(["HDMI-A-1"], now=1005.0)
+            self.assertEqual(r1, {"HDMI-A-1": None})
+            self.assertEqual(r2, {"HDMI-A-1": "0x11"})
+            self.assertEqual(detect.call_count, 1)
+            self.assertEqual(read.call_count, 2)
 
     def test_persist_aborts_before_memory_write_if_monitors_lua_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -46,9 +46,17 @@ function cleanSdrSaturation(value) {
   return Math.round(Math.max(0.5, Math.min(1.5, n)) * 100) / 100
 }
 
-function cleanMirrorOf(value) {
+function cleanMirrorOf(value, monitors) {
   var s = clean(value)
   if (!s || s.toLowerCase() === "none") return ""
+  // Hyprland 0.56+ may report mirrorOf as a numeric monitor ID string (e.g. "0").
+  if (/^\d+$/.test(s) && Array.isArray(monitors)) {
+    var idNum = parseInt(s, 10)
+    for (var i = 0; i < monitors.length; i++) {
+      if (monitors[i] && Number(monitors[i].id) === idNum && monitors[i].name)
+        return clean(monitors[i].name)
+    }
+  }
   return s
 }
 
@@ -67,9 +75,9 @@ function baseFingerprint(monitor) {
 // identical monitors that report the same (often empty) serial cannot be told
 // apart by EDID, so only those get the connector name appended. Hyprland also
 // prefix-matches `desc:` selectors, so if one description is a prefix of
-// another connected monitor's description, fall back to the connector name.
-// Internal panels are always addressed by connector name.
-function identify(monitors) {
+// another connected or previously remembered monitor's description, fall back
+// to the connector name. Internal panels are always addressed by connector name.
+function identify(monitors, memory) {
   var counts = {}
   var list = Array.isArray(monitors) ? monitors : []
   var descs = []
@@ -77,6 +85,14 @@ function identify(monitors) {
     var fp = baseFingerprint(list[i])
     counts[fp] = (counts[fp] || 0) + 1
     descs.push(clean(list[i].description))
+  }
+  var knownDescs = []
+  var memMonitors = memory && memory.monitors && typeof memory.monitors === "object" ? memory.monitors : null
+  if (memMonitors) {
+    for (var mfp in memMonitors) {
+      var d = clean(memMonitors[mfp] && memMonitors[mfp].description)
+      if (d && knownDescs.indexOf(d) === -1) knownDescs.push(d)
+    }
   }
   var out = []
   for (var j = 0; j < list.length; j++) {
@@ -95,10 +111,21 @@ function identify(monitors) {
         }
       }
     }
+    if (descSafe && knownDescs.length) {
+      for (var r = 0; r < knownDescs.length; r++) {
+        var kd = knownDescs[r]
+        if (kd === description) continue
+        if (kd.indexOf(description) === 0 || description.indexOf(kd) === 0) {
+          descSafe = false
+          break
+        }
+      }
+    }
     out.push({
       name: clean(m.name),
       fp: unique ? base : base + "|" + clean(m.name),
       selector: descSafe ? "desc:" + description : clean(m.name),
+      description: description,
       internal: internal
     })
   }
@@ -585,12 +612,13 @@ function forgetLayout(memory, plan) {
   return mem
 }
 
-function liveOutput(monitor, id) {
+function liveOutput(monitor, id, allMonitors) {
   var mode = { w: Number(monitor.width), h: Number(monitor.height), hz: Number(monitor.refreshRate) }
   return {
     name: id.name,
     fp: id.fp,
     selector: id.selector,
+    description: id.description || clean(monitor.description),
     internal: id.internal,
     enabled: monitor.disabled !== true,
     autoOff: false,
@@ -600,11 +628,12 @@ function liveOutput(monitor, id) {
     y: Number(monitor.y) || 0,
     scale: Number(monitor.scale) > 0 ? Number(monitor.scale) : 1,
     vrr: monitor.vrr === true ? 1 : Number(monitor.vrr) || 0,
+    vrrManaged: true,
     hdr: /^hdr/i.test(String(monitor.colorManagementPreset || "")),
     sdrBrightness: cleanSdrBrightness(monitor.sdrBrightness),
     sdrSaturation: cleanSdrSaturation(monitor.sdrSaturation),
     transform: cleanTransform(monitor.transform),
-    mirrorOf: cleanMirrorOf(monitor.mirrorOf),
+    mirrorOf: cleanMirrorOf(monitor.mirrorOf, allMonitors),
     ddcWatch: false,
     textSize: null,
     brightness: null,
@@ -617,9 +646,9 @@ function liveOutput(monitor, id) {
 function planFromLive(monitors, memory, autoOff) {
   var mem = normalizeMemory(memory)
   var off = autoOff || {}
-  var ids = identify(monitors)
+  var ids = identify(monitors, mem)
   return monitors.map(function(m, i) {
-    var out = liveOutput(m, ids[i])
+    var out = liveOutput(m, ids[i], monitors)
     var profile = mem.monitors[out.fp]
     out.ddcWatch = !!(profile && profile.ddcWatch)
     // Hyprland reports whether VRR is active, not the Off/On/Fullscreen
@@ -649,11 +678,11 @@ function planFromLive(monitors, memory, autoOff) {
 function derive(monitors, memory, autoOff) {
   var mem = normalizeMemory(memory)
   var off = autoOff || {}
-  var ids = identify(monitors)
+  var ids = identify(monitors, mem)
   var outputs = []
   for (var i = 0; i < monitors.length; i++) {
     var m = monitors[i]
-    var out = liveOutput(m, ids[i])
+    var out = liveOutput(m, ids[i], monitors)
     var hasProfile = Object.prototype.hasOwnProperty.call(mem.monitors, out.fp)
     var profile = hasProfile ? (mem.monitors[out.fp] || {}) : null
     if (hasProfile) {
@@ -661,6 +690,7 @@ function derive(monitors, memory, autoOff) {
       var scale = Number(profile.scale) > 0 ? Number(profile.scale) : out.scale
       out.scale = cleanScale(scale, out.mode.w, out.mode.h)
       out.vrr = [0, 1, 2].indexOf(Number(profile.vrr)) !== -1 ? Number(profile.vrr) : out.vrr
+      out.vrrManaged = true
       out.hdr = profile.hdr === true && m.hdrCapable !== false
       out.sdrBrightness = profile.sdrBrightness !== undefined ? cleanSdrBrightness(profile.sdrBrightness) : out.sdrBrightness
       out.sdrSaturation = profile.sdrSaturation !== undefined ? cleanSdrSaturation(profile.sdrSaturation) : out.sdrSaturation
@@ -670,11 +700,13 @@ function derive(monitors, memory, autoOff) {
       out.brightness = cleanBrightness(profile.brightness)
       out.nightLight = cleanNightLight(profile.nightLight)
     } else {
-      // Unprofiled monitor: preserve whatever live settings Hyprland chose.
+      // Unprofiled monitor: preserve whatever live settings Hyprland chose,
+      // and leave its VRR policy unmanaged so fullscreen VRR isn't overwritten.
       if (!(out.mode.w > 0 && out.mode.h > 0 && out.mode.hz > 0)) {
         out.mode = pickMode(m.availableModes, null) || out.mode
       }
       out.scale = cleanScale(out.scale, out.mode.w, out.mode.h)
+      out.vrrManaged = false
     }
     out.autoOff = !!off[out.fp]
     out.offReason = off[out.fp] ? String(off[out.fp]) : ""
@@ -706,7 +738,7 @@ function derive(monitors, memory, autoOff) {
     for (var l = 0; l < active.length; l++) {
       known[active[l].fp] = true
       var origMonitor = monitors[outputs.indexOf(active[l])]
-      active[l].mirrorOf = cleanMirrorOf(origMonitor ? origMonitor.mirrorOf : "")
+      active[l].mirrorOf = cleanMirrorOf(origMonitor ? origMonitor.mirrorOf : "", monitors)
     }
   }
   for (var a = 0; source && a < active.length; a++) {
@@ -864,6 +896,8 @@ function remember(memory, plan, now, options) {
       transform: cleanTransform(o.transform),
       ddcWatch: o.ddcWatch === true
     }
+    var desc = clean(o.description || previous.description)
+    if (desc) profile.description = desc
     var brightness = cleanBrightness(o.brightness !== null && o.brightness !== undefined ? o.brightness : previous.brightness)
     if (brightness !== null) profile.brightness = brightness
     // The input a watched monitor is expected on is learned when the watch is
