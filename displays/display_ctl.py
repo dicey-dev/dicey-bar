@@ -126,7 +126,7 @@ def _fmt(number: float) -> str:
     return text or "0"
 
 
-def validate_output(output: dict) -> dict:
+def validate_output(output: dict, *, allow_preferred_mode: bool = False) -> dict:
     if not isinstance(output, dict):
         raise ValueError("output must be an object")
     selector = str(output.get("selector") or output.get("name") or "")
@@ -147,6 +147,7 @@ def validate_output(output: dict) -> dict:
         "offReason": str(output.get("offReason") or ""),
         "hdr": output.get("hdr") is True,
         "ddcWatch": output.get("ddcWatch") is True,
+        "vrrManaged": output.get("vrrManaged") is not False,
         "mirrorOf": mirror_raw,
     }
     if clean["offReason"] not in ("", "lid", "input"):
@@ -159,8 +160,8 @@ def validate_output(output: dict) -> dict:
             "hz": _number(mode.get("hz"), 1, 1000, "refresh rate"),
         }
     except (ValueError, TypeError):
-        # An output that is off may report no usable mode; it gets none.
-        if clean["enabled"] and not clean["autoOff"]:
+        # An output that is off (or an emergency revert entry) may have no mode.
+        if clean["enabled"] and not clean["autoOff"] and not allow_preferred_mode:
             raise
         clean["mode"] = None
     clean["x"] = _int(output.get("x", 0), -100000, 100000, "x")
@@ -195,11 +196,13 @@ def validate_plan(plan) -> list:
 
 def monitor_rule(output: dict, *, keep_on: bool = False, use_connector_name: bool = False) -> str:
     """One hl.monitor call. Hyprland merges a rule into the one already set for
-    that output, so every field is spelled out: a rule that left out
-    `disabled`, `bitdepth`, or `mirror` would keep the old value."""
-    target = output["name"] if use_connector_name else output["selector"]
+    that output, so every managed field is spelled out. Disabled rules always
+    use the exact connector name so a prefix-matched `desc:` rule can never
+    disable a future hotplugged display."""
+    is_disabled = not output["enabled"] and not keep_on
+    target = output["name"] if (use_connector_name or is_disabled) else output["selector"]
     selector = lua_string(target)
-    if not output["enabled"] and not keep_on:
+    if is_disabled:
         return f"hl.monitor({{ output = {selector}, disabled = true }})"
     mode = output["mode"]
     if mode is None:
@@ -213,13 +216,16 @@ def monitor_rule(output: dict, *, keep_on: bool = False, use_connector_name: boo
         f'position = "{output["x"]}x{output["y"]}"',
         f"scale = {_fmt(output['scale'])}",
         f"transform = {output['transform']}",
-        f"vrr = {output['vrr']}",
+    ]
+    if output.get("vrrManaged", True):
+        fields.append(f"vrr = {output['vrr']}")
+    fields.extend([
         'cm = "hdr"' if output["hdr"] else 'cm = "srgb"',
         f"bitdepth = {10 if output['hdr'] else 8}",
         f"sdrbrightness = {_fmt(sdr_b)}",
         f"sdrsaturation = {_fmt(sdr_s)}",
         f"mirror = {lua_string(output.get('mirrorOf') or '')}",
-    ]
+    ])
     return "hl.monitor({ " + ", ".join(fields) + " })"
 
 
@@ -268,13 +274,35 @@ def _skip_long_bracket_content(text: str, start: int, eq_count: int) -> int:
 
 def strip_hl_monitor_calls(text: str) -> str:
     """Remove top-level `hl.monitor(...)` calls (single or multiline) from a
-    Lua snippet while preserving all other statements (e.g. `hl.config({...})`,
-    `hl.workspace_rule(...)`) intact."""
+    Lua snippet while preserving all other statements (including strings that
+    contain `--` or `hl.monitor(...)`, multiline `hl.config({...})`, etc.)."""
     out = []
     i = 0
     n = len(text)
     while i < n:
         ch = text[i]
+        # Quoted string literals outside hl.monitor() — preserve verbatim
+        if ch in ('"', "'"):
+            q = ch
+            start = i
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == q:
+                    i += 1
+                    break
+                i += 1
+            out.append(text[start:i])
+            continue
+        # Long-bracket string literals `[==[...]==]` outside hl.monitor() — preserve verbatim
+        lb_str = _match_long_bracket(text, i)
+        if lb_str:
+            end = _skip_long_bracket_content(text, lb_str[1], lb_str[0])
+            out.append(text[i:end])
+            i = end
+            continue
         # Line or block comments
         if ch == "-" and i + 1 < n and text[i + 1] == "-":
             lb = _match_long_bracket(text, i + 2)
@@ -597,12 +625,22 @@ def set_nightlight(enabled: bool, kelvin: int = 4000) -> dict:
 
 
 def connected_monitors() -> list:
+    raw = hyprctl_json("monitors", "all")
+    id_to_name = {}
+    for m in raw:
+        name = str(m.get("name") or "")
+        if name and name != "FALLBACK" and m.get("id") is not None:
+            id_to_name[str(m["id"])] = name
     monitors = []
-    for monitor in hyprctl_json("monitors", "all"):
+    for monitor in raw:
         name = str(monitor.get("name") or "")
         # Hyprland's stand-in once nothing else is left; never a real monitor.
         if not name or name == "FALLBACK":
             continue
+        # Normalize Hyprland 0.56+ numeric monitor ID strings in mirrorOf to connector names.
+        mirror_of = str(monitor.get("mirrorOf") or "").strip()
+        if mirror_of in id_to_name:
+            monitor["mirrorOf"] = id_to_name[mirror_of]
         monitor["hdrCapable"] = hdr_capable(name)
         monitors.append(monitor)
     return monitors
@@ -620,21 +658,30 @@ def state() -> dict:
 # ------------------------------------------------------------------ apply & safe revert
 
 def _verify_some_display_enabled(outputs: list) -> list:
-    """Confirm at least one real connected display remained enabled after apply."""
+    """Confirm at least one real connected, DPMS-on display remained enabled after apply."""
     try:
         live = connected_monitors()
     except (OSError, ValueError, subprocess.SubprocessError):
         return []
     if not live:
         return []
-    if any(not m.get("disabled") for m in live):
+    if any(not m.get("disabled") and m.get("dpmsStatus", True) is not False for m in live):
         return []
     # Emergency recovery: re-enable the first connected monitor so the user is
     # never stranded on a black screen.
     rescue = next((m for m in live if re.match(r"^(eDP|LVDS|DSI)-", m["name"])), live[0])
     rule = f'hl.monitor({{ output = {lua_string(rescue["name"])}, disabled = false, mode = "preferred", position = "auto", scale = "auto", mirror = "" }})'
-    subprocess.run(["hyprctl", "eval", rule], capture_output=True, text=True, timeout=HYPRCTL_TIMEOUT)
-    return [f"No display stayed enabled; restored {rescue['name']} safely"]
+    res = subprocess.run(["hyprctl", "eval", rule], capture_output=True, text=True, timeout=HYPRCTL_TIMEOUT)
+    reply = (res.stdout + res.stderr).strip()
+    if res.returncode != 0 or (reply and reply != "ok"):
+        return [f"No display stayed enabled; emergency restore of {rescue['name']} failed: {reply or res.returncode}"]
+    try:
+        after = connected_monitors()
+        if any(not m.get("disabled") and m.get("dpmsStatus", True) is not False for m in after):
+            return [f"No display stayed enabled; restored {rescue['name']} safely"]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return [f"No display stayed enabled; could not verify recovery of {rescue['name']}"]
 
 
 def apply(outputs: list) -> dict:
@@ -654,29 +701,34 @@ def safe_revert_plan(plan: list, current_monitors: list, lid_is_closed: bool = F
     """Filter a saved revert plan to monitors that are STILL connected right now,
     and guarantee at least one connected display stays enabled & non-mirrored."""
     live_by_name = {m["name"]: m for m in current_monitors if m.get("name")}
+    id_to_name = {str(m["id"]): m["name"] for m in current_monitors if m.get("name") and m.get("id") is not None}
     kept = []
     for raw in plan:
         try:
-            o = validate_output(raw)
+            o = validate_output(raw, allow_preferred_mode=True)
         except (ValueError, TypeError):
             continue
+        if o["mirrorOf"] in id_to_name:
+            o["mirrorOf"] = id_to_name[o["mirrorOf"]]
         if o["name"] in live_by_name:
             kept.append(o)
     if not kept:
-        # Topology changed completely: leave all currently connected monitors on.
+        # Topology changed completely: leave all currently connected monitors on,
+        # allowing `mode = None` ("preferred") if a disabled replacement reports 0x0.
         return [
             validate_output({
                 "name": m["name"],
                 "selector": m["name"],
                 "enabled": True,
                 "autoOff": False,
-                "mode": {"w": m["width"], "h": m["height"], "hz": m["refreshRate"]}
-                if (m.get("width") and m.get("height") and m.get("refreshRate")) else None,
+                "mode": {"w": int(m["width"]), "h": int(m["height"]), "hz": float(m["refreshRate"])}
+                if (int(m.get("width") or 0) > 0 and int(m.get("height") or 0) > 0 and float(m.get("refreshRate") or 0) > 0)
+                else None,
                 "x": m.get("x", 0),
                 "y": m.get("y", 0),
                 "scale": m.get("scale", 1) or 1,
                 "transform": m.get("transform", 0) or 0,
-            })
+            }, allow_preferred_mode=True)
             for m in current_monitors if m.get("name")
         ]
     # Clear any mirror targeting a monitor that is no longer connected/active.
@@ -697,7 +749,7 @@ def safe_revert_plan(plan: list, current_monitors: list, lid_is_closed: bool = F
         chosen["mirrorOf"] = ""
         if chosen["mode"] is None:
             m = live_by_name.get(chosen["name"]) or {}
-            if m.get("width") and m.get("height") and m.get("refreshRate"):
+            if int(m.get("width") or 0) > 0 and int(m.get("height") or 0) > 0 and float(m.get("refreshRate") or 0) > 0:
                 chosen["mode"] = {"w": int(m["width"]), "h": int(m["height"]), "hz": float(m["refreshRate"])}
     return kept
 
@@ -880,15 +932,37 @@ def drop_cached_bus(name: str) -> None:
         pass
 
 
-def ddc_poll(names: list, *, force_refresh: bool = False) -> dict:
+def ddc_poll(names: list, *, force_refresh: bool = False, now: float = None) -> dict:
+    """Read VCP 0x60 for each connector. Never drops a cached bus on a single
+    transient I2C read failure (so the next poll retries the same bus in 5s).
+    Only refreshes `ddcutil detect` when due (>= 60s) or forced."""
     names = [n for n in names if re.fullmatch(r"[A-Za-z0-9._-]+", n)]
-    buses = cached_buses(names, force_refresh=force_refresh)
+    current_time = time.time() if now is None else float(now)
+    buses = cached_buses(names, force_refresh=force_refresh, now=current_time)
     readings = {}
+    failed = []
     for name in names:
         val = ddc_input(buses[name]) if name in buses else None
-        if val is None and name in buses:
-            drop_cached_bus(name)
         readings[name] = val
+        if val is None:
+            failed.append(name)
+    # If any read failed and we haven't refreshed detect in >= 60s, refresh
+    # once and retry those connectors immediately (handles bus renumbering after
+    # dock reconnect without causing a detect storm or blacking out on a single clash).
+    if failed and not force_refresh:
+        path = bus_cache_path()
+        detected_at = 0.0
+        if not path.is_symlink() and path.exists():
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                detected_at = float(raw.get("detectedAt") or 0.0) if isinstance(raw, dict) else 0.0
+            except (OSError, ValueError, TypeError):
+                detected_at = 0.0
+        if (current_time - detected_at) >= DDC_DETECT_MIN_INTERVAL:
+            refreshed = cached_buses(names, force_refresh=True, now=current_time)
+            for name in failed:
+                if name in refreshed and refreshed[name] != buses.get(name):
+                    readings[name] = ddc_input(refreshed[name])
     return readings
 
 
