@@ -9,8 +9,6 @@ The panel and its hotplug service decide what each monitor should do
   revert                    stdin plan -> re-read connected monitors & safely roll back
   persist                   stdin {"plan": [...]?, "memory": {...}?, "removeManagedBlock": bool?}
   ddc-poll NAME...          JSON: each connector's DDC/CI input source code
-  ddc-inputs NAME           JSON: supported VCP 0x60 inputs + current input for NAME
-  ddc-set-input NAME CODE   JSON: switch monitor NAME to VCP 0x60 input CODE
   ddc-relearn NAME FP       JSON: re-read VCP 0x60 for NAME and store under saved FP
   nightlight on KELVIN|off  JSON: control hyprsunset temperature & notify bar
 
@@ -40,7 +38,6 @@ TAKEOVER_HEADER = "-- Monitor rules are managed by the Displays panel in Dicey B
 CATCH_ALL = 'hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" })'
 HYPRCTL_TIMEOUT = 10
 DDC_TIMEOUT = 4
-DDC_CAP_TIMEOUT = 8
 DDC_DETECT_MIN_INTERVAL = 60
 DAY_KELVIN = 6500
 
@@ -60,8 +57,6 @@ MCCS_INPUTS = {
     "0x19": "USB-C-1",
     "0x1b": "USB-C",
 }
-
-DEFAULT_INPUT_CODES = ("0x0f", "0x10", "0x11", "0x12", "0x1b")
 
 
 def home() -> Path:
@@ -824,37 +819,6 @@ def parse_vcp_input(text: str):
     return "0x%02x" % int(match.group(1), 16) if match else None
 
 
-def parse_vcp60_capabilities(text: str) -> list:
-    """Extract supported VCP 0x60 input codes from `ddcutil capabilities`."""
-    lines = (text or "").splitlines()
-    in_60 = False
-    in_values = False
-    seen = []
-    for raw in lines:
-        stripped = raw.strip()
-        if re.match(r"Feature:\s*60\b", stripped, re.IGNORECASE):
-            in_60 = True
-            in_values = False
-            continue
-        if in_60:
-            if re.match(r"Feature:\s*[0-9a-fA-F]{2}\b", stripped, re.IGNORECASE):
-                break
-            if stripped.startswith("Values:"):
-                in_values = True
-                continue
-            if in_values:
-                match = re.match(r"([0-9a-fA-F]{2})\s*:\s*(.*)$", stripped)
-                if match:
-                    code = "0x%02x" % int(match.group(1), 16)
-                    raw_label = match.group(2).strip()
-                    label = MCCS_INPUTS.get(code) or raw_label or f"Input {code.upper()}"
-                    if not any(item["code"] == code for item in seen):
-                        seen.append({"code": code, "label": label})
-                elif stripped and not stripped.startswith("("):
-                    break
-    return seen
-
-
 def ddc_input(bus: str):
     if not re.fullmatch(r"\d+", str(bus or "")):
         return None
@@ -966,49 +930,6 @@ def ddc_poll(names: list, *, force_refresh: bool = False, now: float = None) -> 
     return readings
 
 
-def ddc_inputs(name: str) -> dict:
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
-        raise ValueError(f"invalid monitor name: {name!r}")
-    buses = cached_buses([name], force_refresh=True)
-    bus = buses.get(name)
-    if not bus:
-        return {"ok": False, "name": name, "current": None, "inputs": [], "errors": ["No DDC/CI bus found for display"]}
-    current = ddc_input(bus)
-    inputs = []
-    try:
-        cap = subprocess.run(["ddcutil", "--bus", bus, "--skip-ddc-checks", "capabilities"],
-                             capture_output=True, text=True, timeout=DDC_CAP_TIMEOUT)
-        if cap.returncode == 0:
-            inputs = parse_vcp60_capabilities(cap.stdout)
-    except (OSError, subprocess.SubprocessError):
-        inputs = []
-    if not inputs:
-        inputs = [{"code": c, "label": input_label(c)} for c in DEFAULT_INPUT_CODES]
-    if current and not any(item["code"] == current for item in inputs):
-        inputs.insert(0, {"code": current, "label": input_label(current)})
-    return {"ok": True, "name": name, "current": current, "inputs": inputs}
-
-
-def ddc_set_input(name: str, code: str) -> dict:
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
-        raise ValueError(f"invalid monitor name: {name!r}")
-    if not re.fullmatch(r"0x[0-9a-fA-F]{1,2}", str(code or "")):
-        raise ValueError(f"invalid VCP input code: {code!r}")
-    norm = "0x%02x" % int(code, 16)
-    # Always refresh connector->bus mapping before a write so a dock reconnect
-    # can never switch the wrong monitor's input.
-    buses = cached_buses([name], force_refresh=True)
-    bus = buses.get(name)
-    if not bus:
-        return {"ok": False, "errors": [f"No DDC/CI bus found for {name}"]}
-    result = subprocess.run(["ddcutil", "--bus", bus, "--skip-ddc-checks", "setvcp", "60", norm],
-                            capture_output=True, text=True, timeout=DDC_TIMEOUT)
-    if result.returncode != 0:
-        err = (result.stderr or result.stdout or "").strip() or f"ddcutil setvcp exited {result.returncode}"
-        return {"ok": False, "errors": [err]}
-    return {"ok": True, "name": name, "code": norm, "label": input_label(norm)}
-
-
 def ddc_relearn(name: str, fp: str) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
         raise ValueError(f"invalid monitor name: {name!r}")
@@ -1021,8 +942,9 @@ def ddc_relearn(name: str, fp: str) -> dict:
     if not reading:
         return {"ok": False, "errors": [f"Could not read DDC/CI input for {name}"]}
     profile["ddcInput"] = reading
+    profile["ddcConnector"] = name
     atomic_write(memory_path(), json.dumps(memory, indent=2, sort_keys=True) + "\n", 0o600)
-    return {"ok": True, "ddcInput": reading, "label": input_label(reading), "memory": memory}
+    return {"ok": True, "ddcInput": reading, "ddcConnector": name, "label": input_label(reading), "memory": memory}
 
 
 # ------------------------------------------------------------------ persist
@@ -1048,13 +970,26 @@ def persist(payload: dict) -> dict:
     if memory is not None:
         monitors = memory.get("monitors") if isinstance(memory.get("monitors"), dict) else {}
         if outputs is not None:
-            learn = [o for o in outputs if o["ddcWatch"] and not (monitors.get(o["fp"]) or {}).get("ddcInput")]
+            learn = []
+            for o in outputs:
+                if not o["ddcWatch"]:
+                    continue
+                profile = monitors.get(o["fp"])
+                if not isinstance(profile, dict):
+                    continue
+                saved_input = profile.get("ddcInput")
+                saved_conn = profile.get("ddcConnector")
+                if not saved_input or (saved_conn and saved_conn != o["name"]):
+                    learn.append(o)
+                elif not saved_conn:
+                    profile["ddcConnector"] = o["name"]
             if learn:
                 readings = ddc_poll([o["name"] for o in learn], force_refresh=True)
                 for output in learn:
                     profile = monitors.get(output["fp"])
                     if isinstance(profile, dict) and readings.get(output["name"]):
                         profile["ddcInput"] = readings[output["name"]]
+                        profile["ddcConnector"] = output["name"]
         atomic_write(memory_path(), json.dumps(memory, indent=2, sort_keys=True) + "\n", 0o600)
     return {"ok": True, "monitorsLuaChanged": changed}
 
@@ -1082,14 +1017,6 @@ def main(argv: list) -> int:
             result = persist(payload)
         elif command == "ddc-poll":
             result = ddc_poll(argv[1:])
-        elif command == "ddc-inputs":
-            if len(argv) < 2:
-                raise ValueError("ddc-inputs expects monitor name")
-            result = ddc_inputs(argv[1])
-        elif command == "ddc-set-input":
-            if len(argv) < 3:
-                raise ValueError("ddc-set-input expects monitor name and code")
-            result = ddc_set_input(argv[1], argv[2])
         elif command == "ddc-relearn":
             if len(argv) < 3:
                 raise ValueError("ddc-relearn expects monitor name and fingerprint")

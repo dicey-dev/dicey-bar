@@ -129,7 +129,10 @@ Dicey Bar upgrades the stock `omarchy.monitor` icon into a built-in
 multi-monitor manager (and deduplicates `dicey.displays` if both IDs appear in
 `~/.config/omarchy/shell.json`, so only one display icon sits in the bar).
 
-- Drag displays on the canvas; they snap edge to edge and gaps close.
+- Click the Displays bar icon to open the panel focused on that monitor, or
+  scroll on the icon to step that monitor's brightness directly.
+- Drag displays on the canvas with magnetic edge & H/V center snap guides (hold
+  `Shift` while dragging for 1px free placement); gaps close automatically.
 - Header **Extend / Mirror** toggle when 2+ displays are connected.
 - Pick resolution and refresh rate separately via side-by-side dropdowns, plus
   scale, orientation (`0°`–`270°`), adaptive sync, and HDR (with conditional
@@ -148,11 +151,12 @@ multi-monitor manager (and deduplicates `dicey.displays` if both IDs appear in
   sizing); both are remembered per monitor combination on **Apply** and reverted
   on **Discard**.
 - **Switch away / power off** (external monitors) reads the monitor's input
-  over DDC/CI every 5 seconds, with one-click **Re-learn input** and a
-  **Switch input** picker (`VCP 0x60`). When the monitor shows another input or
-  stops answering, it is turned off and the layout is rearranged without it; it
-  comes back when the monitor returns to this computer's input. This needs
-  `ddcutil` and a monitor with DDC/CI enabled.
+  over DDC/CI every 5 seconds. When the monitor shows another input or stops
+  answering, it is turned off and the layout is rearranged without it; it comes
+  back when the monitor returns to this computer's input. Switching PC ports
+  re-learns the input automatically, and **Re-learn input** covers moving the
+  same cable to another port on the monitor. This needs `ddcutil` and a monitor
+  with DDC/CI enabled.
 - Keyboard shortcuts: `1`–`9` or `←`/`→` select displays, `↑`/`↓` scroll,
   `[`/`]` step brightness, `R` re-probes, `I` identifies, and `Enter` applies.
 - Closing the laptop lid is handled by Omarchy's clamshell guard.
@@ -172,7 +176,7 @@ Omarchy installation with its matching shell imports, Bash, Git and
 `jq`. Configured widgets use Omarchy's normal helper commands; keyboard-layout
 descriptions additionally use `xkbcli` (`libxkbcommon`), recording status uses
 `pgrep` (`procps-ng`), and optional dictation uses Omarchy's Voxtype integration.
-The Displays panel uses `python3` and, for input switching, `ddcutil`.
+The Displays panel uses `python3` and, for switch-away auto-disable, `ddcutil`.
 Only enable helpers you have installed. User-configured custom modules execute
 their configured shell commands with your permissions. No installer/build,
 privileged helper, external service, download or remote build is required.
