@@ -243,9 +243,16 @@ TestCase {
     }
 
     function test_ddc_needs_two_misses_and_recovers_on_its_own_input() {
-        compare(Model.ddcStep(0, "0x0f", "0x11"), { misses: 1, off: false })
-        compare(Model.ddcStep(1, null, "0x11"), { misses: 2, off: true })
-        compare(Model.ddcStep(2, "0x11", "0x11"), { misses: 0, off: false })
+        // Explicit different input: 2 misses -> off
+        compare(Model.ddcStep(0, "0x0f", "0x11"), { misses: 2, off: false })
+        compare(Model.ddcStep(2, "0x0f", "0x11"), { misses: 4, off: true })
+        compare(Model.ddcStep(4, "0x11", "0x11"), { misses: 0, off: false })
+
+        // No reply (e.g. I2C bus contention): requires 4 consecutive misses -> off
+        compare(Model.ddcStep(0, null, "0x11"), { misses: 1, off: false })
+        compare(Model.ddcStep(1, null, "0x11"), { misses: 2, off: false })
+        compare(Model.ddcStep(2, null, "0x11"), { misses: 3, off: false })
+        compare(Model.ddcStep(3, null, "0x11"), { misses: 4, off: true })
     }
 
     function test_remember_keeps_a_learned_input_while_watched() {
@@ -370,6 +377,62 @@ TestCase {
         compare(Model.layoutNightLight(afterForget, docked), null)
         // Unrelated laptop-only layout survives forgetting BenQ
         compare(Model.layoutNightLight(afterForget, undocked), { enabled: false, kelvin: 4000 })
+    }
+
+    function test_desc_prefix_collision_falls_back_to_connector_names() {
+        var m1 = monitor("DP-1", "ACME", "Pro", "1", 1920, 1080, 60, 0, 0)
+        var m2 = monitor("DP-2", "ACME", "Pro", "10", 1920, 1080, 60, 1920, 0)
+        var ids = Model.identify([m1, m2])
+        // "ACME Pro 1" is a prefix of "ACME Pro 10" — Hyprland desc: would match both!
+        compare(ids[0].selector, "DP-1")
+        compare(ids[1].selector, "DP-2")
+    }
+
+    function test_unprofiled_monitor_preserves_live_mode_and_flags_on_hotplug() {
+        var tv = monitor("HDMI-A-2", "SONY", "TV", "TV1", 3840, 2160, 60, 1920, 0, {
+            vrr: true,
+            colorManagementPreset: "hdr",
+            hdrCapable: true,
+            availableModes: ["4096x2160@60.00Hz", "3840x2160@60.00Hz", "1920x1080@120.00Hz"]
+        })
+        var existingMemory = Model.remember({}, Model.derive([laptop()], {}, {}), "t1")
+        var plan = Model.derive([laptop(), tv], existingMemory, {})
+        var tvPlan = byName(plan, "HDMI-A-2")
+        // Never force 4096x2160 or strip VRR/HDR on a display the user hasn't configured
+        compare(tvPlan.mode, { w: 3840, h: 2160, hz: 60 })
+        compare(tvPlan.vrr, 1)
+        compare(tvPlan.hdr, true)
+    }
+
+    function test_lid_closed_never_auto_offs_last_external_monitor() {
+        var plan = Model.derive([laptop(), benq()], {}, {})
+        var fp = byName(plan, "HDMI-A-1").fp
+        var off = Model.autoOffFor(plan, true, { [fp]: true })
+        compare(off["LG Display|0x0753|"], "lid")
+        compare(off[fp], undefined)
+    }
+
+    function test_remember_keeps_existing_night_light_when_not_edited() {
+        var docked = Model.derive([laptop(), benq()], {}, {})
+        var memory = Model.remember({}, docked, "t1", {
+            textSize: 12,
+            nightLight: { enabled: true, kelvin: 3200 }
+        })
+        // Re-applying without options.nightLight or options.textSize preserves prior values
+        var memory2 = Model.remember(memory, docked, "t2", {})
+        compare(Model.layoutTextSize(memory2, docked), 12)
+        compare(Model.layoutNightLight(memory2, docked), { enabled: true, kelvin: 3200 })
+    }
+
+    function test_ensure_enabled_mode_recovers_zero_mode_disabled_monitor() {
+        var off = benq()
+        off.disabled = true
+        off.width = 0
+        off.height = 0
+        off.refreshRate = 0
+        var live = Model.planFromLive([laptop(), off], {})
+        var recovered = Model.ensureEnabledMode(byName(live, "HDMI-A-1"), off.availableModes, null)
+        compare(recovered, { w: 2560, h: 1440, hz: 100 })
     }
 }
 """
