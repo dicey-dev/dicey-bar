@@ -10,7 +10,7 @@ import "DisplayModel.js" as Model
 // Unified Displays bar widget (replaces stock `omarchy.monitor` and answers
 // `dicey.displays`). Per-monitor settings (position, resolution, refresh rate,
 // scale, orientation, adaptive sync, HDR + SDR tuning, brightness, DDC/CI
-// input watch/switching) are scoped to the selected monitor; OS-wide controls
+// input watch) are scoped to the selected monitor; OS-wide controls
 // (text size and night light) sit in a dedicated All Displays card with a
 // separating bar so their scope is never ambiguous.
 Panel {
@@ -47,13 +47,6 @@ Panel {
   // confirmation rollback undo hardware brightness changes cleanly.
   property var openedBrightness: ({})
   property bool brightnessEdited: false
-
-  // Per-monitor DDC/CI input probing state (lazy-loaded on click).
-  property string ddcProbeFor: ""
-  property bool ddcProbing: false
-  property string ddcCurrentInput: ""
-  property var ddcAvailableInputs: []
-  property string ddcProbeError: ""
 
   function monitorByName(name) {
     for (var i = 0; i < liveMonitors.length; i++)
@@ -352,41 +345,6 @@ Panel {
     })
   }
 
-  function probeSelectedInputs() {
-    if (!service || !current || ddcProbing) return
-    var name = current.name
-    ddcProbeFor = name
-    ddcProbing = true
-    ddcProbeError = ""
-    ddcAvailableInputs = []
-    ddcCurrentInput = ""
-    service.probeDdcInputs(name, function(ok, data) {
-      if (root.ddcProbeFor !== name) return
-      root.ddcProbing = false
-      if (ok && data) {
-        root.ddcCurrentInput = String(data.current || "")
-        root.ddcAvailableInputs = Array.isArray(data.inputs) ? data.inputs : []
-        root.ddcProbeError = ""
-      } else {
-        root.ddcProbeError = (data && data.error) ? data.error : "No DDC/CI inputs reported"
-      }
-    })
-  }
-
-  function switchSelectedInput(code, label) {
-    if (!service || !current) return
-    var name = current.name
-    showNotice("Switching " + name + " to " + label + "…")
-    service.setDdcInput(name, code, function(ok, data) {
-      if (ok) {
-        root.ddcCurrentInput = code
-        showNotice("Switched " + name + " to " + label)
-      } else {
-        showNotice((data && data.error) ? data.error : ("Failed to switch " + name))
-      }
-    })
-  }
-
   function canTurnOff(index) {
     var o = draft[index]
     if (!o) return false
@@ -525,11 +483,6 @@ Panel {
     openedBrightness = ({})
     brightnessEdited = false
     noticeText = ""
-    ddcProbeFor = ""
-    ddcProbing = false
-    ddcAvailableInputs = []
-    ddcCurrentInput = ""
-    ddcProbeError = ""
     syncNightLightFromService()
     resetDraft()
     pendingHostSelect = !selectHostDisplay()
@@ -537,11 +490,6 @@ Panel {
     readBrightness()
   }
   onSelectedChanged: {
-    ddcProbeFor = ""
-    ddcProbing = false
-    ddcAvailableInputs = []
-    ddcCurrentInput = ""
-    ddcProbeError = ""
     readBrightness()
   }
 
@@ -1762,7 +1710,7 @@ Panel {
 
                 Rectangle { width: parent.width; height: 1; color: root.hairline }
 
-                // Per-monitor Auto-Disable & DDC/CI Input Switcher
+                // Per-monitor Auto-Disable
                 Column {
                   width: parent.width
                   spacing: Style.space(6)
@@ -1770,7 +1718,7 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: "AUTO-DISABLE & INPUT"
+                    text: "AUTO-DISABLE"
                     color: root.muted
                     font.family: root.fontName
                     font.pixelSize: Math.max(9, Style.font.caption - 1)
@@ -1778,7 +1726,7 @@ Panel {
                     font.letterSpacing: 1.0
                   }
 
-                  // External display: DDC/CI input watch + Re-learn + Input switcher
+                  // External display: DDC/CI input watch + Re-learn fallback
                   Column {
                     width: parent.width
                     visible: !!root.current && !root.current.internal
@@ -1833,48 +1781,25 @@ Panel {
                       }
                     }
 
-                    Row {
-                      spacing: Style.space(6)
+                    Column {
+                      width: parent.width
+                      visible: root.currentSavedDdcWatch
+                      spacing: Style.space(4)
 
                       TinyChipButton {
-                        visible: root.currentSavedDdcWatch
                         text: "Re-learn input"
                         onClicked: root.relearnSelectedDdc()
                       }
 
-                      TinyChipButton {
-                        text: root.ddcProbing ? "Probing…" : (root.ddcAvailableInputs.length ? "Refresh inputs" : "Switch input")
-                        accented: root.ddcAvailableInputs.length > 0
-                        onClicked: root.probeSelectedInputs()
+                      Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        wrapMode: Text.Wrap
+                        text: "Auto-updates if you switch PC ports. Click only if you moved this cable to another port on the monitor."
+                        color: root.muted
+                        font.family: root.fontName
+                        font.pixelSize: Math.max(9, Style.font.caption - 1)
                       }
-                    }
-
-                    Flow {
-                      width: parent.width
-                      visible: root.ddcAvailableInputs.length > 0
-                      spacing: Style.space(4)
-
-                      Repeater {
-                        model: root.ddcAvailableInputs
-
-                        TinyChipButton {
-                          required property var modelData
-                          text: String(modelData.label || modelData.code)
-                          accented: root.ddcCurrentInput !== "" && String(modelData.code).toLowerCase() === root.ddcCurrentInput.toLowerCase()
-                          onClicked: root.switchSelectedInput(String(modelData.code), String(modelData.label || modelData.code))
-                        }
-                      }
-                    }
-
-                    Text {
-                      visible: root.ddcProbeError !== ""
-                      width: parent.width
-                      textFormat: Text.PlainText
-                      wrapMode: Text.Wrap
-                      text: root.ddcProbeError
-                      color: root.alertColor
-                      font.family: root.fontName
-                      font.pixelSize: Math.max(9, Style.font.caption - 1)
                     }
                   }
 
@@ -2356,6 +2281,7 @@ Panel {
     property var dragBounds: null
     property var dragRect: null
     property var activeSnap: null
+    property bool shiftFreeMove: false
 
     readonly property var view: dragBounds ? viewForBounds(dragBounds) : viewFor(root.draft)
 
@@ -2602,6 +2528,7 @@ Panel {
                 canvas.dragBounds = canvas.boundsFor(root.draft)
                 canvas.dragRect = start
                 canvas.activeSnap = null
+                canvas.shiftFreeMove = !!(mouse.modifiers & Qt.ShiftModifier)
                 canvas.dragIndex = tile.index
               }
               onPositionChanged: function(mouse) {
@@ -2616,7 +2543,9 @@ Panel {
                 }
                 // Hold Shift to disable magnetic snapping for 1px fine positioning;
                 // otherwise snap cleanly within 8px on-screen toward edges & H/V centers.
-                var snapThreshold = (mouse.modifiers & Qt.ShiftModifier) ? 0 : (Style.space(8) / v.k)
+                var shiftHeld = !!(mouse.modifiers & Qt.ShiftModifier)
+                canvas.shiftFreeMove = shiftHeld
+                var snapThreshold = shiftHeld ? 0 : (Style.space(8) / v.k)
                 var res = Model.attachWithGuides(wanted, canvas.others(tile.index), snapThreshold)
                 canvas.dragRect = res.rect
                 canvas.activeSnap = res.snap
@@ -2631,6 +2560,7 @@ Panel {
                 canvas.dragRect = null
                 canvas.activeSnap = null
                 canvas.dragBounds = null
+                canvas.shiftFreeMove = false
                 start = null
                 if (!moved) return
                 var next = root.draft.map(root.copyOutput)
@@ -2644,6 +2574,7 @@ Panel {
                 canvas.dragRect = null
                 canvas.activeSnap = null
                 canvas.dragBounds = null
+                canvas.shiftFreeMove = false
                 start = null
               }
             }
@@ -2668,9 +2599,11 @@ Panel {
         anchors.rightMargin: Style.space(8)
         textFormat: Text.PlainText
         text: canvas.dragIndex >= 0
-          ? (canvas.activeSnap ? (canvas.activeSnap.label + " · hold Shift for free move") : "Drag to place · hold Shift for free move")
-          : "Drag tiles · 1-9 select · ←/→ switch · Enter apply"
-        color: canvas.dragIndex >= 0 && canvas.activeSnap ? root.accent : root.muted
+          ? (canvas.shiftFreeMove
+              ? "Free placement (Shift held)"
+              : (canvas.activeSnap ? (canvas.activeSnap.label + " · hold Shift for free move") : "Drag to place · hold Shift for free move"))
+          : "Drag tiles (Shift free) · 1-9 select · ←/→ switch · Enter apply"
+        color: canvas.dragIndex >= 0 && (canvas.activeSnap || canvas.shiftFreeMove) ? root.accent : root.muted
         font.family: root.fontName
         font.pixelSize: Math.max(9, Style.font.caption - 1)
         elide: Text.ElideRight

@@ -958,7 +958,10 @@ function remember(memory, plan, now, options) {
       if (mem.monitors[o.fp]) {
         if (o.ddcWatch !== (previous.ddcWatch === true)) {
           mem.monitors[o.fp].ddcWatch = o.ddcWatch === true
-          if (!o.ddcWatch) delete mem.monitors[o.fp].ddcInput
+          if (!o.ddcWatch) {
+            delete mem.monitors[o.fp].ddcInput
+            delete mem.monitors[o.fp].ddcConnector
+          }
         }
         continue
       }
@@ -978,8 +981,12 @@ function remember(memory, plan, now, options) {
     var brightness = cleanBrightness(o.brightness !== null && o.brightness !== undefined ? o.brightness : previous.brightness)
     if (brightness !== null) profile.brightness = brightness
     // The input a watched monitor is expected on is learned when the watch is
-    // switched on, and kept while it stays on.
-    if (profile.ddcWatch && previous.ddcWatch && previous.ddcInput) profile.ddcInput = previous.ddcInput
+    // switched on, and kept while it stays on. Also keep the PC connector name
+    // so moving the monitor to a different PC port auto-relearns its input.
+    if (profile.ddcWatch && previous.ddcWatch && previous.ddcInput) {
+      profile.ddcInput = previous.ddcInput
+      if (previous.ddcConnector) profile.ddcConnector = previous.ddcConnector
+    }
     var neighbour = o.enabled && !o.autoOff && !o.mirrorOf ? neighbourOf(o, members) : null
     if (neighbour) profile.lastNeighbour = neighbour
     else if (previous.lastNeighbour) profile.lastNeighbour = previous.lastNeighbour

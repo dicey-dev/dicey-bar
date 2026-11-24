@@ -281,21 +281,7 @@ Invalid display
         self.assertEqual(ctl.parse_vcp_input("VCP 60 SNC x0F"), "0x0f")
         self.assertIsNone(ctl.parse_vcp_input("VCP 60 ERR"))
 
-    def test_ddc_capabilities_and_nightlight_parsers(self):
-        caps = """VCP Features:
-   Feature: 10 (Brightness)
-   Feature: 60 (Input Source)
-      Values:
-         0f: DisplayPort-1
-         11: HDMI-1
-         12: HDMI-2
-   Feature: 62 (Audio speaker volume)
-"""
-        self.assertEqual(ctl.parse_vcp60_capabilities(caps), [
-            {"code": "0x0f", "label": "DP-1"},
-            {"code": "0x11", "label": "HDMI-1"},
-            {"code": "0x12", "label": "HDMI-2"},
-        ])
+    def test_nightlight_parser(self):
         self.assertEqual(ctl.parse_hyprsunset_temp("4000\n"), 4000)
         self.assertIsNone(ctl.parse_hyprsunset_temp("Couldn't connect"))
 
@@ -329,6 +315,7 @@ class PersistTest(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertEqual(result["ddcInput"], "0x0f")
             self.assertEqual(saved["monitors"][fp]["ddcInput"], "0x0f")
+            self.assertEqual(saved["monitors"][fp]["ddcConnector"], "HDMI-A-1")
 
     def test_cached_buses_rate_limits_detect_for_powered_off_monitor(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -378,15 +365,24 @@ class PersistTest(unittest.TestCase):
             plan = [dict(output(ddcWatch=True))]
             memory = {"version": 1, "monitors": {fp: {"ddcWatch": True}}, "layouts": {}}
             with mock.patch.dict(os.environ, env), \
-                    mock.patch.object(ctl, "ddc_poll", return_value={"HDMI-A-1": "0x11"}) as poll:
+                    mock.patch.object(ctl, "ddc_poll", side_effect=[{"HDMI-A-1": "0x11"}, {"DP-1": "0x0f"}]) as poll:
                 result = ctl.persist({"plan": plan, "memory": memory})
                 saved = json.loads((Path(tmp) / "state" / "dicey-bar" / "displays.json").read_text())
+                self.assertEqual(saved["monitors"][fp]["ddcInput"], "0x11")
+                self.assertEqual(saved["monitors"][fp]["ddcConnector"], "HDMI-A-1")
                 poll.assert_called_once_with(["HDMI-A-1"], force_refresh=True)
-                # Already learned: no second read.
+                # Already learned on same connector: no second read.
                 ctl.persist({"plan": plan, "memory": saved})
-                poll.assert_called_once()
+                self.assertEqual(poll.call_count, 1)
+                # Same monitor moved to a different PC port (DP-1): auto-relearns input!
+                moved_plan = [dict(output(name="DP-1", ddcWatch=True))]
+                ctl.persist({"plan": moved_plan, "memory": saved})
+                saved_moved = json.loads((Path(tmp) / "state" / "dicey-bar" / "displays.json").read_text())
+                self.assertEqual(poll.call_count, 2)
+                poll.assert_called_with(["DP-1"], force_refresh=True)
             self.assertTrue(result["monitorsLuaChanged"])
-            self.assertEqual(saved["monitors"][fp]["ddcInput"], "0x11")
+            self.assertEqual(saved_moved["monitors"][fp]["ddcInput"], "0x0f")
+            self.assertEqual(saved_moved["monitors"][fp]["ddcConnector"], "DP-1")
             self.assertEqual(oct((Path(tmp) / "state" / "dicey-bar" / "displays.json").stat().st_mode & 0o777), "0o600")
             self.assertIn(ctl.BEGIN, lua.read_text())
 

@@ -39,6 +39,9 @@ Item {
   // keyed by fingerprint, and the consecutive DDC misses behind that.
   property var ddcOff: ({})
   property var ddcMisses: ({})
+  // Tracks auto-relearn attempts keyed by "<fp>@<connector>" so a connector
+  // swap triggers one automatic re-learn without looping if DDC fails.
+  property var autoRelearnAttempted: ({})
 
   // Modes Hyprland did not take on the last apply, usually link bandwidth.
   property var fallbacks: []
@@ -172,10 +175,17 @@ Item {
     for (var i = 0; i < livePlan.length; i++) present[livePlan[i].fp] = true
     var off = {}
     var misses = {}
+    var attempted = {}
     for (var fp in ddcOff) if (present[fp]) off[fp] = ddcOff[fp]
     for (var mp in ddcMisses) if (present[mp]) misses[mp] = ddcMisses[mp]
+    for (var ak in autoRelearnAttempted) {
+      var sep = ak.lastIndexOf("@")
+      var afp = sep > 0 ? ak.slice(0, sep) : ak
+      if (present[afp]) attempted[ak] = autoRelearnAttempted[ak]
+    }
     ddcOff = off
     ddcMisses = misses
+    autoRelearnAttempted = attempted
   }
 
   // ---------------------------------------------------------------- unified brightness & text-size queues
@@ -367,29 +377,22 @@ Item {
     })
   }
 
-  function probeDdcInputs(name, done) {
-    if (!name) return
-    run(["ddc-inputs", name], null, function(code, data, stderr) {
-      if (code === 0 && data && data.ok) {
-        if (done) done(true, data)
-      } else {
-        if (done) done(false, { error: service.errorText(data, stderr) })
+  function autoRelearnMovedConnectors(plan) {
+    if (!Array.isArray(plan) || !memory || !memory.monitors) return
+    for (var i = 0; i < plan.length; i++) {
+      var o = plan[i]
+      if (!o || o.internal || !o.enabled || o.autoOff) continue
+      var profile = memory.monitors[o.fp]
+      if (!profile || !profile.ddcWatch) continue
+      if (profile.ddcConnector && profile.ddcConnector !== o.name) {
+        var attemptKey = o.fp + "@" + o.name
+        if (autoRelearnAttempted[attemptKey]) continue
+        var nextAttempted = Object.assign({}, autoRelearnAttempted)
+        nextAttempted[attemptKey] = true
+        autoRelearnAttempted = nextAttempted
+        relearnDdcInput(o.name, o.fp, null)
       }
-    })
-  }
-
-  function setDdcInput(name, codeHex, done) {
-    if (!name || !codeHex) return
-    run(["ddc-set-input", name, codeHex], null, function(code, data, stderr) {
-      if (code === 0 && data && data.ok) {
-        service.lastError = ""
-        if (done) done(true, data)
-      } else {
-        var err = service.errorText(data, stderr)
-        service.lastError = err
-        if (done) done(false, { error: err })
-      }
-    })
+    }
   }
 
   // ---------------------------------------------------------------- automatic
@@ -411,6 +414,7 @@ Item {
         lastPrefsTopology = topo
         applyMonitorPreferences(plan, memory, true)
       }
+      autoRelearnMovedConnectors(plan)
       return
     }
     var signature = JSON.stringify(plan)
@@ -423,6 +427,7 @@ Item {
       if (code === 0) {
         service.lastPrefsTopology = topo
         service.applyMonitorPreferences(plan, service.memory, true)
+        service.autoRelearnMovedConnectors(plan)
         service.run(["persist"], JSON.stringify({ plan: plan }), null)
       }
       service.refresh()
@@ -465,7 +470,10 @@ Item {
     for (var i = 0; i < livePlan.length; i++) {
       var o = livePlan[i]
       var profile = mem.monitors[o.fp]
-      if (!o.internal && profile && profile.ddcWatch && profile.ddcInput) out.push({ name: o.name, fp: o.fp, input: profile.ddcInput })
+      // Wait for connector-change auto-relearn before polling against an old connector's input.
+      if (!o.internal && profile && profile.ddcWatch && profile.ddcInput
+          && (!profile.ddcConnector || profile.ddcConnector === o.name))
+        out.push({ name: o.name, fp: o.fp, input: profile.ddcInput })
     }
     return out
   }
