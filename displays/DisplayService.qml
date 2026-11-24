@@ -71,9 +71,14 @@ Item {
   // Emitted on confirmed serialized brightness read/step/set for a monitor.
   // source: "read" | "step" | "set"; prevPct: prior known brightness (or 0).
   signal brightnessUpdated(string monitorName, int pct, string source, int prevPct)
+  // Emitted synchronously when a scroll step is queued so open panels track the edit immediately.
+  signal brightnessStepQueued(string monitorName)
   // Emitted when a pre-write baseline read finishes (even if a write was queued after it).
   signal brightnessBaseline(string monitorName, int pct)
   signal brightnessReadFailed(string monitorName)
+  // Emitted when a panel Apply commits or rolls back so open panels advance or restore baselines cleanly.
+  signal panelApplyCommitted()
+  signal panelApplyReverted(var revertedSnap)
 
   // ---------------------------------------------------------------- jobs
   // Helper calls run one at a time, in order. `runFront` prioritizes safety
@@ -345,8 +350,16 @@ Item {
     if (!res.gen) return false
     brightnessGen = res.gens
     brightnessQueue = res.queue
+    brightnessStepQueued(String(name || "").trim())
     pumpBrightness()
     return true
+  }
+
+  function discardBrightnessPreviews(restoreMap) {
+    var res = Model.brightnessQueueDiscard(brightnessQueue, brightnessGen, activeBrightnessJob, restoreMap)
+    brightnessGen = res.gens
+    brightnessQueue = res.queue
+    pumpBrightness()
   }
 
   function setAllBrightness(pct, outputs) {
@@ -405,7 +418,11 @@ Item {
 
   // ---------------------------------------------------------------- memory & DDC actions
   function forgetMonitor(fp, done) {
-    if (!fp || confirming) return
+    if (!fp || confirming || applyInFlight) return
+    // Invalidate and abort any in-flight/queued DDC probe before persisting
+    // the Forget so a slow probe can never resurrect the deleted profile.
+    relearnEpoch = relearnEpoch + 1
+    cancelQueuedAutoRelearn()
     var nextMemory = Model.forgetMonitor(memory, fp)
     var off = {}
     var misses = {}
@@ -422,7 +439,9 @@ Item {
     } else if (livePlan.length) {
       payload.plan = livePlan
     }
+    persistInFlight = true
     run(["persist"], JSON.stringify(payload), function(code, data, stderr) {
+      service.persistInFlight = false
       if (code === 0) {
         service.memory = nextMemory
         service.lastError = ""
@@ -435,31 +454,35 @@ Item {
     })
   }
 
-  function relearnDdcInput(name, fp, done, silentError) {
-    if (!name || !fp || confirming) return
-    run(["ddc-relearn", name, fp], null, function(code, data, stderr) {
-      if (code === 0 && data && data.ok) {
-        if (data.memory) service.memory = Model.normalizeMemory(data.memory)
-        var off = {}
-        var misses = {}
-        for (var k in service.ddcOff) if (k !== fp) off[k] = service.ddcOff[k]
-        for (var m in service.ddcMisses) if (m !== fp) misses[m] = service.ddcMisses[m]
-        service.ddcOff = off
-        service.ddcMisses = misses
-        if (!silentError) service.lastError = ""
-        if (done) done(true, data)
-      } else {
-        var err = service.errorText(data, stderr)
-        if (!silentError) service.lastError = err
-        if (done) done(false, { error: err })
-      }
-    })
-  }
-
-  // Dedicated Process for automatic background DDC re-learning so slow I2C
-  // detection/reads can NEVER block Apply, Keep, or safety Revert on `helper`.
+  // Dedicated read-only DDC probe Process for BOTH manual and automatic
+  // re-learning. Slow I2C probes run here (never on `helper`) so they can
+  // never block Apply, Keep, or safety Revert; only the fast, serialized
+  // `ddc-save` write touches displays.json after validating current state.
   property var autoRelearnQueue: []
   property var activeAutoRelearn: null
+  property int relearnEpoch: 0
+
+  function relearnDdcInput(name, fp, done) {
+    if (!name || !fp) return
+    if (confirming || applyInFlight || persistInFlight) {
+      var busyErr = "Wait for pending display changes to finish first"
+      if (done) done(false, { error: busyErr })
+      return
+    }
+    if (!hasSavedDdcWatch(fp)) {
+      if (done) done(false, { error: "Apply Auto-Disable first before re-learning input" })
+      return
+    }
+    autoRelearnQueue = autoRelearnQueue.concat([{
+      name: name,
+      fp: fp,
+      manual: true,
+      epoch: relearnEpoch,
+      wasOff: !!(ddcOff && ddcOff[fp]),
+      done: done || null
+    }])
+    pumpAutoRelearn()
+  }
 
   Process {
     id: ddcRelearnProc
@@ -467,33 +490,56 @@ Item {
     onExited: function(exitCode) {
       var job = service.activeAutoRelearn
       service.activeAutoRelearn = null
-      var ok = false
-      var data = null
+      var reading = ""
       if (exitCode === 0) {
         try {
-          data = JSON.parse(String(ddcRelearnOut.text || "null"))
-          ok = !!(data && data.ok)
+          var parsed = JSON.parse(String(ddcRelearnOut.text || "null"))
+          if (parsed && job && parsed[job.name]) reading = String(parsed[job.name])
         } catch (e) {
-          data = null
+          reading = ""
         }
       }
       if (job) {
-        if (job.cancelled) {
-          service.autoRelearnState = Model.ddcRelearnCancelQueued(service.autoRelearnState, [job.fp])
+        var invalidated = job.cancelled || job.epoch !== service.relearnEpoch
+          || service.confirming || service.applyInFlight || service.persistInFlight
+          || !service.hasSavedDdcWatch(job.fp)
+        if (invalidated) {
+          if (!job.manual) {
+            service.autoRelearnState = Model.ddcRelearnCancelQueued(service.autoRelearnState, [job.fp])
+          }
+          if (job.done) job.done(false, { error: "Cancelled while display changes were in progress" })
+        } else if (!reading) {
+          var readErr = "Could not read DDC/CI input for " + job.name
+          if (job.manual) service.lastError = readErr
+          else service.autoRelearnState = Model.ddcRelearnFinish(service.autoRelearnState, job.fp, job.name, false, Date.now())
+          if (job.done) job.done(false, { error: readErr })
         } else {
-          if (ok && data && data.memory) {
-            service.memory = Model.normalizeMemory(data.memory)
-            var off = {}
-            var misses = {}
-            for (var k in service.ddcOff) if (k !== job.fp) off[k] = service.ddcOff[k]
-            for (var m in service.ddcMisses) if (m !== job.fp) misses[m] = service.ddcMisses[m]
-            service.ddcOff = off
-            service.ddcMisses = misses
-          }
-          service.autoRelearnState = Model.ddcRelearnFinish(service.autoRelearnState, job.fp, job.name, ok, Date.now())
-          if (ok && job.wasOff && !service.confirming && !service.applyInFlight) {
-            service.refresh(service.reconcile)
-          }
+          // Fast, serialized memory update on `helper`; re-checks ddcWatch on disk.
+          ;(function(savedJob, codeHex) {
+            service.run(["ddc-save", savedJob.name, savedJob.fp, codeHex], null, function(code, data, stderr) {
+              var ok = code === 0 && data && data.ok
+              if (ok) {
+                if (data.memory) service.memory = Model.normalizeMemory(data.memory)
+                var off = {}
+                var misses = {}
+                for (var k in service.ddcOff) if (k !== savedJob.fp) off[k] = service.ddcOff[k]
+                for (var m in service.ddcMisses) if (m !== savedJob.fp) misses[m] = service.ddcMisses[m]
+                service.ddcOff = off
+                service.ddcMisses = misses
+                if (savedJob.manual) service.lastError = ""
+                else service.autoRelearnState = Model.ddcRelearnFinish(service.autoRelearnState, savedJob.fp, savedJob.name, true, Date.now())
+                if (savedJob.done) savedJob.done(true, data)
+                if (savedJob.wasOff && !service.confirming && !service.applyInFlight) {
+                  service.refresh(service.reconcile)
+                }
+              } else {
+                var err = service.errorText(data, stderr)
+                if (savedJob.manual) service.lastError = err
+                else service.autoRelearnState = Model.ddcRelearnFinish(service.autoRelearnState, savedJob.fp, savedJob.name, false, Date.now())
+                if (savedJob.done) savedJob.done(false, { error: err })
+              }
+            })
+          })(job, reading)
         }
       }
       Qt.callLater(service.pumpAutoRelearn)
@@ -501,11 +547,16 @@ Item {
   }
 
   function cancelQueuedAutoRelearn() {
-    var fps = autoRelearnQueue.map(function(j) { return j.fp })
+    var queued = autoRelearnQueue
     autoRelearnQueue = []
+    var fps = []
+    for (var i = 0; i < queued.length; i++) {
+      if (!queued[i].manual) fps.push(queued[i].fp)
+      if (queued[i].done) queued[i].done(false, { error: "Cancelled while display changes were in progress" })
+    }
     if (activeAutoRelearn && ddcRelearnProc.running) {
       activeAutoRelearn.cancelled = true
-      fps.push(activeAutoRelearn.fp)
+      if (!activeAutoRelearn.manual) fps.push(activeAutoRelearn.fp)
       ddcRelearnProc.running = false
     }
     if (fps.length) autoRelearnState = Model.ddcRelearnCancelQueued(autoRelearnState, fps)
@@ -513,18 +564,24 @@ Item {
 
   function pumpAutoRelearn() {
     if (ddcRelearnProc.running || autoRelearnQueue.length === 0) return
-    if (isDevInstance || confirming || applyInFlight || persistInFlight) {
+    if (confirming || applyInFlight || persistInFlight) {
       cancelQueuedAutoRelearn()
       return
     }
     var job = autoRelearnQueue[0]
     autoRelearnQueue = autoRelearnQueue.slice(1)
+    if (!job.manual && isDevInstance) {
+      autoRelearnState = Model.ddcRelearnCancelQueued(autoRelearnState, [job.fp])
+      Qt.callLater(service.pumpAutoRelearn)
+      return
+    }
     activeAutoRelearn = job
-    ddcRelearnProc.command = ["python3", "-I", service.helperPath, "ddc-relearn", job.name, job.fp]
+    ddcRelearnProc.command = ["python3", "-I", service.helperPath, "ddc-poll", "--fresh", job.name]
     ddcRelearnProc.running = true
     if (!ddcRelearnProc.running) {
       activeAutoRelearn = null
-      autoRelearnState = Model.ddcRelearnFinish(autoRelearnState, job.fp, job.name, false, Date.now())
+      if (!job.manual) autoRelearnState = Model.ddcRelearnFinish(autoRelearnState, job.fp, job.name, false, Date.now())
+      if (job.done) job.done(false, { error: "Failed to start DDC probe" })
       Qt.callLater(service.pumpAutoRelearn)
     }
   }
@@ -545,7 +602,10 @@ Item {
       autoRelearnQueue = autoRelearnQueue.concat([{
         name: o.name,
         fp: o.fp,
-        wasOff: !!(service.ddcOff && service.ddcOff[o.fp])
+        manual: false,
+        epoch: relearnEpoch,
+        wasOff: !!(service.ddcOff && service.ddcOff[o.fp]),
+        done: null
       }])
     }
     pumpAutoRelearn()
@@ -708,6 +768,7 @@ Item {
   // any previewed OS-wide preferences if rejected or timed out.
   function applyFromPanel(plan, options, revertSnapshot) {
     if (confirming || applyInFlight || !plan || !plan.length) return
+    relearnEpoch = relearnEpoch + 1
     cancelQueuedAutoRelearn()
     applyInFlight = true
     var before = livePlan
@@ -719,6 +780,7 @@ Item {
       if (code !== 0) {
         service.lastError = service.errorText(data, stderr)
         service.restorePreviewPrefs(revertSnapshot)
+        service.panelApplyReverted(revertSnapshot)
         service.runFront(["revert"], JSON.stringify(before), function() { service.refresh() })
         return
       }
@@ -756,6 +818,7 @@ Item {
     var nextMemory = Model.remember(memory, plan, new Date().toISOString(), options)
     lastPrefsTopology = topologySignature(plan)
     persistInFlight = true
+    relearnEpoch = relearnEpoch + 1
     cancelQueuedAutoRelearn()
     run(["persist"], JSON.stringify({ plan: plan, memory: nextMemory }), function(code, data, stderr) {
       service.persistInFlight = false
@@ -763,6 +826,7 @@ Item {
         service.memory = nextMemory
         service.lastError = ""
         service.applyMonitorPreferences(plan, nextMemory, false)
+        service.panelApplyCommitted()
       } else {
         service.lastError = service.errorText(data, stderr)
       }
@@ -785,6 +849,7 @@ Item {
     if (!confirming) return
     confirmTimer.stop()
     confirming = false
+    relearnEpoch = relearnEpoch + 1
     cancelQueuedAutoRelearn()
     var previous = revertPlan
     var snap = revertPrefs
@@ -792,6 +857,7 @@ Item {
     revertPlan = null
     revertPrefs = null
     restorePreviewPrefs(snap)
+    panelApplyReverted(snap)
     // Uses `runFront` + `revert` so safety rollback jumps ahead of any queued
     // refresh/nightlight job and never disables the last connected display.
     if (previous) runFront(["revert"], JSON.stringify(previous), function() { service.refresh() })

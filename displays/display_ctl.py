@@ -8,7 +8,8 @@ The panel and its hotplug service decide what each monitor should do
   apply                     stdin plan -> live `hyprctl eval`, then read back
   revert                    stdin plan -> re-read connected monitors & safely roll back
   persist                   stdin {"plan": [...]?, "memory": {...}?, "removeManagedBlock": bool?}
-  ddc-poll NAME...          JSON: each connector's DDC/CI input source code
+  ddc-poll [--fresh] NAME... JSON: each connector's DDC/CI input source code
+  ddc-save NAME FP CODE     JSON: save learned VCP 0x60 code if FP is still watched
   ddc-relearn NAME FP       JSON: re-read VCP 0x60 for NAME and store under saved FP
   nightlight on KELVIN|off  JSON: control hyprsunset temperature & notify bar
 
@@ -930,6 +931,23 @@ def ddc_poll(names: list, *, force_refresh: bool = False, now: float = None) -> 
     return readings
 
 
+def ddc_save(name: str, fp: str, code: str) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
+        raise ValueError(f"invalid monitor name: {name!r}")
+    if not re.fullmatch(r"0x[0-9a-fA-F]{1,2}", str(code or "")):
+        raise ValueError(f"invalid VCP input code: {code!r}")
+    norm = "0x%02x" % int(code, 16)
+    memory = load_memory()
+    monitors = memory.get("monitors") if isinstance(memory.get("monitors"), dict) else {}
+    profile = monitors.get(fp)
+    if not isinstance(profile, dict) or not profile.get("ddcWatch"):
+        return {"ok": False, "errors": ["Apply Auto-Disable first before re-learning input"]}
+    profile["ddcInput"] = norm
+    profile["ddcConnector"] = name
+    atomic_write(memory_path(), json.dumps(memory, indent=2, sort_keys=True) + "\n", 0o600)
+    return {"ok": True, "ddcInput": norm, "ddcConnector": name, "label": input_label(norm), "memory": memory}
+
+
 def ddc_relearn(name: str, fp: str) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
         raise ValueError(f"invalid monitor name: {name!r}")
@@ -941,10 +959,9 @@ def ddc_relearn(name: str, fp: str) -> dict:
     reading = ddc_poll([name], force_refresh=True).get(name)
     if not reading:
         return {"ok": False, "errors": [f"Could not read DDC/CI input for {name}"]}
-    profile["ddcInput"] = reading
-    profile["ddcConnector"] = name
-    atomic_write(memory_path(), json.dumps(memory, indent=2, sort_keys=True) + "\n", 0o600)
-    return {"ok": True, "ddcInput": reading, "ddcConnector": name, "label": input_label(reading), "memory": memory}
+    # Re-load fresh memory AFTER slow DDC probing so a concurrent Forget or
+    # toggle-off is never overwritten or resurrected.
+    return ddc_save(name, fp, reading)
 
 
 # ------------------------------------------------------------------ persist
@@ -1017,7 +1034,14 @@ def main(argv: list) -> int:
                 raise ValueError("persist expects an object")
             result = persist(payload)
         elif command == "ddc-poll":
-            result = ddc_poll(argv[1:])
+            if len(argv) >= 2 and argv[1] == "--fresh":
+                result = ddc_poll(argv[2:], force_refresh=True)
+            else:
+                result = ddc_poll(argv[1:])
+        elif command == "ddc-save":
+            if len(argv) < 4:
+                raise ValueError("ddc-save expects monitor name, fingerprint, and VCP code")
+            result = ddc_save(argv[1], argv[2], argv[3])
         elif command == "ddc-relearn":
             if len(argv) < 3:
                 raise ValueError("ddc-relearn expects monitor name and fingerprint")

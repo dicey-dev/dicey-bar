@@ -1275,6 +1275,44 @@ function brightnessQueueRead(queue, gens, name, baseline) {
   return { queue: next, gens: gens || {}, gen: gen }
 }
 
+// Supersede any queued scroll steps/readbacks on Discard, bump generations so
+// in-flight step callbacks are ignored, and restore every monitor in restoreMap.
+function brightnessQueueDiscard(queue, gens, activeJob, restoreMap) {
+  var nextGens = {}
+  for (var k in gens || {}) nextGens[k] = gens[k]
+  var affected = {}
+  for (var r in restoreMap || {}) {
+    if (cleanBrightness(restoreMap[r]) !== null) affected[r] = true
+  }
+  for (var i = 0; i < (queue || []).length; i++) {
+    var qItem = queue[i]
+    if (qItem && (qItem.delta !== undefined || qItem.afterStep)) affected[qItem.name] = true
+  }
+  if (activeJob && (activeJob.delta !== undefined || activeJob.afterStep)) {
+    affected[activeJob.name] = true
+  }
+  for (var name in affected) {
+    nextGens[name] = (Number(nextGens[name]) || 0) + 1
+  }
+  var next = []
+  for (var j = 0; j < (queue || []).length; j++) {
+    var item = queue[j]
+    if (!item) continue
+    if (affected[item.name]) {
+      // Preserve unrun baseline reads so future edits still know pre-edit hardware value.
+      if (item.readOnly && item.baseline) next.push(item)
+      continue
+    }
+    next.push(item)
+  }
+  for (var rn in restoreMap || {}) {
+    var pct = cleanBrightness(restoreMap[rn])
+    if (pct === null) continue
+    next.push({ name: rn, pct: pct, gen: nextGens[rn] })
+  }
+  return { queue: next, gens: nextGens }
+}
+
 // Hotplug handling applies the same plan at most twice in 20 seconds. The
 // second try covers a config reload (from our own monitors.lua write)
 // undoing the first; the limit stops a loop when Hyprland won't hold a plan.

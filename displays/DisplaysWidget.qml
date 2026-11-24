@@ -227,11 +227,11 @@ Panel {
     if (nightLightEdited && service) {
       service.setNightLight(openedNightLight.enabled, openedNightLight.kelvin, null)
     }
-    if (brightnessEdited && service) {
-      for (var name in openedBrightness) {
-        service.enqueueBrightness(name, openedBrightness[name])
-      }
-      if (current && Object.prototype.hasOwnProperty.call(openedBrightness, current.name))
+    if (service) {
+      // Always supersede pending scroll steps/readbacks on Discard and restore
+      // every monitor whose brightness was edited or stepped while open.
+      service.discardBrightnessPreviews(brightnessEdited ? openedBrightness : ({}))
+      if (brightnessEdited && current && Object.prototype.hasOwnProperty.call(openedBrightness, current.name))
         brightness = openedBrightness[current.name]
     }
     textSizeEdited = false
@@ -398,7 +398,8 @@ Panel {
     if (nightLightEdited) openedNightLight = { enabled: shownNightLightOn, kelvin: shownKelvin }
     nightLightEdited = false
     brightnessEdited = false
-    openedBrightness = service && service.liveBrightness ? Object.assign({}, service.liveBrightness) : ({})
+    // Keep `openedBrightness` intact until `panelApplyCommitted` fires so a
+    // failed or reverted Apply never advances the Discard baseline to preview values.
     noticeText = ""
     service.applyFromPanel(plan, options, snap)
   }
@@ -492,6 +493,10 @@ Panel {
       }
       root.syncNightLightFromService()
     }
+    function onBrightnessStepQueued(monitorName) {
+      if (!root.opened) return
+      root.brightnessEdited = true
+    }
     function onBrightnessBaseline(monitorName, pct) {
       if (!root.opened) return
       root.recordOpenedBrightness(monitorName, pct)
@@ -520,6 +525,19 @@ Panel {
       if (!root.opened) return
       if (root.current && root.current.name === monitorName) {
         root.brightnessAvailable = false
+      }
+    }
+    function onPanelApplyCommitted() {
+      if (!root.opened || !root.service) return
+      root.openedBrightness = root.service.liveBrightness ? Object.assign({}, root.service.liveBrightness) : ({})
+    }
+    function onPanelApplyReverted(revertedSnap) {
+      if (!root.opened) return
+      if (revertedSnap && revertedSnap.openedBrightness) {
+        root.openedBrightness = Object.assign({}, revertedSnap.openedBrightness)
+        if (root.current && Object.prototype.hasOwnProperty.call(root.openedBrightness, root.current.name)) {
+          root.brightness = root.openedBrightness[root.current.name]
+        }
       }
     }
   }

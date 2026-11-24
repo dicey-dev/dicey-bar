@@ -653,6 +653,23 @@ TestCase {
         verify(!!after["fp1"])
         verify(!after["fp2"])
     }
+
+    function test_brightness_queue_discard_supersedes_pending_and_inflight_steps() {
+        // Panel open on eDP-1 (baseline 40%), user scrolls +5% then immediately clicks Discard.
+        var step = Model.brightnessQueueStep([], {}, { "eDP-1": 40 }, "eDP-1", 5)
+        // Simulate step[0] (delta +5, gen 1) already running in brightnessProc,
+        // and step[1] (afterStep, gen 1) still in queue.
+        var active = step.queue[0]
+        var remaining = step.queue.slice(1)
+        var disc = Model.brightnessQueueDiscard(remaining, step.gens, active, { "eDP-1": 40 })
+        // Generation bumped past active/afterStep so late callbacks are ignored
+        verify(disc.gens["eDP-1"] > active.gen)
+        // Queued afterStep dropped, restore write to 40% queued at new gen
+        compare(disc.queue.length, 1)
+        compare(disc.queue[0].name, "eDP-1")
+        compare(disc.queue[0].pct, 40)
+        compare(disc.queue[0].gen, disc.gens["eDP-1"])
+    }
 }
 """
 
