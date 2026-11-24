@@ -1156,6 +1156,35 @@ function ddcRelearnClearBackoff(state) {
   return next
 }
 
+function ddcRelearnCancelQueued(state, fps) {
+  var drop = {}
+  for (var i = 0; i < (fps || []).length; i++) drop[fps[i]] = true
+  var next = {}
+  for (var k in state || {}) {
+    if (drop[k]) continue
+    next[k] = state[k]
+  }
+  return next
+}
+
+// Merge confirmed live hardware brightness into enabled outputs of a plan on
+// Apply so brightness changes made while the panel was closed (or via hotkeys/
+// bar-icon scroll) are preserved instead of overwritten by stale saved values.
+function mergeActualBrightness(plan, liveBrightness) {
+  if (!Array.isArray(plan)) return []
+  var map = liveBrightness && typeof liveBrightness === "object" ? liveBrightness : {}
+  return plan.map(function(o) {
+    var c = {}
+    for (var k in o) c[k] = o[k]
+    if (o.mode) c.mode = { w: o.mode.w, h: o.mode.h, hz: o.mode.hz }
+    if (c.enabled && !c.autoOff && Object.prototype.hasOwnProperty.call(map, c.name)) {
+      var clean = cleanBrightness(map[c.name])
+      if (clean !== null) c.brightness = clean
+    }
+    return c
+  })
+}
+
 function syncDraftBrightness(draft, monitorName, pct) {
   var clean = cleanBrightness(pct)
   if (!Array.isArray(draft) || !monitorName || clean === null) return { draft: draft || [], changed: false }
@@ -1171,6 +1200,79 @@ function syncDraftBrightness(draft, monitorName, pct) {
     return c
   })
   return { draft: next, changed: changed }
+}
+
+// Pure queue helpers for DisplayService's serialized brightness pipeline so
+// generation checks, baseline capture, and write/step coalescing are unit-tested.
+function brightnessQueueSet(queue, gens, name, pct) {
+  var n = String(name || "").trim()
+  var clamped = cleanBrightness(pct)
+  if (!n || clamped === null) return { queue: queue || [], gens: gens || {}, gen: 0 }
+  var nextGens = {}
+  for (var k in gens || {}) nextGens[k] = gens[k]
+  var gen = (Number(nextGens[n]) || 0) + 1
+  nextGens[n] = gen
+  var next = []
+  for (var i = 0; i < (queue || []).length; i++) {
+    var item = queue[i]
+    // Preserve an unrun baseline read ahead of the write so Discard can revert.
+    if (item.name === n && !(item.readOnly && item.baseline)) continue
+    next.push(item)
+  }
+  next.push({ name: n, pct: clamped, gen: gen })
+  return { queue: next, gens: nextGens, gen: gen }
+}
+
+function brightnessQueueStep(queue, gens, liveBrightness, name, deltaPct) {
+  var n = String(name || "").trim()
+  var d = Math.round(Number(deltaPct))
+  if (!n || !isFinite(d) || d === 0) return { queue: queue || [], gens: gens || {}, gen: 0 }
+  var nextGens = {}
+  for (var k in gens || {}) nextGens[k] = gens[k]
+  var prevGen = Number(nextGens[n]) || 0
+  var gen = prevGen + 1
+  nextGens[n] = gen
+  var hasBaselineQueued = false
+  var next = []
+  var merged = false
+  for (var i = 0; i < (queue || []).length; i++) {
+    var item = queue[i]
+    if (item.name === n && item.readOnly) {
+      if (item.baseline) {
+        hasBaselineQueued = true
+        next.push(item)
+      }
+      continue
+    }
+    if (item.name === n && item.delta !== undefined) {
+      var combined = Math.max(-100, Math.min(100, item.delta + d))
+      if (combined !== 0) next.push({ name: n, delta: combined, gen: gen })
+      merged = true
+    } else {
+      next.push(item)
+    }
+  }
+  var hasKnown = liveBrightness && Object.prototype.hasOwnProperty.call(liveBrightness, n)
+  if (!hasKnown && !hasBaselineQueued && !merged) {
+    next.push({ name: n, readOnly: true, baseline: true, gen: prevGen })
+  }
+  if (!merged) next.push({ name: n, delta: Math.max(-100, Math.min(100, d)), gen: gen })
+  next.push({ name: n, readOnly: true, afterStep: true, gen: gen })
+  return { queue: next, gens: nextGens, gen: gen }
+}
+
+function brightnessQueueRead(queue, gens, name, baseline) {
+  var n = String(name || "").trim()
+  if (!n) return { queue: queue || [], gens: gens || {}, gen: 0 }
+  var gen = Number(gens && gens[n]) || 0
+  var next = (queue || []).slice()
+  for (var i = 0; i < next.length; i++) {
+    if (next[i].name === n && next[i].readOnly && !!next[i].baseline === !!baseline && next[i].gen === gen) {
+      return { queue: next, gens: gens || {}, gen: gen }
+    }
+  }
+  next.push({ name: n, readOnly: true, baseline: !!baseline, gen: gen })
+  return { queue: next, gens: gens || {}, gen: gen }
 }
 
 // Hotplug handling applies the same plan at most twice in 20 seconds. The

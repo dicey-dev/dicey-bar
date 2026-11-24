@@ -47,6 +47,7 @@ Panel {
   // confirmation rollback undo hardware brightness changes cleanly.
   property var openedBrightness: ({})
   property bool brightnessEdited: false
+  property bool applyingPending: false
 
   function monitorByName(name) {
     for (var i = 0; i < liveMonitors.length; i++)
@@ -218,6 +219,8 @@ Panel {
   }
 
   function discardDraft() {
+    applyingPending = false
+    brightnessDebounce.stop()
     if (textSizeEdited && openedTextSize >= 9 && openedTextSize <= 20 && service) {
       service.applyTextSize(openedTextSize)
     }
@@ -357,8 +360,26 @@ Panel {
   }
 
   function apply() {
-    if (!service || !dirty || service.confirming) return
-    var plan = Model.solve(draft)
+    if (!service || !dirty || service.confirming || service.applyInFlight || applyingPending) return
+    if (brightnessDebounce.running) {
+      brightnessDebounce.stop()
+      setBrightness(brightness, true)
+    }
+    if (service.brightnessBusy) {
+      applyingPending = true
+      service.whenBrightnessIdle(function() {
+        if (!root.applyingPending) return
+        root.applyingPending = false
+        root.applyNow()
+      })
+      return
+    }
+    applyNow()
+  }
+
+  function applyNow() {
+    if (!service || !dirty || service.confirming || service.applyInFlight) return
+    var plan = Model.mergeActualBrightness(Model.solve(draft), service.liveBrightness)
     // Only persist OS-wide text size / night light when explicitly edited in
     // this session so an unrelated display change never overwrites them.
     var options = {}
@@ -377,7 +398,7 @@ Panel {
     if (nightLightEdited) openedNightLight = { enabled: shownNightLightOn, kelvin: shownKelvin }
     nightLightEdited = false
     brightnessEdited = false
-    openedBrightness = ({})
+    openedBrightness = service && service.liveBrightness ? Object.assign({}, service.liveBrightness) : ({})
     noticeText = ""
     service.applyFromPanel(plan, options, snap)
   }
@@ -460,26 +481,45 @@ Panel {
         root.resetDraft()
         if (root.pendingHostSelect && root.selectHostDisplay()) {
           root.pendingHostSelect = false
-          root.readBrightness()
+          root.readAllBrightness(true)
         }
       } else if (root.draftTopologyKey(root.draft) !== root.draftTopologyKey(root.live)) {
+        root.applyingPending = false
         root.resetDraft()
         root.selectHostDisplay()
+        root.readAllBrightness(true)
         root.showNotice("Display topology changed — refreshed")
       }
       root.syncNightLightFromService()
     }
-    function onBrightnessUpdated(monitorName, pct) {
+    function onBrightnessBaseline(monitorName, pct) {
       if (!root.opened) return
+      root.recordOpenedBrightness(monitorName, pct)
+    }
+    function onBrightnessUpdated(monitorName, pct, source, prevPct) {
+      if (!root.opened) return
+      if (source === "read") {
+        root.recordOpenedBrightness(monitorName, pct)
+      } else if (source === "step" && prevPct > 0) {
+        root.recordOpenedBrightness(monitorName, prevPct)
+      }
       if (root.current && root.current.name === monitorName) {
         root.brightness = pct
         root.brightnessAvailable = true
       }
-      var synced = Model.syncDraftBrightness(root.draft, monitorName, pct)
-      if (synced.changed) {
-        root.draft = synced.draft
-        root.edited = true
-        root.brightnessEdited = true
+      if (source === "step") {
+        var synced = Model.syncDraftBrightness(root.draft, monitorName, pct)
+        if (synced.changed) {
+          root.draft = synced.draft
+          root.edited = true
+          root.brightnessEdited = true
+        }
+      }
+    }
+    function onBrightnessReadFailed(monitorName) {
+      if (!root.opened) return
+      if (root.current && root.current.name === monitorName) {
+        root.brightnessAvailable = false
       }
     }
   }
@@ -487,6 +527,7 @@ Panel {
   onOpenedChanged: {
     if (!opened) {
       pendingHostSelect = false
+      applyingPending = false
       return
     }
     openedTextSize = Style.font.baseSize
@@ -495,72 +536,71 @@ Panel {
     nightLightEdited = false
     openedBrightness = ({})
     brightnessEdited = false
+    applyingPending = false
     noticeText = ""
     syncNightLightFromService()
     resetDraft()
     pendingHostSelect = !selectHostDisplay()
     if (service) service.refresh()
-    readBrightness()
+    readAllBrightness(true)
   }
   onSelectedChanged: {
     readBrightness()
   }
 
   // ---------------------------------------------------------------- brightness (per monitor)
+  // All reads and writes are serialized through DisplayService with per-monitor
+  // generations so stale reads can never overwrite newer scroll/slider values.
   property int brightness: 0
   property bool brightnessAvailable: false
   property string brightnessFor: ""
-  property bool brightnessReadQueued: false
 
-  function readBrightness() {
+  function recordOpenedBrightness(name, pct) {
+    if (!name || Object.prototype.hasOwnProperty.call(openedBrightness, name)) return
+    var nextMap = Object.assign({}, openedBrightness)
+    nextMap[name] = pct
+    openedBrightness = nextMap
+  }
+
+  function readAllBrightness(baseline) {
+    readBrightness(!!baseline)
+    if (!opened || !service) return
+    for (var i = 0; i < draft.length; i++) {
+      var o = draft[i]
+      if (!o || !o.enabled || o.autoOff || i === selected) continue
+      service.requestBrightnessRead(o.name, !!baseline)
+    }
+  }
+
+  function readBrightness(baseline) {
     var o = selected >= 0 && selected < draft.length ? draft[selected] : null
-    brightnessAvailable = false
-    if (!o || !o.enabled || o.autoOff || !opened) return
-    brightnessFor = o.name
-    if (brightnessRead.running) {
-      brightnessReadQueued = true
+    if (!o || !o.enabled || o.autoOff || !opened || !service) {
+      brightnessAvailable = false
       return
     }
-    brightnessRead.command = ["omarchy-brightness-display", "--monitor", o.name]
-    brightnessRead.running = true
+    brightnessFor = o.name
+    if (service.liveBrightness && Object.prototype.hasOwnProperty.call(service.liveBrightness, o.name)) {
+      brightness = service.liveBrightness[o.name]
+      brightnessAvailable = true
+    } else {
+      brightnessAvailable = false
+    }
+    service.requestBrightnessRead(o.name, !!baseline)
   }
 
   function setBrightness(value, recordInDraft) {
     var v = Number(value)
     if (!isFinite(v) || !brightnessFor) return
     var pct = Math.max(1, Math.min(100, Math.round(v)))
+    if (service && service.liveBrightness && Object.prototype.hasOwnProperty.call(service.liveBrightness, brightnessFor)) {
+      recordOpenedBrightness(brightnessFor, service.liveBrightness[brightnessFor])
+    }
     brightness = pct
     if (recordInDraft !== false && current && current.name === brightnessFor) {
       brightnessEdited = true
       update(selected, { brightness: pct }, false)
     }
     if (service) service.enqueueBrightness(brightnessFor, pct)
-  }
-
-  Process {
-    id: brightnessRead
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var value = parseInt(String(text || "").trim(), 10)
-        var asked = brightnessRead.command.length ? brightnessRead.command[brightnessRead.command.length - 1] : ""
-        if (isFinite(value) && asked === root.brightnessFor) {
-          var clamped = Math.max(1, Math.min(100, value))
-          root.brightness = clamped
-          root.brightnessAvailable = true
-          if (!Object.prototype.hasOwnProperty.call(root.openedBrightness, asked)) {
-            var nextMap = Object.assign({}, root.openedBrightness)
-            nextMap[asked] = clamped
-            root.openedBrightness = nextMap
-          }
-        }
-      }
-    }
-    onRunningChanged: {
-      if (running || !root.brightnessReadQueued) return
-      root.brightnessReadQueued = false
-      root.readBrightness()
-    }
   }
 
   Timer {
@@ -709,6 +749,7 @@ Panel {
                 return f.name + " fell back to " + f.actual + " instead of " + f.wanted
               }
               if (s.confirming) return "Confirming changes (" + s.confirmSeconds + "s) · Enter to keep"
+              if (root.applyingPending) return "Syncing brightness before Apply…"
               if (root.noticeText) return root.noticeText
               if (root.dirty) return "Unsaved changes · Apply or press Enter"
               return "Synced with monitors.lua · auto-applies on reconnect"
@@ -716,7 +757,7 @@ Panel {
             color: {
               var s = root.service
               if (s && (s.lastError || s.fallbacks.length)) return root.alertColor
-              if (root.dirty || root.noticeText || (s && s.confirming)) return root.accent
+              if (root.dirty || root.noticeText || root.applyingPending || (s && s.confirming)) return root.accent
               return root.muted
             }
             font.family: root.fontName
@@ -763,7 +804,7 @@ Panel {
 
             Rectangle {
               id: applyBtn
-              readonly property bool canApply: root.dirty && !!root.service && !root.service.confirming
+              readonly property bool canApply: root.dirty && !!root.service && !root.service.confirming && !root.service.applyInFlight && !root.applyingPending
               implicitWidth: applyLabel.implicitWidth + Style.space(22)
               implicitHeight: Style.space(28)
               radius: Style.cornerRadius

@@ -48,6 +48,8 @@ Item {
   property string lastError: ""
 
   // After an Apply that changes a mode, rotation, HDR, mirror, or power state.
+  property bool applyInFlight: false
+  property bool persistInFlight: false
   property bool confirming: false
   property int confirmSeconds: 0
   property var pendingCommit: null
@@ -66,10 +68,16 @@ Item {
   property string lastPrefsTopology: ""
 
   signal refreshed()
-  signal brightnessUpdated(string monitorName, int pct)
+  // Emitted on confirmed serialized brightness read/step/set for a monitor.
+  // source: "read" | "step" | "set"; prevPct: prior known brightness (or 0).
+  signal brightnessUpdated(string monitorName, int pct, string source, int prevPct)
+  // Emitted when a pre-write baseline read finishes (even if a write was queued after it).
+  signal brightnessBaseline(string monitorName, int pct)
+  signal brightnessReadFailed(string monitorName)
 
   // ---------------------------------------------------------------- jobs
-  // Helper calls run one at a time, in order.
+  // Helper calls run one at a time, in order. `runFront` prioritizes safety
+  // rollbacks ahead of queued refreshes or night-light updates.
   property var jobs: []
   property var currentJob: null
   property var refreshWaiters: []
@@ -77,6 +85,11 @@ Item {
 
   function run(args, input, done) {
     jobs = jobs.concat([{ args: args, input: input, done: done || null }])
+    pump()
+  }
+
+  function runFront(args, input, done) {
+    jobs = [{ args: args, input: input, done: done || null }].concat(jobs)
     pump()
   }
 
@@ -191,11 +204,16 @@ Item {
   }
 
   // ---------------------------------------------------------------- unified brightness & text-size queues
-  // Single immutable queue ({ name, pct } | { name, delta } | { name, readOnly })
-  // so slider drags, bar-icon scroll steps, readbacks, Sync all, and IPC calls
-  // never collide or write to the wrong monitor.
+  // Single serialized, generation-stamped queue ({ name, pct, gen } |
+  // { name, delta, gen } | { name, readOnly, baseline?, afterStep?, gen })
+  // so panel reads, slider drags, bar-icon scroll steps, Sync all, and IPC
+  // never race or overwrite newer values with stale readbacks.
   property var brightnessQueue: []
   property var activeBrightnessJob: null
+  property var brightnessGen: ({})
+  property var liveBrightness: ({})
+  property var brightnessIdleWaiters: []
+  readonly property bool brightnessBusy: brightnessProc.running || brightnessQueue.length > 0
   property int pendingTextSize: 0
 
   Process {
@@ -220,28 +238,64 @@ Item {
     textSizeProc.running = true
   }
 
+  function flushBrightnessIdleWaiters() {
+    if (brightnessProc.running || brightnessQueue.length > 0 || brightnessIdleWaiters.length === 0) return
+    var waiters = brightnessIdleWaiters
+    brightnessIdleWaiters = []
+    for (var i = 0; i < waiters.length; i++) waiters[i]()
+  }
+
+  function whenBrightnessIdle(fn) {
+    if (!fn) return
+    if (!brightnessProc.running && brightnessQueue.length === 0) {
+      fn()
+      return
+    }
+    brightnessIdleWaiters = brightnessIdleWaiters.concat([fn])
+  }
+
+  function recordLiveBrightness(name, pct) {
+    var next = Object.assign({}, liveBrightness)
+    next[name] = pct
+    liveBrightness = next
+  }
+
   Process {
     id: brightnessProc
     stdout: StdioCollector { id: brightnessOut; waitForEnd: true }
     onExited: function(exitCode) {
       var doneJob = service.activeBrightnessJob
       service.activeBrightnessJob = null
-      if (doneJob && doneJob.readOnly && exitCode === 0) {
-        var hasPendingForMonitor = false
-        for (var i = 0; i < service.brightnessQueue.length; i++) {
-          if (service.brightnessQueue[i].name === doneJob.name) {
-            hasPendingForMonitor = true
-            break
-          }
-        }
-        if (!hasPendingForMonitor) {
-          var val = parseInt(String(brightnessOut.text || "").trim(), 10)
+      if (doneJob) {
+        var curGen = Number(service.brightnessGen[doneJob.name]) || 0
+        var isCurrent = doneJob.gen === curGen
+        if (doneJob.readOnly) {
+          var val = exitCode === 0 ? parseInt(String(brightnessOut.text || "").trim(), 10) : NaN
           if (isFinite(val)) {
-            service.brightnessUpdated(doneJob.name, Math.max(1, Math.min(100, val)))
+            var clamped = Math.max(1, Math.min(100, val))
+            var prev = Object.prototype.hasOwnProperty.call(service.liveBrightness, doneJob.name)
+              ? Number(service.liveBrightness[doneJob.name]) : 0
+            if (doneJob.baseline) {
+              // Baseline ran strictly before any later write; update liveBrightness and notify Discard snapshot.
+              service.recordLiveBrightness(doneJob.name, clamped)
+              service.brightnessBaseline(doneJob.name, clamped)
+            }
+            if (isCurrent) {
+              service.recordLiveBrightness(doneJob.name, clamped)
+              service.brightnessUpdated(doneJob.name, clamped, doneJob.afterStep ? "step" : "read", prev)
+            }
+          } else if (isCurrent && !doneJob.afterStep) {
+            service.brightnessReadFailed(doneJob.name)
           }
+        } else if (doneJob.pct !== undefined && exitCode === 0 && isCurrent) {
+          var prevSet = Object.prototype.hasOwnProperty.call(service.liveBrightness, doneJob.name)
+            ? Number(service.liveBrightness[doneJob.name]) : 0
+          service.recordLiveBrightness(doneJob.name, doneJob.pct)
+          service.brightnessUpdated(doneJob.name, doneJob.pct, "set", prevSet)
         }
       }
       service.pumpBrightness()
+      service.flushBrightnessIdleWaiters()
     }
   }
 
@@ -261,48 +315,36 @@ Item {
     brightnessProc.running = true
     if (!brightnessProc.running) {
       activeBrightnessJob = null
-      Qt.callLater(service.pumpBrightness)
+      Qt.callLater(function() {
+        service.pumpBrightness()
+        service.flushBrightnessIdleWaiters()
+      })
     }
   }
 
-  function enqueueBrightness(name, pct) {
+  function requestBrightnessRead(name, baseline) {
     var n = String(name || "").trim()
-    var v = Number(pct)
-    if (!n || !isFinite(v)) return false
-    var clamped = Math.max(1, Math.min(100, Math.round(v)))
-    // Coalesce any already-queued write or readback for the same monitor so dragging stays snappy.
-    var next = []
-    for (var i = 0; i < brightnessQueue.length; i++) {
-      if (brightnessQueue[i].name !== n) next.push(brightnessQueue[i])
-    }
-    next.push({ name: n, pct: clamped })
-    brightnessQueue = next
+    if (!n) return false
+    var res = Model.brightnessQueueRead(brightnessQueue, brightnessGen, n, !!baseline)
+    brightnessQueue = res.queue
+    pumpBrightness()
+    return true
+  }
+
+  function enqueueBrightness(name, pct) {
+    var res = Model.brightnessQueueSet(brightnessQueue, brightnessGen, name, pct)
+    if (!res.gen) return false
+    brightnessGen = res.gens
+    brightnessQueue = res.queue
     pumpBrightness()
     return true
   }
 
   function enqueueBrightnessStep(name, deltaPct) {
-    var n = String(name || "").trim()
-    var d = Math.round(Number(deltaPct))
-    if (!n || !isFinite(d) || d === 0) return false
-    var next = []
-    var merged = false
-    for (var i = 0; i < brightnessQueue.length; i++) {
-      var item = brightnessQueue[i]
-      if (item.name === n && item.readOnly) continue
-      if (item.name === n && item.delta !== undefined) {
-        var combined = Math.max(-100, Math.min(100, item.delta + d))
-        if (combined !== 0) next.push({ name: n, delta: combined })
-        merged = true
-      } else {
-        next.push(item)
-      }
-    }
-    if (!merged) next.push({ name: n, delta: Math.max(-100, Math.min(100, d)) })
-    // Queue a serialized readback after the step burst so the panel slider and
-    // draft stay synced with actual hardware brightness (including <5% 1% steps).
-    next.push({ name: n, readOnly: true })
-    brightnessQueue = next
+    var res = Model.brightnessQueueStep(brightnessQueue, brightnessGen, liveBrightness, name, deltaPct)
+    if (!res.gen) return false
+    brightnessGen = res.gens
+    brightnessQueue = res.queue
     pumpBrightness()
     return true
   }
@@ -414,8 +456,81 @@ Item {
     })
   }
 
+  // Dedicated Process for automatic background DDC re-learning so slow I2C
+  // detection/reads can NEVER block Apply, Keep, or safety Revert on `helper`.
+  property var autoRelearnQueue: []
+  property var activeAutoRelearn: null
+
+  Process {
+    id: ddcRelearnProc
+    stdout: StdioCollector { id: ddcRelearnOut }
+    onExited: function(exitCode) {
+      var job = service.activeAutoRelearn
+      service.activeAutoRelearn = null
+      var ok = false
+      var data = null
+      if (exitCode === 0) {
+        try {
+          data = JSON.parse(String(ddcRelearnOut.text || "null"))
+          ok = !!(data && data.ok)
+        } catch (e) {
+          data = null
+        }
+      }
+      if (job) {
+        if (job.cancelled) {
+          service.autoRelearnState = Model.ddcRelearnCancelQueued(service.autoRelearnState, [job.fp])
+        } else {
+          if (ok && data && data.memory) {
+            service.memory = Model.normalizeMemory(data.memory)
+            var off = {}
+            var misses = {}
+            for (var k in service.ddcOff) if (k !== job.fp) off[k] = service.ddcOff[k]
+            for (var m in service.ddcMisses) if (m !== job.fp) misses[m] = service.ddcMisses[m]
+            service.ddcOff = off
+            service.ddcMisses = misses
+          }
+          service.autoRelearnState = Model.ddcRelearnFinish(service.autoRelearnState, job.fp, job.name, ok, Date.now())
+          if (ok && job.wasOff && !service.confirming && !service.applyInFlight) {
+            service.refresh(service.reconcile)
+          }
+        }
+      }
+      Qt.callLater(service.pumpAutoRelearn)
+    }
+  }
+
+  function cancelQueuedAutoRelearn() {
+    var fps = autoRelearnQueue.map(function(j) { return j.fp })
+    autoRelearnQueue = []
+    if (activeAutoRelearn && ddcRelearnProc.running) {
+      activeAutoRelearn.cancelled = true
+      fps.push(activeAutoRelearn.fp)
+      ddcRelearnProc.running = false
+    }
+    if (fps.length) autoRelearnState = Model.ddcRelearnCancelQueued(autoRelearnState, fps)
+  }
+
+  function pumpAutoRelearn() {
+    if (ddcRelearnProc.running || autoRelearnQueue.length === 0) return
+    if (isDevInstance || confirming || applyInFlight || persistInFlight) {
+      cancelQueuedAutoRelearn()
+      return
+    }
+    var job = autoRelearnQueue[0]
+    autoRelearnQueue = autoRelearnQueue.slice(1)
+    activeAutoRelearn = job
+    ddcRelearnProc.command = ["python3", "-I", service.helperPath, "ddc-relearn", job.name, job.fp]
+    ddcRelearnProc.running = true
+    if (!ddcRelearnProc.running) {
+      activeAutoRelearn = null
+      autoRelearnState = Model.ddcRelearnFinish(autoRelearnState, job.fp, job.name, false, Date.now())
+      Qt.callLater(service.pumpAutoRelearn)
+    }
+  }
+
   function autoRelearnMovedConnectors(plan) {
-    if (isDevInstance || confirming || !Array.isArray(plan) || !memory || !memory.monitors) return
+    if (isDevInstance || confirming || applyInFlight || persistInFlight || !Array.isArray(plan) || !memory || !memory.monitors) return
     var now = Date.now()
     for (var i = 0; i < plan.length; i++) {
       var o = plan[i]
@@ -427,14 +542,13 @@ Item {
       var step = Model.ddcRelearnBegin(autoRelearnState, o.fp, o.name, now)
       if (!step.allowed) continue
       autoRelearnState = step.state
-      ;(function(monName, monFp) {
-        var wasOff = !!(service.ddcOff && service.ddcOff[monFp])
-        relearnDdcInput(monName, monFp, function(ok) {
-          service.autoRelearnState = Model.ddcRelearnFinish(service.autoRelearnState, monFp, monName, ok, Date.now())
-          if (ok && wasOff) service.refresh(service.reconcile)
-        }, true)
-      })(o.name, o.fp)
+      autoRelearnQueue = autoRelearnQueue.concat([{
+        name: o.name,
+        fp: o.fp,
+        wasOff: !!(service.ddcOff && service.ddcOff[o.fp])
+      }])
     }
+    pumpAutoRelearn()
   }
 
   // ---------------------------------------------------------------- automatic
@@ -580,7 +694,7 @@ Item {
     interval: 5000
     repeat: true
     running: (service.watchedOutputs.length > 0 || service.pendingRelearnOutputs.length > 0)
-      && !service.confirming && !service.isDevInstance
+      && !service.confirming && !service.applyInFlight && !service.persistInFlight && !service.isDevInstance
     onTriggered: {
       if (service.pendingRelearnOutputs.length > 0) service.autoRelearnMovedConnectors(service.livePlan)
       service.pollInputs()
@@ -593,20 +707,24 @@ Item {
   // first waits for the user to keep it, and safely reverts both displays and
   // any previewed OS-wide preferences if rejected or timed out.
   function applyFromPanel(plan, options, revertSnapshot) {
-    if (confirming || !plan || !plan.length) return
+    if (confirming || applyInFlight || !plan || !plan.length) return
+    cancelQueuedAutoRelearn()
+    applyInFlight = true
     var before = livePlan
     var mustConfirm = Model.needsConfirmation(plan, before)
     var opts = options || {}
     run(["apply"], JSON.stringify(plan), function(code, data, stderr) {
+      service.applyInFlight = false
       service.fallbacks = data && Array.isArray(data.fallbacks) ? data.fallbacks : []
       if (code !== 0) {
         service.lastError = service.errorText(data, stderr)
         service.restorePreviewPrefs(revertSnapshot)
-        service.run(["revert"], JSON.stringify(before), function() { service.refresh() })
+        service.runFront(["revert"], JSON.stringify(before), function() { service.refresh() })
         return
       }
       service.lastError = ""
       if (mustConfirm) {
+        service.cancelQueuedAutoRelearn()
         service.pendingCommit = { plan: plan, options: opts }
         service.revertPlan = before
         service.revertPrefs = revertSnapshot || null
@@ -637,7 +755,10 @@ Item {
     // changes aren't lost.
     var nextMemory = Model.remember(memory, plan, new Date().toISOString(), options)
     lastPrefsTopology = topologySignature(plan)
+    persistInFlight = true
+    cancelQueuedAutoRelearn()
     run(["persist"], JSON.stringify({ plan: plan, memory: nextMemory }), function(code, data, stderr) {
+      service.persistInFlight = false
       if (code === 0) {
         service.memory = nextMemory
         service.lastError = ""
@@ -664,15 +785,16 @@ Item {
     if (!confirming) return
     confirmTimer.stop()
     confirming = false
+    cancelQueuedAutoRelearn()
     var previous = revertPlan
     var snap = revertPrefs
     pendingCommit = null
     revertPlan = null
     revertPrefs = null
     restorePreviewPrefs(snap)
-    // Uses `revert` (not `apply`) so if a monitor was unplugged during the
-    // confirmation window, we never disable the last remaining connected display.
-    if (previous) run(["revert"], JSON.stringify(previous), function() { service.refresh() })
+    // Uses `runFront` + `revert` so safety rollback jumps ahead of any queued
+    // refresh/nightlight job and never disables the last connected display.
+    if (previous) runFront(["revert"], JSON.stringify(previous), function() { service.refresh() })
   }
 
   Timer {

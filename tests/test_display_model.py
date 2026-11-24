@@ -592,6 +592,67 @@ TestCase {
         var mem2 = Model.remember(mem, s2.draft, "t2")
         compare(mem2.monitors["LG Display|0x0753|"].brightness, 3)
     }
+
+    function test_merge_actual_brightness_preserves_closed_panel_scroll_on_apply() {
+        // Saved brightness is 40%; user scrolled to 45% while panel was closed,
+        // then opened panel and applied an unrelated layout change.
+        var plan = Model.derive([laptop(), benq()], {}, {})
+        byName(plan, "eDP-1").brightness = 40
+        var merged = Model.mergeActualBrightness(plan, { "eDP-1": 45 })
+        compare(byName(merged, "eDP-1").brightness, 45)
+        compare(byName(merged, "HDMI-A-1").brightness, null)
+        var mem = Model.remember({}, merged, "t1")
+        compare(mem.monitors["LG Display|0x0753|"].brightness, 45)
+    }
+
+    function test_brightness_queue_serializes_baseline_generations_and_steps() {
+        // Panel opens on A; baseline reads are queued for A and B at gen 0.
+        var q = []
+        var gens = {}
+        var rA = Model.brightnessQueueRead(q, gens, "eDP-1", true)
+        var rB = Model.brightnessQueueRead(rA.queue, gens, "HDMI-A-1", true)
+        compare(rB.queue.length, 2)
+        compare(rB.queue[1].baseline, true)
+        compare(rB.queue[1].gen, 0)
+
+        // Scrolling unvisited B preserves B's queued baseline read BEFORE the step,
+        // bumps B's generation to 1, and appends an afterStep readback at gen 1.
+        var sB = Model.brightnessQueueStep(rB.queue, gens, {}, "HDMI-A-1", 5)
+        compare(sB.gen, 1)
+        compare(sB.queue.length, 4)
+        compare(sB.queue[1].baseline, true)
+        compare(sB.queue[1].gen, 0)
+        compare(sB.queue[2].delta, 5)
+        compare(sB.queue[2].gen, 1)
+        compare(sB.queue[3].afterStep, true)
+        compare(sB.queue[3].gen, 1)
+
+        // Setting brightness via slider/Discard bumps generation to 2, drops obsolete
+        // step/afterStep for B, while still preserving unrun baseline read.
+        var wB = Model.brightnessQueueSet(sB.queue, sB.gens, "HDMI-A-1", 60)
+        compare(wB.gen, 2)
+        compare(wB.queue.length, 3)
+        compare(wB.queue[1].baseline, true)
+        compare(wB.queue[2].pct, 60)
+        compare(wB.queue[2].gen, 2)
+        // A stale read with gen 0 or 1 no longer matches current gen 2.
+        verify(rB.queue[1].gen !== wB.gens["HDMI-A-1"])
+
+        // Scrolling an unread monitor with no queued baseline automatically prepends baseline.
+        var sFresh = Model.brightnessQueueStep([], {}, {}, "DP-1", 5)
+        compare(sFresh.queue.length, 3)
+        compare(sFresh.queue[0].baseline, true)
+        compare(sFresh.queue[1].delta, 5)
+        compare(sFresh.queue[2].afterStep, true)
+    }
+
+    function test_ddc_relearn_cancel_queued_only_drops_queued_entries() {
+        var b1 = Model.ddcRelearnBegin({}, "fp1", "DP-1", 1000)
+        var b2 = Model.ddcRelearnBegin(b1.state, "fp2", "DP-2", 1000)
+        var after = Model.ddcRelearnCancelQueued(b2.state, ["fp2"])
+        verify(!!after["fp1"])
+        verify(!after["fp2"])
+    }
 }
 """
 
