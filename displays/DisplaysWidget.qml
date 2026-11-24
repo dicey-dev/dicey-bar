@@ -478,13 +478,35 @@ Panel {
     function hide() { root.close() }
   }
 
+  readonly property string hostScreenName: (button.QsWindow && button.QsWindow.window && button.QsWindow.window.screen)
+    ? String(button.QsWindow.window.screen.name || "") : ""
+  property bool pendingHostSelect: false
+  property real wheelAccumulator: 0
+
+  function selectHostDisplay() {
+    var target = hostScreenName || focusedOutputName()
+    if (!target || !draft.length) return false
+    for (var i = 0; i < draft.length; i++) {
+      if (draft[i] && draft[i].name === target) {
+        selected = i
+        return true
+      }
+    }
+    return false
+  }
+
   Connections {
     target: root.service
     function onRefreshed() {
       if (!root.edited) {
         root.resetDraft()
+        if (root.pendingHostSelect && root.selectHostDisplay()) {
+          root.pendingHostSelect = false
+          root.readBrightness()
+        }
       } else if (root.draftTopologyKey(root.draft) !== root.draftTopologyKey(root.live)) {
         root.resetDraft()
+        root.selectHostDisplay()
         root.showNotice("Display topology changed — refreshed")
       }
       root.syncNightLightFromService()
@@ -492,7 +514,10 @@ Panel {
   }
 
   onOpenedChanged: {
-    if (!opened) return
+    if (!opened) {
+      pendingHostSelect = false
+      return
+    }
     openedTextSize = Style.font.baseSize
     draftTextSize = Style.font.baseSize
     textSizeEdited = false
@@ -507,6 +532,7 @@ Panel {
     ddcProbeError = ""
     syncNightLightFromService()
     resetDraft()
+    pendingHostSelect = !selectHostDisplay()
     if (service) service.refresh()
     readBrightness()
   }
@@ -609,8 +635,20 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: Quickshell.screens.length > 1 ? "󰍺" : "󰍹"
-    tooltipText: "Displays"
+    tooltipText: "Displays · scroll for brightness"
     onPressed: function(b) { root.toggle() }
+    onWheelMoved: function(delta) {
+      var wheel = Util.wheelSteps(root.wheelAccumulator, delta)
+      root.wheelAccumulator = wheel.remainder
+      if (wheel.steps === 0) return
+      var target = root.hostScreenName || root.focusedOutputName()
+      if (!target || !root.service) return
+      var stepPct = wheel.steps * 5
+      root.service.enqueueBrightnessStep(target, stepPct)
+      if (root.opened && root.current && root.current.name === target && root.brightnessAvailable) {
+        root.brightness = Math.max(1, Math.min(100, root.brightness + stepPct))
+      }
+    }
   }
 
   KeyboardPanel {
@@ -995,7 +1033,7 @@ Panel {
           // ---------- Interactive Layout Canvas ----------
           LayoutCanvas {
             width: parent.width
-            height: Style.space(170)
+            height: Style.space(184)
           }
 
           // ---------- Display Selector Strip ----------
@@ -2310,16 +2348,18 @@ Panel {
 
   component LayoutCanvas: Item {
     id: canvas
+    clip: true
 
     readonly property real pad: Style.space(14)
     readonly property real footerPad: Style.space(22)
     property int dragIndex: -1
-    property var frozenView: null
+    property var dragBounds: null
     property var dragRect: null
+    property var activeSnap: null
 
-    readonly property var view: frozenView || viewFor(root.draft)
+    readonly property var view: dragBounds ? viewForBounds(dragBounds) : viewFor(root.draft)
 
-    function viewFor(outputs) {
+    function boundsFor(outputs) {
       var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
       for (var i = 0; i < outputs.length; i++) {
         if (!outputs[i].enabled || outputs[i].autoOff || outputs[i].mirrorOf) continue
@@ -2329,17 +2369,37 @@ Panel {
         maxX = Math.max(maxX, r.x + r.w)
         maxY = Math.max(maxY, r.y + r.h)
       }
+      if (minX === Infinity) return null
+      return { minX: minX, minY: minY, maxX: maxX, maxY: maxY }
+    }
+
+    function viewForBounds(b) {
       var usableH = Math.max(Style.space(60), height - footerPad)
-      if (minX === Infinity) return { k: 1, ox: pad, oy: pad, minX: 0, minY: 0 }
-      var spanX = Math.max(1, maxX - minX)
-      var spanY = Math.max(1, maxY - minY)
-      var k = Math.min((width - pad * 2) / (spanX * 1.28), (usableH - pad * 2) / (spanY * 1.22))
+      if (!b) return { k: 1, ox: pad, oy: pad, minX: 0, minY: 0 }
+      var spanX = Math.max(1, b.maxX - b.minX)
+      var spanY = Math.max(1, b.maxY - b.minY)
+      var k = Math.min((width - pad * 2) / (spanX * 1.24), (usableH - pad * 2) / (spanY * 1.20))
       return {
         k: k,
         ox: (width - spanX * k) / 2,
         oy: (usableH - spanY * k) / 2,
-        minX: minX,
-        minY: minY
+        minX: b.minX,
+        minY: b.minY
+      }
+    }
+
+    function viewFor(outputs) {
+      return viewForBounds(boundsFor(outputs))
+    }
+
+    function expandDragBounds(r) {
+      if (!r || !dragBounds) return
+      var nx0 = Math.min(dragBounds.minX, r.x)
+      var ny0 = Math.min(dragBounds.minY, r.y)
+      var nx1 = Math.max(dragBounds.maxX, r.x + r.w)
+      var ny1 = Math.max(dragBounds.maxY, r.y + r.h)
+      if (nx0 !== dragBounds.minX || ny0 !== dragBounds.minY || nx1 !== dragBounds.maxX || ny1 !== dragBounds.maxY) {
+        dragBounds = { minX: nx0, minY: ny0, maxX: nx1, maxY: ny1 }
       }
     }
 
@@ -2379,173 +2439,214 @@ Panel {
           }
         }
       }
-    }
 
-    Repeater {
-      model: root.draft
-
-      Rectangle {
-        id: tile
-        required property var modelData
-        required property int index
-        readonly property bool shown: modelData.enabled && !modelData.autoOff && !modelData.mirrorOf
-        readonly property var rect: canvas.dragIndex === index && canvas.dragRect ? canvas.dragRect : Model.rectOf(modelData)
-        readonly property bool chosen: root.selected === index
-        readonly property bool draggingThis: canvas.dragIndex === index
-        readonly property var mirroredBy: root.mirrorsOf(modelData.name)
-
-        visible: shown
-        x: Math.round(canvas.view.ox + (rect.x - canvas.view.minX) * canvas.view.k)
-        y: Math.round(canvas.view.oy + (rect.y - canvas.view.minY) * canvas.view.k)
-        width: Math.max(Style.space(62), Math.round(rect.w * canvas.view.k))
-        height: Math.max(Style.space(40), Math.round(rect.h * canvas.view.k))
-        z: draggingThis ? 3 : (chosen ? 2 : 1)
-        radius: Math.min(Style.cornerRadius, Style.space(6))
-        color: chosen
-          ? Qt.tint(Commons.Color.popups.background, root.accentSoft)
-          : (tileMouse.containsMouse
-            ? Qt.lighter(Commons.Color.popups.background, 1.25)
-            : Qt.lighter(Commons.Color.popups.background, 1.12))
-        border.color: chosen
-          ? root.accent
-          : (tileMouse.containsMouse ? root.accentBorder : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.34))
-        border.width: chosen ? 2 : 1
+      // Clipped stage above the canvas footer so tiles and guide lines can
+      // never overflow onto the header or footer.
+      Item {
+        id: tilesStage
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.margins: 1
+        anchors.bottomMargin: canvas.footerPad
         clip: true
 
-        Item {
-          id: tileTop
-          anchors.left: parent.left
-          anchors.right: parent.right
-          anchors.top: parent.top
-          anchors.margins: Style.space(6)
-          height: tileName.implicitHeight
-
-          Text {
-            id: tileName
-            anchors.left: parent.left
-            anchors.right: tileScale.left
-            anchors.rightMargin: Style.space(4)
-            textFormat: Text.PlainText
-            text: (tile.index + 1) + " · " + tile.modelData.name
-            color: tile.chosen ? root.accent : root.fg
-            font.family: root.fontName
-            font.pixelSize: Style.font.caption
-            font.bold: true
-            elide: Text.ElideRight
-          }
-
-          Text {
-            id: tileScale
-            anchors.right: parent.right
-            textFormat: Text.PlainText
-            text: Commons.I18n.formatNumber(tile.modelData.scale) + "×"
-            color: root.accent
-            font.family: root.fontName
-            font.pixelSize: Math.max(9, Style.font.caption - 1)
-            font.bold: true
-          }
+        // Live magnetic alignment guide line (edge or H/V center)
+        Rectangle {
+          id: snapGuideLine
+          visible: canvas.dragIndex >= 0 && canvas.activeSnap !== null
+          z: 4
+          color: root.accent
+          opacity: 0.75
+          x: visible && canvas.activeSnap.axis === "x"
+            ? Math.round(canvas.view.ox + (canvas.activeSnap.guidePos - canvas.view.minX) * canvas.view.k)
+            : 0
+          y: visible && canvas.activeSnap.axis === "y"
+            ? Math.round(canvas.view.oy + (canvas.activeSnap.guidePos - canvas.view.minY) * canvas.view.k)
+            : 0
+          width: visible && canvas.activeSnap.axis === "x" ? 1 : parent.width
+          height: visible && canvas.activeSnap.axis === "y" ? 1 : parent.height
         }
 
-        Text {
-          visible: tile.height >= Style.space(52)
-          anchors.left: parent.left
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          anchors.leftMargin: Style.space(6)
-          anchors.rightMargin: Style.space(6)
-          textFormat: Text.PlainText
-          text: tile.mirroredBy.length
-            ? ("⇄ Mirrored by " + tile.mirroredBy.join(", "))
-            : root.shortModelName(tile.index)
-          color: tile.mirroredBy.length ? root.accent : root.muted
-          font.family: root.fontName
-          font.pixelSize: Math.max(9, Style.font.caption - 1)
-          font.bold: tile.mirroredBy.length > 0
-          elide: Text.ElideRight
-        }
+        Repeater {
+          model: root.draft
 
-        Item {
-          visible: tile.height >= Style.space(64) && !!tile.modelData.mode
-          anchors.left: parent.left
-          anchors.right: parent.right
-          anchors.bottom: parent.bottom
-          anchors.margins: Style.space(6)
-          height: tileRes.implicitHeight
+          Rectangle {
+            id: tile
+            required property var modelData
+            required property int index
+            readonly property bool shown: modelData.enabled && !modelData.autoOff && !modelData.mirrorOf
+            readonly property var rect: canvas.dragIndex === index && canvas.dragRect ? canvas.dragRect : Model.rectOf(modelData)
+            readonly property bool chosen: root.selected === index
+            readonly property bool draggingThis: canvas.dragIndex === index
+            readonly property var mirroredBy: root.mirrorsOf(modelData.name)
 
-          Text {
-            id: tileRes
-            anchors.left: parent.left
-            anchors.right: tileHz.left
-            anchors.rightMargin: Style.space(4)
-            textFormat: Text.PlainText
-            text: tile.modelData.mode ? (tile.modelData.mode.w + "×" + tile.modelData.mode.h) : ""
-            color: root.muted
-            font.family: root.fontName
-            font.pixelSize: Math.max(9, Style.font.caption - 1)
-            elide: Text.ElideRight
-          }
+            visible: shown
+            x: Math.round(canvas.view.ox + (rect.x - canvas.view.minX) * canvas.view.k)
+            y: Math.round(canvas.view.oy + (rect.y - canvas.view.minY) * canvas.view.k)
+            width: Math.max(Style.space(62), Math.round(rect.w * canvas.view.k))
+            height: Math.max(Style.space(40), Math.round(rect.h * canvas.view.k))
+            z: draggingThis ? 3 : (chosen ? 2 : 1)
+            radius: Math.min(Style.cornerRadius, Style.space(6))
+            color: chosen
+              ? Qt.tint(Commons.Color.popups.background, root.accentSoft)
+              : (tileMouse.containsMouse
+                ? Qt.lighter(Commons.Color.popups.background, 1.25)
+                : Qt.lighter(Commons.Color.popups.background, 1.12))
+            border.color: chosen
+              ? root.accent
+              : (tileMouse.containsMouse ? root.accentBorder : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.34))
+            border.width: chosen ? 2 : 1
+            clip: true
 
-          Text {
-            id: tileHz
-            anchors.right: parent.right
-            textFormat: Text.PlainText
-            text: tile.modelData.mode ? (Math.round(tile.modelData.mode.hz) + "Hz") : ""
-            color: root.muted
-            font.family: root.fontName
-            font.pixelSize: Math.max(9, Style.font.caption - 1)
-          }
-        }
+            Item {
+              id: tileTop
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.margins: Style.space(6)
+              height: tileName.implicitHeight
 
-        MouseArea {
-          id: tileMouse
-          anchors.fill: parent
-          hoverEnabled: true
-          preventStealing: true
-          cursorShape: canvas.dragIndex === tile.index ? Qt.ClosedHandCursor : Qt.OpenHandCursor
-          property point grab: Qt.point(0, 0)
-          property var start: null
+              Text {
+                id: tileName
+                anchors.left: parent.left
+                anchors.right: tileScale.left
+                anchors.rightMargin: Style.space(4)
+                textFormat: Text.PlainText
+                text: (tile.index + 1) + " · " + tile.modelData.name
+                color: tile.chosen ? root.accent : root.fg
+                font.family: root.fontName
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                elide: Text.ElideRight
+              }
 
-          onPressed: function(mouse) {
-            root.selected = tile.index
-            grab = Qt.point(mouse.x, mouse.y)
-            start = Model.rectOf(tile.modelData)
-            canvas.frozenView = canvas.view
-            canvas.dragRect = start
-            canvas.dragIndex = tile.index
-          }
-          onPositionChanged: function(mouse) {
-            if (canvas.dragIndex !== tile.index || !start) return
-            var v = canvas.frozenView
-            var p = mapToItem(canvas, mouse.x, mouse.y)
-            var wanted = {
-              x: Math.round((p.x - grab.x - v.ox) / v.k + v.minX),
-              y: Math.round((p.y - grab.y - v.oy) / v.k + v.minY),
-              w: start.w,
-              h: start.h
+              Text {
+                id: tileScale
+                anchors.right: parent.right
+                textFormat: Text.PlainText
+                text: Commons.I18n.formatNumber(tile.modelData.scale) + "×"
+                color: root.accent
+                font.family: root.fontName
+                font.pixelSize: Math.max(9, Style.font.caption - 1)
+                font.bold: true
+              }
             }
-            canvas.dragRect = Model.attach(wanted, canvas.others(tile.index), Style.space(12) / v.k)
-          }
-          onReleased: {
-            if (canvas.dragIndex !== tile.index) return
-            var index = tile.index
-            var r = canvas.dragRect
-            var moved = r && start && (r.x !== start.x || r.y !== start.y)
-            canvas.dragIndex = -1
-            canvas.dragRect = null
-            canvas.frozenView = null
-            start = null
-            if (!moved) return
-            var next = root.draft.map(root.copyOutput)
-            next[index].x = r.x
-            next[index].y = r.y
-            root.edited = true
-            root.draft = Model.solve(next, index, 0)
-          }
-          onCanceled: {
-            canvas.dragIndex = -1
-            canvas.dragRect = null
-            canvas.frozenView = null
-            start = null
+
+            Text {
+              visible: tile.height >= Style.space(52)
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(6)
+              anchors.rightMargin: Style.space(6)
+              textFormat: Text.PlainText
+              text: tile.mirroredBy.length
+                ? ("⇄ Mirrored by " + tile.mirroredBy.join(", "))
+                : root.shortModelName(tile.index)
+              color: tile.mirroredBy.length ? root.accent : root.muted
+              font.family: root.fontName
+              font.pixelSize: Math.max(9, Style.font.caption - 1)
+              font.bold: tile.mirroredBy.length > 0
+              elide: Text.ElideRight
+            }
+
+            Item {
+              visible: tile.height >= Style.space(64) && !!tile.modelData.mode
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.bottom: parent.bottom
+              anchors.margins: Style.space(6)
+              height: tileRes.implicitHeight
+
+              Text {
+                id: tileRes
+                anchors.left: parent.left
+                anchors.right: tileHz.left
+                anchors.rightMargin: Style.space(4)
+                textFormat: Text.PlainText
+                text: tile.modelData.mode ? (tile.modelData.mode.w + "×" + tile.modelData.mode.h) : ""
+                color: root.muted
+                font.family: root.fontName
+                font.pixelSize: Math.max(9, Style.font.caption - 1)
+                elide: Text.ElideRight
+              }
+
+              Text {
+                id: tileHz
+                anchors.right: parent.right
+                textFormat: Text.PlainText
+                text: tile.modelData.mode ? (Math.round(tile.modelData.mode.hz) + "Hz") : ""
+                color: root.muted
+                font.family: root.fontName
+                font.pixelSize: Math.max(9, Style.font.caption - 1)
+              }
+            }
+
+            MouseArea {
+              id: tileMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              preventStealing: true
+              cursorShape: canvas.dragIndex === tile.index ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+              property real grabFx: 0.5
+              property real grabFy: 0.5
+              property var start: null
+
+              onPressed: function(mouse) {
+                root.selected = tile.index
+                grabFx = tile.width > 0 ? Math.max(0, Math.min(1, mouse.x / tile.width)) : 0.5
+                grabFy = tile.height > 0 ? Math.max(0, Math.min(1, mouse.y / tile.height)) : 0.5
+                start = Model.rectOf(tile.modelData)
+                canvas.dragBounds = canvas.boundsFor(root.draft)
+                canvas.dragRect = start
+                canvas.activeSnap = null
+                canvas.dragIndex = tile.index
+              }
+              onPositionChanged: function(mouse) {
+                if (canvas.dragIndex !== tile.index || !start) return
+                var v = canvas.view
+                var p = mapToItem(tilesStage, mouse.x, mouse.y)
+                var wanted = {
+                  x: Math.round((p.x - v.ox) / v.k + v.minX - grabFx * start.w),
+                  y: Math.round((p.y - v.oy) / v.k + v.minY - grabFy * start.h),
+                  w: start.w,
+                  h: start.h
+                }
+                // Hold Shift to disable magnetic snapping for 1px fine positioning;
+                // otherwise snap cleanly within 8px on-screen toward edges & H/V centers.
+                var snapThreshold = (mouse.modifiers & Qt.ShiftModifier) ? 0 : (Style.space(8) / v.k)
+                var res = Model.attachWithGuides(wanted, canvas.others(tile.index), snapThreshold)
+                canvas.dragRect = res.rect
+                canvas.activeSnap = res.snap
+                canvas.expandDragBounds(res.rect)
+              }
+              onReleased: {
+                if (canvas.dragIndex !== tile.index) return
+                var index = tile.index
+                var r = canvas.dragRect
+                var moved = r && start && (r.x !== start.x || r.y !== start.y)
+                canvas.dragIndex = -1
+                canvas.dragRect = null
+                canvas.activeSnap = null
+                canvas.dragBounds = null
+                start = null
+                if (!moved) return
+                var next = root.draft.map(root.copyOutput)
+                next[index].x = r.x
+                next[index].y = r.y
+                root.edited = true
+                root.draft = Model.solve(next, index, 0)
+              }
+              onCanceled: {
+                canvas.dragIndex = -1
+                canvas.dragRect = null
+                canvas.activeSnap = null
+                canvas.dragBounds = null
+                start = null
+              }
+            }
           }
         }
       }
@@ -2566,8 +2667,10 @@ Panel {
         anchors.right: canvasCoord.left
         anchors.rightMargin: Style.space(8)
         textFormat: Text.PlainText
-        text: "Drag tiles · 1-9 select · ←/→ switch · Enter apply"
-        color: root.muted
+        text: canvas.dragIndex >= 0
+          ? (canvas.activeSnap ? (canvas.activeSnap.label + " · hold Shift for free move") : "Drag to place · hold Shift for free move")
+          : "Drag tiles · 1-9 select · ←/→ switch · Enter apply"
+        color: canvas.dragIndex >= 0 && canvas.activeSnap ? root.accent : root.muted
         font.family: root.fontName
         font.pixelSize: Math.max(9, Style.font.caption - 1)
         elide: Text.ElideRight

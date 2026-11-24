@@ -451,6 +451,34 @@ TestCase {
         compare(plan[0].selector, "DP-2")
         compare(plan[0].vrrManaged, false)
     }
+
+    function test_attach_with_guides_snaps_closest_edge_and_hv_centers() {
+        var placed = [{ x: 0, y: 0, w: 2560, h: 1440 }]
+        // Horizontal center snap (below): centerX = 1280, rect x = 320
+        var hCent = Model.attachWithGuides({ x: 340, y: 1440, w: 1920, h: 1080 }, placed, 60)
+        compare([hCent.rect.x, hCent.rect.y], [320, 1440])
+        compare(hCent.snap.axis, "x")
+        compare(hCent.snap.kind, "h-center")
+        compare(hCent.snap.guidePos, 1280)
+
+        // Vertical center snap (to right): centerY = 720, rect y = 180
+        var vCent = Model.attachWithGuides({ x: 2560, y: 195, w: 1920, h: 1080 }, placed, 60)
+        compare([vCent.rect.x, vCent.rect.y], [2560, 180])
+        compare(vCent.snap.axis, "y")
+        compare(vCent.snap.kind, "v-center")
+        compare(vCent.snap.guidePos, 720)
+
+        // Bottom edge snap picks closest over center
+        var bot = Model.attachWithGuides({ x: 2560, y: 345, w: 1920, h: 1080 }, placed, 60)
+        compare([bot.rect.x, bot.rect.y], [2560, 360])
+        compare(bot.snap.kind, "bottom")
+        compare(bot.snap.guidePos, 1440)
+
+        // Free move (alignWithin = 0) allows exact 1px fine positioning without jumping
+        var free = Model.attachWithGuides({ x: 347, y: 1440, w: 1920, h: 1080 }, placed, 0)
+        compare([free.rect.x, free.rect.y], [347, 1440])
+        compare(free.snap, null)
+    }
 }
 """
 

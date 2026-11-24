@@ -215,7 +215,12 @@ Item {
     if (brightnessProc.running || brightnessQueue.length === 0) return
     var next = brightnessQueue[0]
     brightnessQueue = brightnessQueue.slice(1)
-    brightnessProc.command = ["omarchy-brightness-display", "--no-osd", "--monitor", next.name, next.pct + "%"]
+    if (next.delta !== undefined) {
+      var stepArg = next.delta > 0 ? ("+" + next.delta + "%") : (Math.abs(next.delta) + "%-")
+      brightnessProc.command = ["omarchy-brightness-display", "--monitor", next.name, stepArg]
+    } else {
+      brightnessProc.command = ["omarchy-brightness-display", "--no-osd", "--monitor", next.name, next.pct + "%"]
+    }
     brightnessProc.running = true
     if (!brightnessProc.running) Qt.callLater(service.pumpBrightness)
   }
@@ -231,6 +236,28 @@ Item {
       if (brightnessQueue[i].name !== n) next.push(brightnessQueue[i])
     }
     next.push({ name: n, pct: clamped })
+    brightnessQueue = next
+    pumpBrightness()
+    return true
+  }
+
+  function enqueueBrightnessStep(name, deltaPct) {
+    var n = String(name || "").trim()
+    var d = Math.round(Number(deltaPct))
+    if (!n || !isFinite(d) || d === 0) return false
+    var next = []
+    var merged = false
+    for (var i = 0; i < brightnessQueue.length; i++) {
+      var item = brightnessQueue[i]
+      if (item.name === n && item.delta !== undefined) {
+        var combined = Math.max(-100, Math.min(100, item.delta + d))
+        if (combined !== 0) next.push({ name: n, delta: combined })
+        merged = true
+      } else {
+        next.push(item)
+      }
+    }
+    if (!merged) next.push({ name: n, delta: Math.max(-100, Math.min(100, d)) })
     brightnessQueue = next
     pumpBrightness()
     return true
