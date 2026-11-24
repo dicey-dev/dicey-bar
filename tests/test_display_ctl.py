@@ -317,6 +317,23 @@ class PersistTest(unittest.TestCase):
             self.assertEqual(saved["monitors"][fp]["ddcInput"], "0x0f")
             self.assertEqual(saved["monitors"][fp]["ddcConnector"], "HDMI-A-1")
 
+    def test_ddc_relearn_does_not_resurrect_profile_forgotten_during_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"XDG_STATE_HOME": str(Path(tmp) / "state")}
+            fp = "BNQ|BenQ GW2790Q|ET97T00426087"
+            def forget_during_probe(names, force_refresh=False):
+                # Simulate user clicking Forget while slow DDC probe is running
+                ctl.persist({"memory": {"version": 1, "monitors": {}, "layouts": {}}})
+                return {names[0]: "0x0f"}
+
+            with mock.patch.dict(os.environ, env):
+                ctl.persist({"memory": {"version": 1, "monitors": {fp: {"ddcWatch": True}}, "layouts": {}}})
+                with mock.patch.object(ctl, "ddc_poll", side_effect=forget_during_probe):
+                    res = ctl.ddc_relearn("HDMI-A-1", fp)
+                saved = json.loads((Path(tmp) / "state" / "dicey-bar" / "displays.json").read_text())
+            self.assertFalse(res["ok"])
+            self.assertEqual(saved["monitors"], {})
+
     def test_cached_buses_rate_limits_detect_for_powered_off_monitor(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = {"XDG_RUNTIME_DIR": tmp}
