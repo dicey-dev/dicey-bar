@@ -479,6 +479,119 @@ TestCase {
         compare([free.rect.x, free.rect.y], [347, 1440])
         compare(free.snap, null)
     }
+
+    function test_attach_with_guides_preserves_valid_placement_when_snap_obstructed() {
+        var placed = [
+            { x: 0, y: 0, w: 300, h: 240 },
+            { x: 70, y: 240, w: 160, h: 400 },
+            { x: 300, y: 60, w: 280, h: 210 }
+        ]
+        var res = Model.attachWithGuides({ x: 240, y: 270, w: 140, h: 380 }, placed, 30)
+        compare([res.rect.x, res.rect.y], [240, 270])
+        for (var i = 0; i < placed.length; i++) verify(!Model.overlaps(res.rect, placed[i]))
+    }
+
+    function test_pointer_anchored_drag_prevents_zoom_feedback_and_min_tile_jump() {
+        // Two 1920x1080 monitors on a 600x184 canvas (usableH = 162, pad = 14)
+        var spanX0 = 3840, spanY0 = 1080
+        var k0 = Math.min((600 - 28) / (spanX0 * 1.24), (162 - 28) / (spanY0 * 1.20))
+        var start = { x: 1920, y: 0, w: 1920, h: 1080 }
+        var p0 = { x: 400, y: 80 }
+        var anchor = Model.createDragAnchor(p0, start, k0)
+
+        // Drag down to y ~= 500
+        var p1 = { x: 400, y: 80 + 500 * k0 }
+        var w1 = Model.dragWantedRect(anchor, p1)
+        compare(w1.y, 500)
+
+        // Bounds expand vertically to [0..1580], reducing k
+        var k1 = Math.min((600 - 28) / (3840 * 1.24), (162 - 28) / (1580 * 1.20))
+        verify(k1 < k0)
+        anchor = Model.rebaseDragAnchor(anchor, p1, w1, k1)
+
+        // Next 1px pointer movement must advance by ~1/k1 (~14px), never jump to ~996
+        var p2 = { x: 400, y: p1.y + 1 }
+        var w2 = Model.dragWantedRect(anchor, p2)
+        verify(w2.y > 500 && w2.y < 530)
+
+        // Minimum-sized tile (200%-scaled laptop 960x540 beside 4K 3840x2160):
+        // grabbing anywhere preserves exact start position with zero jump on first Shift-drag
+        var smallK = Math.min((600 - 28) / (4800 * 1.24), (162 - 28) / (2160 * 1.20))
+        var laptopRect = { x: 0, y: 0, w: 960, h: 540 }
+        var smallAnchor = Model.createDragAnchor({ x: 80, y: 65 }, laptopRect, smallK)
+        compare(Model.dragWantedRect(smallAnchor, { x: 80, y: 65 }), laptopRect)
+        var shifted = Model.dragWantedRect(smallAnchor, { x: 81, y: 65 })
+        compare(shifted.y, 0)
+        compare(shifted.x, Math.round(1 / smallK))
+    }
+
+    function test_ddc_quick_port_swap_legacy_migration_and_backoff_retry() {
+        var fp = "BNQ|BenQ GW2790Q|ET97T00426087"
+        var movedBenq = benq()
+        movedBenq.name = "DP-1"
+        var mem = { version: 1, monitors: {}, layouts: {} }
+        mem.monitors[fp] = {
+            mode: { w: 2560, h: 1440, hz: 100 }, scale: 1, vrr: 0, hdr: false,
+            ddcWatch: true, ddcInput: "0x11", ddcConnector: "HDMI-A-1"
+        }
+
+        // Quick swap while ddcOff was set: pruneDdcState clears stale off/misses
+        var identified = Model.planFromLive([laptop(), movedBenq], mem, {})
+        var pruned = Model.pruneDdcState(identified, mem, { [fp]: true }, { [fp]: 4 }, { [fp]: { connector: "HDMI-A-1", inFlight: false, failures: 2, nextRetryAt: 99999 } })
+        compare(pruned.ddcOff, {})
+        compare(pruned.ddcMisses, {})
+        compare(pruned.relearnState, {})
+        verify(Model.ddcNeedsRelearn(mem.monitors[fp], "DP-1"))
+        verify(!Model.ddcNeedsRelearn(mem.monitors[fp], "HDMI-A-1"))
+
+        // With stale ddcOff cleared, derive keeps the moved monitor enabled
+        var autoOff = Model.autoOffFor(identified, false, pruned.ddcOff)
+        compare(autoOff, {})
+        var derived = Model.derive([laptop(), movedBenq], mem, autoOff)
+        compare(byName(derived, "DP-1").autoOff, false)
+        compare(byName(derived, "DP-1").enabled, true)
+
+        // Legacy profile (no ddcConnector) requires migration re-learn on any connector
+        var legacy = { ddcWatch: true, ddcInput: "0x11" }
+        verify(Model.ddcNeedsRelearn(legacy, "HDMI-A-1"))
+        verify(Model.ddcNeedsRelearn(legacy, "DP-1"))
+
+        // Transient failure backoff, retry, connector transition reset, and Re-probe clear
+        var b1 = Model.ddcRelearnBegin({}, fp, "DP-1", 1000)
+        verify(b1.allowed)
+        verify(!Model.ddcRelearnBegin(b1.state, fp, "DP-1", 1001).allowed)
+        var f1 = Model.ddcRelearnFinish(b1.state, fp, "DP-1", false, 1500)
+        verify(!Model.ddcRelearnBegin(f1, fp, "DP-1", 6499).allowed)
+        var b2 = Model.ddcRelearnBegin(f1, fp, "DP-1", 6500)
+        verify(b2.allowed)
+        var f2 = Model.ddcRelearnFinish(b2.state, fp, "DP-1", false, 7000)
+        verify(!Model.ddcRelearnBegin(f2, fp, "DP-1", 16999).allowed)
+        // Re-probe clears backoff immediately
+        var cleared = Model.ddcRelearnClearBackoff(f2)
+        verify(Model.ddcRelearnBegin(cleared, fp, "DP-1", 7100).allowed)
+        // Connector change invalidates old backoff immediately
+        verify(Model.ddcRelearnBegin(f2, fp, "DP-2", 7100).allowed)
+        // Success removes tracking entry
+        compare(Model.ddcRelearnFinish(b2.state, fp, "DP-1", true, 7000), {})
+    }
+
+    function test_sync_draft_brightness_reconciles_slider_scroll_and_low_steps() {
+        var draft = Model.derive([laptop(), benq()], {}, {})
+        byName(draft, "eDP-1").brightness = 40
+        // Bar-icon scroll moves hardware 40% -> 45%; draft syncs before Apply
+        var s1 = Model.syncDraftBrightness(draft, "eDP-1", 45)
+        verify(s1.changed)
+        compare(byName(s1.draft, "eDP-1").brightness, 45)
+        var mem = Model.remember({}, s1.draft, "t1")
+        compare(mem.monitors["LG Display|0x0753|"].brightness, 45)
+
+        // Low-brightness step (Omarchy +5% at 2% steps to 3%) syncs exact actual value
+        var s2 = Model.syncDraftBrightness(s1.draft, "eDP-1", 3)
+        verify(s2.changed)
+        compare(byName(s2.draft, "eDP-1").brightness, 3)
+        var mem2 = Model.remember(mem, s2.draft, "t2")
+        compare(mem2.monitors["LG Display|0x0753|"].brightness, 3)
+    }
 }
 """
 

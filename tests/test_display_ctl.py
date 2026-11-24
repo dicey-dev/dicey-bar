@@ -386,6 +386,31 @@ class PersistTest(unittest.TestCase):
             self.assertEqual(oct((Path(tmp) / "state" / "dicey-bar" / "displays.json").stat().st_mode & 0o777), "0o600")
             self.assertIn(ctl.BEGIN, lua.read_text())
 
+    def test_persist_migrates_legacy_ddc_profile_with_fresh_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lua = Path(tmp) / "hypr" / "monitors.lua"
+            env = {"XDG_STATE_HOME": str(Path(tmp) / "state"), "DICEY_DISPLAYS_MONITORS_LUA": str(lua)}
+            fp = "BNQ|BenQ GW2790Q|ET97T00426087"
+            moved_plan = [dict(output(name="DP-1", ddcWatch=True))]
+            # Legacy profile from main: has ddcInput, lacks ddcConnector
+            legacy_mem = {"version": 1, "monitors": {fp: {"ddcWatch": True, "ddcInput": "0x11"}}, "layouts": {}}
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(ctl, "ddc_poll", return_value={"DP-1": None}) as fail_poll:
+                ctl.persist({"plan": moved_plan, "memory": json.loads(json.dumps(legacy_mem))})
+                saved_fail = json.loads((Path(tmp) / "state" / "dicey-bar" / "displays.json").read_text())
+                fail_poll.assert_called_once_with(["DP-1"], force_refresh=True)
+            # Failed read must NOT stamp ddcConnector onto unverified old input
+            self.assertNotIn("ddcConnector", saved_fail["monitors"][fp])
+            self.assertEqual(saved_fail["monitors"][fp]["ddcInput"], "0x11")
+
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(ctl, "ddc_poll", return_value={"DP-1": "0x0f"}) as ok_poll:
+                ctl.persist({"plan": moved_plan, "memory": saved_fail})
+                saved_ok = json.loads((Path(tmp) / "state" / "dicey-bar" / "displays.json").read_text())
+                ok_poll.assert_called_once_with(["DP-1"], force_refresh=True)
+            self.assertEqual(saved_ok["monitors"][fp]["ddcInput"], "0x0f")
+            self.assertEqual(saved_ok["monitors"][fp]["ddcConnector"], "DP-1")
+
     def test_cli_reports_invalid_input_as_json(self):
         result = subprocess.run([sys.executable, "-I", str(HELPER), "apply"], input="[]",
                                 capture_output=True, text=True, timeout=30)
