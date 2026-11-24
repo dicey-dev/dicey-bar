@@ -307,13 +307,56 @@ function sanitizeMirrors(outputs) {
 // must touch the rest. `alignWithin` magnetically snaps edges and centers into
 // line when within that logical-pixel threshold, always picking the closest
 // matching guide line.
+function overlapsAny(rect, placed) {
+  for (var i = 0; i < placed.length; i++) if (overlaps(rect, placed[i])) return true
+  return false
+}
+
+// Pointer-anchored canvas drag math: computes logical coordinates from screen
+// deltas relative to the current drag anchor so minimum-sized tiles never jump
+// on initial grab and viewport expansion never creates zoom feedback.
+function createDragAnchor(pointer, startRect, viewK) {
+  var k = Number(viewK) > 0 ? Number(viewK) : 1
+  return {
+    screenX: Number(pointer && pointer.x) || 0,
+    screenY: Number(pointer && pointer.y) || 0,
+    logicalX: startRect.x,
+    logicalY: startRect.y,
+    w: startRect.w,
+    h: startRect.h,
+    k: k
+  }
+}
+
+function dragWantedRect(anchor, pointer) {
+  var k = Number(anchor && anchor.k) > 0 ? Number(anchor.k) : 1
+  return {
+    x: Math.round(anchor.logicalX + ((Number(pointer && pointer.x) || 0) - anchor.screenX) / k),
+    y: Math.round(anchor.logicalY + ((Number(pointer && pointer.y) || 0) - anchor.screenY) / k),
+    w: anchor.w,
+    h: anchor.h
+  }
+}
+
+function rebaseDragAnchor(anchor, pointer, wanted, newViewK) {
+  var k = Number(newViewK) > 0 ? Number(newViewK) : anchor.k
+  return {
+    screenX: Number(pointer && pointer.x) || 0,
+    screenY: Number(pointer && pointer.y) || 0,
+    logicalX: wanted.x,
+    logicalY: wanted.y,
+    w: anchor.w,
+    h: anchor.h,
+    k: k
+  }
+}
+
 function attachWithGuides(rect, placed, alignWithin) {
   if (!placed.length) return { rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h }, snap: null }
   var snap = Number(alignWithin) > 0 ? Number(alignWithin) : 0
-  var free = true
+  var free = !overlapsAny(rect, placed)
   var touching = false
   for (var i = 0; i < placed.length; i++) {
-    if (overlaps(rect, placed[i])) free = false
     if (sharedEdge(rect, placed[i]) > 0) touching = true
   }
   if (free && touching && !snap) return { rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h }, snap: null }
@@ -338,7 +381,8 @@ function attachWithGuides(rect, placed, alignWithin) {
       { x: clamp(rect.x, o.x - rect.w + 1, o.x + o.w - 1), y: o.y - rect.h, axis: "x" }
     ]
     for (var s = 0; s < sides.length; s++) {
-      var c = { x: sides[s].x, y: sides[s].y, w: rect.w, h: rect.h }
+      var base = { x: sides[s].x, y: sides[s].y, w: rect.w, h: rect.h }
+      var c = { x: base.x, y: base.y, w: base.w, h: base.h }
       var matchedGuide = null
       if (snap) {
         var candidates = []
@@ -346,9 +390,9 @@ function attachWithGuides(rect, placed, alignWithin) {
           for (var t = 0; t < placed.length; t++) {
             var refY = placed[t]
             candidates.push({ pos: refY.y, guidePos: refY.y, kind: "top", label: "Top aligned" })
-            candidates.push({ pos: refY.y + refY.h - c.h, guidePos: refY.y + refY.h, kind: "bottom", label: "Bottom aligned" })
+            candidates.push({ pos: refY.y + refY.h - base.h, guidePos: refY.y + refY.h, kind: "bottom", label: "Bottom aligned" })
             candidates.push({
-              pos: refY.y + Math.round((refY.h - c.h) / 2),
+              pos: refY.y + Math.round((refY.h - base.h) / 2),
               guidePos: refY.y + Math.round(refY.h / 2),
               kind: "v-center",
               label: "V-centered"
@@ -357,7 +401,7 @@ function attachWithGuides(rect, placed, alignWithin) {
           if (placed.length > 1) {
             var gH = gMaxY - gMinY
             candidates.push({
-              pos: gMinY + Math.round((gH - c.h) / 2),
+              pos: gMinY + Math.round((gH - base.h) / 2),
               guidePos: gMinY + Math.round(gH / 2),
               kind: "v-center",
               label: "V-centered"
@@ -367,9 +411,9 @@ function attachWithGuides(rect, placed, alignWithin) {
           for (var u = 0; u < placed.length; u++) {
             var refX = placed[u]
             candidates.push({ pos: refX.x, guidePos: refX.x, kind: "left", label: "Left aligned" })
-            candidates.push({ pos: refX.x + refX.w - c.w, guidePos: refX.x + refX.w, kind: "right", label: "Right aligned" })
+            candidates.push({ pos: refX.x + refX.w - base.w, guidePos: refX.x + refX.w, kind: "right", label: "Right aligned" })
             candidates.push({
-              pos: refX.x + Math.round((refX.w - c.w) / 2),
+              pos: refX.x + Math.round((refX.w - base.w) / 2),
               guidePos: refX.x + Math.round(refX.w / 2),
               kind: "h-center",
               label: "H-centered"
@@ -378,44 +422,44 @@ function attachWithGuides(rect, placed, alignWithin) {
           if (placed.length > 1) {
             var gW = gMaxX - gMinX
             candidates.push({
-              pos: gMinX + Math.round((gW - c.w) / 2),
+              pos: gMinX + Math.round((gW - base.w) / 2),
               guidePos: gMinX + Math.round(gW / 2),
               kind: "h-center",
               label: "H-centered"
             })
           }
         }
-        var currentVal = sides[s].axis === "y" ? c.y : c.x
-        var bestSnap = null
+        var currentVal = sides[s].axis === "y" ? base.y : base.x
+        var within = []
         for (var l = 0; l < candidates.length; l++) {
           var cand = candidates[l]
           var delta = Math.abs(currentVal - cand.pos)
-          if (delta <= snap && (!bestSnap || delta < bestSnap.delta)) {
-            bestSnap = { pos: cand.pos, guidePos: cand.guidePos, kind: cand.kind, label: cand.label, delta: delta }
-          }
+          if (delta <= snap) within.push({ pos: cand.pos, guidePos: cand.guidePos, kind: cand.kind, label: cand.label, delta: delta })
         }
-        if (bestSnap) {
+        within.sort(function(a, b) { return a.delta - b.delta })
+        // Choose the nearest valid (unobstructed, edge-sharing) alignment so an
+        // obstructed guide never discards a valid unsnapped side placement.
+        for (var wIdx = 0; wIdx < within.length; wIdx++) {
+          var wCand = within[wIdx]
           var snappedC = {
-            x: sides[s].axis === "x" ? bestSnap.pos : c.x,
-            y: sides[s].axis === "y" ? bestSnap.pos : c.y,
-            w: c.w,
-            h: c.h
+            x: sides[s].axis === "x" ? wCand.pos : base.x,
+            y: sides[s].axis === "y" ? wCand.pos : base.y,
+            w: base.w,
+            h: base.h
           }
-          if (sharedEdge(snappedC, o) > 0) {
-            c.x = snappedC.x
-            c.y = snappedC.y
+          if (sharedEdge(snappedC, o) > 0 && !overlapsAny(snappedC, placed)) {
+            c = snappedC
             matchedGuide = {
               axis: sides[s].axis,
-              guidePos: bestSnap.guidePos,
-              kind: bestSnap.kind,
-              label: bestSnap.label
+              guidePos: wCand.guidePos,
+              kind: wCand.kind,
+              label: wCand.label
             }
+            break
           }
         }
       }
-      var clear = true
-      for (var q = 0; q < placed.length; q++) if (overlaps(c, placed[q])) clear = false
-      if (!clear) continue
+      if (overlapsAny(c, placed)) continue
       var dx = c.x - rect.x
       var dy = c.y - rect.y
       var distance = dx * dx + dy * dy
@@ -1019,6 +1063,114 @@ function ddcStep(misses, reading, expected) {
     count += 1
   }
   return { misses: count, off: count >= 4 }
+}
+
+// True when a watched external monitor needs its VCP 0x60 input learned:
+// missing input, moved to a different PC connector, or legacy profile saved
+// before ddcConnector tracking existed.
+function ddcNeedsRelearn(profile, connectorName) {
+  if (!profile || profile.ddcWatch !== true) return false
+  if (!profile.ddcInput) return true
+  return !profile.ddcConnector || String(profile.ddcConnector) !== String(connectorName || "")
+}
+
+// Clear DDC state for disconnected monitors AND for watched monitors that
+// reconnected on a different PC connector (or require legacy migration) so a
+// quick port swap while auto-disabled never leaves the monitor stuck off.
+function pruneDdcState(identifiedOutputs, memory, ddcOff, ddcMisses, relearnState) {
+  var mem = normalizeMemory(memory)
+  var present = {}
+  var connectors = {}
+  for (var i = 0; i < (identifiedOutputs || []).length; i++) {
+    var o = identifiedOutputs[i]
+    if (!o || !o.fp) continue
+    present[o.fp] = true
+    connectors[o.fp] = o.name
+  }
+  var off = {}
+  var misses = {}
+  var relearn = {}
+  for (var fp in ddcOff || {}) {
+    if (!present[fp]) continue
+    var profOff = mem.monitors[fp]
+    if (profOff && ddcNeedsRelearn(profOff, connectors[fp])) continue
+    off[fp] = ddcOff[fp]
+  }
+  for (var mp in ddcMisses || {}) {
+    if (!present[mp]) continue
+    var profMiss = mem.monitors[mp]
+    if (profMiss && ddcNeedsRelearn(profMiss, connectors[mp])) continue
+    misses[mp] = ddcMisses[mp]
+  }
+  for (var rp in relearnState || {}) {
+    if (!present[rp]) continue
+    var entry = relearnState[rp]
+    if (!entry || entry.connector !== connectors[rp]) continue
+    relearn[rp] = entry
+  }
+  return { ddcOff: off, ddcMisses: misses, relearnState: relearn }
+}
+
+function ddcRelearnBegin(state, fp, connector, now) {
+  var cur = state && state[fp] ? state[fp] : null
+  var sameConn = !!(cur && cur.connector === connector)
+  if (sameConn && cur.inFlight) return { allowed: false, state: state || {} }
+  if (sameConn && cur.nextRetryAt && now < cur.nextRetryAt) return { allowed: false, state: state || {} }
+  var next = {}
+  for (var k in state || {}) next[k] = state[k]
+  next[fp] = {
+    connector: connector,
+    inFlight: true,
+    failures: sameConn ? (Number(cur.failures) || 0) : 0,
+    nextRetryAt: 0
+  }
+  return { allowed: true, state: next }
+}
+
+function ddcRelearnFinish(state, fp, connector, ok, now) {
+  var next = {}
+  for (var k in state || {}) next[k] = state[k]
+  var cur = next[fp]
+  if (!cur || cur.connector !== connector) return next
+  if (ok) {
+    delete next[fp]
+    return next
+  }
+  var failures = (Number(cur.failures) || 0) + 1
+  var backoffMs = Math.min(60000, 5000 * Math.pow(2, failures - 1))
+  next[fp] = {
+    connector: connector,
+    inFlight: false,
+    failures: failures,
+    nextRetryAt: now + backoffMs
+  }
+  return next
+}
+
+function ddcRelearnClearBackoff(state) {
+  var next = {}
+  for (var k in state || {}) {
+    var cur = state[k]
+    if (cur && cur.inFlight) next[k] = cur
+  }
+  return next
+}
+
+function syncDraftBrightness(draft, monitorName, pct) {
+  var clean = cleanBrightness(pct)
+  if (!Array.isArray(draft) || !monitorName || clean === null) return { draft: draft || [], changed: false }
+  var changed = false
+  var next = draft.map(function(o) {
+    var c = {}
+    for (var k in o) c[k] = o[k]
+    if (o.mode) c.mode = { w: o.mode.w, h: o.mode.h, hz: o.mode.hz }
+    if (o.name === monitorName && c.brightness !== clean) {
+      c.brightness = clean
+      changed = true
+    }
+    return c
+  })
+  return { draft: next, changed: changed }
 }
 
 // Hotplug handling applies the same plan at most twice in 20 seconds. The

@@ -39,9 +39,9 @@ Item {
   // keyed by fingerprint, and the consecutive DDC misses behind that.
   property var ddcOff: ({})
   property var ddcMisses: ({})
-  // Tracks auto-relearn attempts keyed by "<fp>@<connector>" so a connector
-  // swap triggers one automatic re-learn without looping if DDC fails.
-  property var autoRelearnAttempted: ({})
+  // Per-fingerprint auto-relearn state ({ connector, inFlight, failures, nextRetryAt })
+  // so transient wake-up timeouts back off and retry instead of sticking forever.
+  property var autoRelearnState: ({})
 
   // Modes Hyprland did not take on the last apply, usually link bandwidth.
   property var fallbacks: []
@@ -66,6 +66,7 @@ Item {
   property string lastPrefsTopology: ""
 
   signal refreshed()
+  signal brightnessUpdated(string monitorName, int pct)
 
   // ---------------------------------------------------------------- jobs
   // Helper calls run one at a time, in order.
@@ -170,28 +171,31 @@ Item {
     })
   }
 
+  function reprobe(then) {
+    autoRelearnState = Model.ddcRelearnClearBackoff(autoRelearnState)
+    refresh(function() {
+      reconcile()
+      if (then) then()
+    })
+  }
+
   function forgetGoneMonitors() {
-    var present = {}
-    for (var i = 0; i < livePlan.length; i++) present[livePlan[i].fp] = true
-    var off = {}
-    var misses = {}
-    var attempted = {}
-    for (var fp in ddcOff) if (present[fp]) off[fp] = ddcOff[fp]
-    for (var mp in ddcMisses) if (present[mp]) misses[mp] = ddcMisses[mp]
-    for (var ak in autoRelearnAttempted) {
-      var sep = ak.lastIndexOf("@")
-      var afp = sep > 0 ? ak.slice(0, sep) : ak
-      if (present[afp]) attempted[ak] = autoRelearnAttempted[ak]
-    }
-    ddcOff = off
-    ddcMisses = misses
-    autoRelearnAttempted = attempted
+    // Identify connected monitors independently of stale ddcOff so moving an
+    // auto-disabled monitor to a new PC connector clears its stale ddcOff/misses
+    // immediately before reconcile() computes currentAutoOff.
+    var identified = Model.planFromLive(monitors, memory, {})
+    var pruned = Model.pruneDdcState(identified, memory, ddcOff, ddcMisses, autoRelearnState)
+    ddcOff = pruned.ddcOff
+    ddcMisses = pruned.ddcMisses
+    autoRelearnState = pruned.relearnState
   }
 
   // ---------------------------------------------------------------- unified brightness & text-size queues
-  // Single immutable { name, pct } queue so slider drags, tab switches, Sync all,
-  // and IPC brightness calls never collide or write to the wrong monitor.
+  // Single immutable queue ({ name, pct } | { name, delta } | { name, readOnly })
+  // so slider drags, bar-icon scroll steps, readbacks, Sync all, and IPC calls
+  // never collide or write to the wrong monitor.
   property var brightnessQueue: []
+  property var activeBrightnessJob: null
   property int pendingTextSize: 0
 
   Process {
@@ -218,21 +222,47 @@ Item {
 
   Process {
     id: brightnessProc
-    onExited: service.pumpBrightness()
+    stdout: StdioCollector { id: brightnessOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      var doneJob = service.activeBrightnessJob
+      service.activeBrightnessJob = null
+      if (doneJob && doneJob.readOnly && exitCode === 0) {
+        var hasPendingForMonitor = false
+        for (var i = 0; i < service.brightnessQueue.length; i++) {
+          if (service.brightnessQueue[i].name === doneJob.name) {
+            hasPendingForMonitor = true
+            break
+          }
+        }
+        if (!hasPendingForMonitor) {
+          var val = parseInt(String(brightnessOut.text || "").trim(), 10)
+          if (isFinite(val)) {
+            service.brightnessUpdated(doneJob.name, Math.max(1, Math.min(100, val)))
+          }
+        }
+      }
+      service.pumpBrightness()
+    }
   }
 
   function pumpBrightness() {
     if (brightnessProc.running || brightnessQueue.length === 0) return
     var next = brightnessQueue[0]
     brightnessQueue = brightnessQueue.slice(1)
-    if (next.delta !== undefined) {
+    activeBrightnessJob = next
+    if (next.readOnly) {
+      brightnessProc.command = ["omarchy-brightness-display", "--monitor", next.name]
+    } else if (next.delta !== undefined) {
       var stepArg = next.delta > 0 ? ("+" + next.delta + "%") : (Math.abs(next.delta) + "%-")
       brightnessProc.command = ["omarchy-brightness-display", "--monitor", next.name, stepArg]
     } else {
       brightnessProc.command = ["omarchy-brightness-display", "--no-osd", "--monitor", next.name, next.pct + "%"]
     }
     brightnessProc.running = true
-    if (!brightnessProc.running) Qt.callLater(service.pumpBrightness)
+    if (!brightnessProc.running) {
+      activeBrightnessJob = null
+      Qt.callLater(service.pumpBrightness)
+    }
   }
 
   function enqueueBrightness(name, pct) {
@@ -240,7 +270,7 @@ Item {
     var v = Number(pct)
     if (!n || !isFinite(v)) return false
     var clamped = Math.max(1, Math.min(100, Math.round(v)))
-    // Coalesce any already-queued write for the same monitor so dragging stays snappy.
+    // Coalesce any already-queued write or readback for the same monitor so dragging stays snappy.
     var next = []
     for (var i = 0; i < brightnessQueue.length; i++) {
       if (brightnessQueue[i].name !== n) next.push(brightnessQueue[i])
@@ -259,6 +289,7 @@ Item {
     var merged = false
     for (var i = 0; i < brightnessQueue.length; i++) {
       var item = brightnessQueue[i]
+      if (item.name === n && item.readOnly) continue
       if (item.name === n && item.delta !== undefined) {
         var combined = Math.max(-100, Math.min(100, item.delta + d))
         if (combined !== 0) next.push({ name: n, delta: combined })
@@ -268,6 +299,9 @@ Item {
       }
     }
     if (!merged) next.push({ name: n, delta: Math.max(-100, Math.min(100, d)) })
+    // Queue a serialized readback after the step burst so the panel slider and
+    // draft stay synced with actual hardware brightness (including <5% 1% steps).
+    next.push({ name: n, readOnly: true })
     brightnessQueue = next
     pumpBrightness()
     return true
@@ -333,10 +367,13 @@ Item {
     var nextMemory = Model.forgetMonitor(memory, fp)
     var off = {}
     var misses = {}
+    var relearn = {}
     for (var k in ddcOff) if (k !== fp) off[k] = ddcOff[k]
     for (var m in ddcMisses) if (m !== fp) misses[m] = ddcMisses[m]
+    for (var r in autoRelearnState) if (r !== fp) relearn[r] = autoRelearnState[r]
     ddcOff = off
     ddcMisses = misses
+    autoRelearnState = relearn
     var payload = { memory: nextMemory }
     if (!Model.hasMemory(nextMemory)) {
       payload.removeManagedBlock = true
@@ -356,7 +393,7 @@ Item {
     })
   }
 
-  function relearnDdcInput(name, fp, done) {
+  function relearnDdcInput(name, fp, done, silentError) {
     if (!name || !fp || confirming) return
     run(["ddc-relearn", name, fp], null, function(code, data, stderr) {
       if (code === 0 && data && data.ok) {
@@ -367,31 +404,36 @@ Item {
         for (var m in service.ddcMisses) if (m !== fp) misses[m] = service.ddcMisses[m]
         service.ddcOff = off
         service.ddcMisses = misses
-        service.lastError = ""
+        if (!silentError) service.lastError = ""
         if (done) done(true, data)
       } else {
         var err = service.errorText(data, stderr)
-        service.lastError = err
+        if (!silentError) service.lastError = err
         if (done) done(false, { error: err })
       }
     })
   }
 
   function autoRelearnMovedConnectors(plan) {
-    if (!Array.isArray(plan) || !memory || !memory.monitors) return
+    if (isDevInstance || confirming || !Array.isArray(plan) || !memory || !memory.monitors) return
+    var now = Date.now()
     for (var i = 0; i < plan.length; i++) {
       var o = plan[i]
-      if (!o || o.internal || !o.enabled || o.autoOff) continue
+      // Skip internal panels and manually disabled monitors, but allow relearning
+      // even if an output had been auto-disabled before a port swap.
+      if (!o || o.internal || (!o.enabled && !o.autoOff)) continue
       var profile = memory.monitors[o.fp]
-      if (!profile || !profile.ddcWatch) continue
-      if (profile.ddcConnector && profile.ddcConnector !== o.name) {
-        var attemptKey = o.fp + "@" + o.name
-        if (autoRelearnAttempted[attemptKey]) continue
-        var nextAttempted = Object.assign({}, autoRelearnAttempted)
-        nextAttempted[attemptKey] = true
-        autoRelearnAttempted = nextAttempted
-        relearnDdcInput(o.name, o.fp, null)
-      }
+      if (!Model.ddcNeedsRelearn(profile, o.name)) continue
+      var step = Model.ddcRelearnBegin(autoRelearnState, o.fp, o.name, now)
+      if (!step.allowed) continue
+      autoRelearnState = step.state
+      ;(function(monName, monFp) {
+        var wasOff = !!(service.ddcOff && service.ddcOff[monFp])
+        relearnDdcInput(monName, monFp, function(ok) {
+          service.autoRelearnState = Model.ddcRelearnFinish(service.autoRelearnState, monFp, monName, ok, Date.now())
+          if (ok && wasOff) service.refresh(service.reconcile)
+        }, true)
+      })(o.name, o.fp)
     }
   }
 
@@ -470,10 +512,23 @@ Item {
     for (var i = 0; i < livePlan.length; i++) {
       var o = livePlan[i]
       var profile = mem.monitors[o.fp]
-      // Wait for connector-change auto-relearn before polling against an old connector's input.
+      // Poll only once connector tracking & input are in sync; moved connectors
+      // and legacy profiles without ddcConnector are migrated via auto-relearn first.
       if (!o.internal && profile && profile.ddcWatch && profile.ddcInput
-          && (!profile.ddcConnector || profile.ddcConnector === o.name))
+          && !Model.ddcNeedsRelearn(profile, o.name))
         out.push({ name: o.name, fp: o.fp, input: profile.ddcInput })
+    }
+    return out
+  }
+
+  readonly property var pendingRelearnOutputs: {
+    var out = []
+    var mem = Model.normalizeMemory(memory)
+    for (var i = 0; i < livePlan.length; i++) {
+      var o = livePlan[i]
+      if (!o || o.internal || (!o.enabled && !o.autoOff)) continue
+      var profile = mem.monitors[o.fp]
+      if (Model.ddcNeedsRelearn(profile, o.name)) out.push(o)
     }
     return out
   }
@@ -524,8 +579,12 @@ Item {
   Timer {
     interval: 5000
     repeat: true
-    running: service.watchedOutputs.length > 0 && !service.confirming && !service.isDevInstance
-    onTriggered: service.pollInputs()
+    running: (service.watchedOutputs.length > 0 || service.pendingRelearnOutputs.length > 0)
+      && !service.confirming && !service.isDevInstance
+    onTriggered: {
+      if (service.pendingRelearnOutputs.length > 0) service.autoRelearnMovedConnectors(service.livePlan)
+      service.pollInputs()
+    }
   }
 
   // ---------------------------------------------------------------- Apply

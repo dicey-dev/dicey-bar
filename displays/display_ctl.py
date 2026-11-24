@@ -979,10 +979,11 @@ def persist(payload: dict) -> dict:
                     continue
                 saved_input = profile.get("ddcInput")
                 saved_conn = profile.get("ddcConnector")
-                if not saved_input or (saved_conn and saved_conn != o["name"]):
+                # Always re-read when input is missing, connector changed, or
+                # migrating a legacy profile that lacked ddcConnector so an old
+                # input code is never blindly stamped onto a moved connector.
+                if not saved_input or saved_conn != o["name"]:
                     learn.append(o)
-                elif not saved_conn:
-                    profile["ddcConnector"] = o["name"]
             if learn:
                 readings = ddc_poll([o["name"] for o in learn], force_refresh=True)
                 for output in learn:

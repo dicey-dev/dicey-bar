@@ -469,6 +469,19 @@ Panel {
       }
       root.syncNightLightFromService()
     }
+    function onBrightnessUpdated(monitorName, pct) {
+      if (!root.opened) return
+      if (root.current && root.current.name === monitorName) {
+        root.brightness = pct
+        root.brightnessAvailable = true
+      }
+      var synced = Model.syncDraftBrightness(root.draft, monitorName, pct)
+      if (synced.changed) {
+        root.draft = synced.draft
+        root.edited = true
+        root.brightnessEdited = true
+      }
+    }
   }
 
   onOpenedChanged: {
@@ -593,9 +606,6 @@ Panel {
       if (!target || !root.service) return
       var stepPct = wheel.steps * 5
       root.service.enqueueBrightnessStep(target, stepPct)
-      if (root.opened && root.current && root.current.name === target && root.brightnessAvailable) {
-        root.brightness = Math.max(1, Math.min(100, root.brightness + stepPct))
-      }
     }
   }
 
@@ -646,7 +656,7 @@ Panel {
         }
         var lower = t.toLowerCase()
         if (lower === "r") {
-          if (root.service) root.service.refresh()
+          if (root.service) root.service.reprobe()
           root.readBrightness()
         } else if (lower === "i") {
           if (root.service) root.service.identify()
@@ -965,7 +975,7 @@ Panel {
               MiniActionButton {
                 text: "Re-probe"
                 onClicked: {
-                  if (root.service) root.service.refresh()
+                  if (root.service) root.service.reprobe()
                   root.readBrightness()
                 }
               }
@@ -2319,14 +2329,16 @@ Panel {
     }
 
     function expandDragBounds(r) {
-      if (!r || !dragBounds) return
+      if (!r || !dragBounds) return false
       var nx0 = Math.min(dragBounds.minX, r.x)
       var ny0 = Math.min(dragBounds.minY, r.y)
       var nx1 = Math.max(dragBounds.maxX, r.x + r.w)
       var ny1 = Math.max(dragBounds.maxY, r.y + r.h)
       if (nx0 !== dragBounds.minX || ny0 !== dragBounds.minY || nx1 !== dragBounds.maxX || ny1 !== dragBounds.maxY) {
         dragBounds = { minX: nx0, minY: ny0, maxX: nx1, maxY: ny1 }
+        return true
       }
+      return false
     }
 
     function others(index) {
@@ -2516,40 +2528,35 @@ Panel {
               hoverEnabled: true
               preventStealing: true
               cursorShape: canvas.dragIndex === tile.index ? Qt.ClosedHandCursor : Qt.OpenHandCursor
-              property real grabFx: 0.5
-              property real grabFy: 0.5
+              property var dragAnchor: null
               property var start: null
 
               onPressed: function(mouse) {
                 root.selected = tile.index
-                grabFx = tile.width > 0 ? Math.max(0, Math.min(1, mouse.x / tile.width)) : 0.5
-                grabFy = tile.height > 0 ? Math.max(0, Math.min(1, mouse.y / tile.height)) : 0.5
                 start = Model.rectOf(tile.modelData)
                 canvas.dragBounds = canvas.boundsFor(root.draft)
+                var p0 = mapToItem(tilesStage, mouse.x, mouse.y)
+                dragAnchor = Model.createDragAnchor(p0, start, canvas.view.k)
                 canvas.dragRect = start
                 canvas.activeSnap = null
                 canvas.shiftFreeMove = !!(mouse.modifiers & Qt.ShiftModifier)
                 canvas.dragIndex = tile.index
               }
               onPositionChanged: function(mouse) {
-                if (canvas.dragIndex !== tile.index || !start) return
-                var v = canvas.view
+                if (canvas.dragIndex !== tile.index || !start || !dragAnchor) return
                 var p = mapToItem(tilesStage, mouse.x, mouse.y)
-                var wanted = {
-                  x: Math.round((p.x - v.ox) / v.k + v.minX - grabFx * start.w),
-                  y: Math.round((p.y - v.oy) / v.k + v.minY - grabFy * start.h),
-                  w: start.w,
-                  h: start.h
-                }
+                var wanted = Model.dragWantedRect(dragAnchor, p)
                 // Hold Shift to disable magnetic snapping for 1px fine positioning;
                 // otherwise snap cleanly within 8px on-screen toward edges & H/V centers.
                 var shiftHeld = !!(mouse.modifiers & Qt.ShiftModifier)
                 canvas.shiftFreeMove = shiftHeld
-                var snapThreshold = shiftHeld ? 0 : (Style.space(8) / v.k)
+                var snapThreshold = shiftHeld ? 0 : (Style.space(8) / canvas.view.k)
                 var res = Model.attachWithGuides(wanted, canvas.others(tile.index), snapThreshold)
                 canvas.dragRect = res.rect
                 canvas.activeSnap = res.snap
-                canvas.expandDragBounds(res.rect)
+                if (canvas.expandDragBounds(res.rect)) {
+                  dragAnchor = Model.rebaseDragAnchor(dragAnchor, p, wanted, canvas.view.k)
+                }
               }
               onReleased: {
                 if (canvas.dragIndex !== tile.index) return
@@ -2561,6 +2568,7 @@ Panel {
                 canvas.activeSnap = null
                 canvas.dragBounds = null
                 canvas.shiftFreeMove = false
+                dragAnchor = null
                 start = null
                 if (!moved) return
                 var next = root.draft.map(root.copyOutput)
@@ -2575,6 +2583,7 @@ Panel {
                 canvas.activeSnap = null
                 canvas.dragBounds = null
                 canvas.shiftFreeMove = false
+                dragAnchor = null
                 start = null
               }
             }
