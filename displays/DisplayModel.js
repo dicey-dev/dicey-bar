@@ -65,27 +65,40 @@ function baseFingerprint(monitor) {
 
 // Gives each connected monitor a fingerprint and a Hyprland selector. Two
 // identical monitors that report the same (often empty) serial cannot be told
-// apart by EDID, so only those get the connector name appended. Internal
-// panels are always addressed by connector name, which is what Omarchy's
-// clamshell handling reads back from monitors.lua.
+// apart by EDID, so only those get the connector name appended. Hyprland also
+// prefix-matches `desc:` selectors, so if one description is a prefix of
+// another connected monitor's description, fall back to the connector name.
+// Internal panels are always addressed by connector name.
 function identify(monitors) {
   var counts = {}
   var list = Array.isArray(monitors) ? monitors : []
+  var descs = []
   for (var i = 0; i < list.length; i++) {
     var fp = baseFingerprint(list[i])
     counts[fp] = (counts[fp] || 0) + 1
+    descs.push(clean(list[i].description))
   }
   var out = []
   for (var j = 0; j < list.length; j++) {
     var m = list[j]
     var base = baseFingerprint(m)
     var unique = counts[base] === 1
-    var description = clean(m.description)
+    var description = descs[j]
     var internal = isInternalName(m.name)
+    var descSafe = !internal && unique && !!description
+    if (descSafe) {
+      for (var k = 0; k < descs.length; k++) {
+        if (k === j || !descs[k]) continue
+        if (descs[k].indexOf(description) === 0 || description.indexOf(descs[k]) === 0) {
+          descSafe = false
+          break
+        }
+      }
+    }
     out.push({
       name: clean(m.name),
       fp: unique ? base : base + "|" + clean(m.name),
-      selector: (!internal && unique && description) ? "desc:" + description : clean(m.name),
+      selector: descSafe ? "desc:" + description : clean(m.name),
       internal: internal
     })
   }
@@ -146,8 +159,8 @@ function modeGroups(availableModes) {
 // at its fastest rate.
 function pickMode(availableModes, wanted) {
   var groups = modeGroups(availableModes)
-  if (!groups.length) return wanted || null
-  if (wanted) {
+  if (!groups.length) return (wanted && wanted.w > 0 && wanted.h > 0 && wanted.hz > 0) ? wanted : null
+  if (wanted && wanted.w > 0 && wanted.h > 0) {
     for (var i = 0; i < groups.length; i++) {
       var group = groups[i]
       if (group.w !== wanted.w || group.h !== wanted.h) continue
@@ -157,6 +170,15 @@ function pickMode(availableModes, wanted) {
     }
   }
   return { w: groups[0].w, h: groups[0].h, hz: groups[0].rates[0] }
+}
+
+// When re-enabling a disabled monitor whose live mode was reported as 0x0,
+// choose a usable mode from availableModes (preferring any remembered mode).
+function ensureEnabledMode(output, availableModes, savedProfile) {
+  if (output && output.mode && output.mode.w > 0 && output.mode.h > 0 && output.mode.hz > 0)
+    return { w: output.mode.w, h: output.mode.h, hz: output.mode.hz }
+  var wanted = savedProfile && savedProfile.mode ? savedProfile.mode : null
+  return pickMode(availableModes, wanted)
 }
 
 function gcd(a, b) {
@@ -623,6 +645,7 @@ function planFromLive(monitors, memory, autoOff) {
 // The layout to run for the connected monitors. `autoOff` maps fingerprints
 // to a reason ("lid", "input") for monitors that are connected but should be
 // left off; the layout is chosen for the rest, as if they were unplugged.
+// Monitors without a saved profile keep their live mode/VRR/HDR/scale/rotation.
 function derive(monitors, memory, autoOff) {
   var mem = normalizeMemory(memory)
   var off = autoOff || {}
@@ -631,20 +654,28 @@ function derive(monitors, memory, autoOff) {
   for (var i = 0; i < monitors.length; i++) {
     var m = monitors[i]
     var out = liveOutput(m, ids[i])
-    var profile = mem.monitors[out.fp] || {}
-    out.mode = pickMode(m.availableModes, profile.mode || null) || out.mode
-    // A monitor with no memory keeps the scale & orientation Hyprland chose.
-    var scale = Number(profile.scale) > 0 ? Number(profile.scale) : out.scale
-    out.scale = cleanScale(scale, out.mode.w, out.mode.h)
-    out.vrr = [0, 1, 2].indexOf(Number(profile.vrr)) !== -1 ? Number(profile.vrr) : 0
-    out.hdr = profile.hdr === true && m.hdrCapable !== false
-    out.sdrBrightness = profile.sdrBrightness !== undefined ? cleanSdrBrightness(profile.sdrBrightness) : out.sdrBrightness
-    out.sdrSaturation = profile.sdrSaturation !== undefined ? cleanSdrSaturation(profile.sdrSaturation) : out.sdrSaturation
-    out.transform = profile.transform !== undefined ? cleanTransform(profile.transform) : out.transform
-    out.ddcWatch = profile.ddcWatch === true
-    out.textSize = cleanTextSize(profile.textSize)
-    out.brightness = cleanBrightness(profile.brightness)
-    out.nightLight = cleanNightLight(profile.nightLight)
+    var hasProfile = Object.prototype.hasOwnProperty.call(mem.monitors, out.fp)
+    var profile = hasProfile ? (mem.monitors[out.fp] || {}) : null
+    if (hasProfile) {
+      out.mode = pickMode(m.availableModes, profile.mode || out.mode) || out.mode
+      var scale = Number(profile.scale) > 0 ? Number(profile.scale) : out.scale
+      out.scale = cleanScale(scale, out.mode.w, out.mode.h)
+      out.vrr = [0, 1, 2].indexOf(Number(profile.vrr)) !== -1 ? Number(profile.vrr) : out.vrr
+      out.hdr = profile.hdr === true && m.hdrCapable !== false
+      out.sdrBrightness = profile.sdrBrightness !== undefined ? cleanSdrBrightness(profile.sdrBrightness) : out.sdrBrightness
+      out.sdrSaturation = profile.sdrSaturation !== undefined ? cleanSdrSaturation(profile.sdrSaturation) : out.sdrSaturation
+      out.transform = profile.transform !== undefined ? cleanTransform(profile.transform) : out.transform
+      out.ddcWatch = profile.ddcWatch === true
+      out.textSize = cleanTextSize(profile.textSize)
+      out.brightness = cleanBrightness(profile.brightness)
+      out.nightLight = cleanNightLight(profile.nightLight)
+    } else {
+      // Unprofiled monitor: preserve whatever live settings Hyprland chose.
+      if (!(out.mode.w > 0 && out.mode.h > 0 && out.mode.hz > 0)) {
+        out.mode = pickMode(m.availableModes, null) || out.mode
+      }
+      out.scale = cleanScale(out.scale, out.mode.w, out.mode.h)
+    }
     out.autoOff = !!off[out.fp]
     out.offReason = off[out.fp] ? String(off[out.fp]) : ""
     out.enabled = true
@@ -785,8 +816,8 @@ function copyMemory(memory) {
 }
 
 // The memory after the user presses Apply on `plan`: every monitor's own
-// settings, and the arrangement (plus optional OS-wide text size & night light)
-// for this combination of monitors.
+// settings, and the arrangement (plus explicitly edited OS-wide text size /
+// night light) for this combination of monitors.
 function remember(memory, plan, now, options) {
   var mem = copyMemory(memory)
   var opts = options && typeof options === "object" ? options : {}
@@ -855,15 +886,21 @@ function remember(memory, plan, now, options) {
   return mem
 }
 
-// One DDC/CI reading of a watched monitor's input source. Two misses in a row
-// (another input selected, or no answer at all because it was switched off)
-// turn it off; reading its own input again turns it back on.
+// One DDC/CI reading of a watched monitor's input source.
+// - Explicit different input reading (non-empty, != expected): 2 misses -> off.
+// - No reply (null/empty, e.g. I2C bus contention from brightness slider or
+//   powered off): 4 consecutive no-replies (20s) -> off.
+// - Reading the expected input resets misses and restores the output.
 function ddcStep(misses, reading, expected) {
   var count = Number(misses) || 0
   if (reading && expected && String(reading).toLowerCase() === String(expected).toLowerCase())
     return { misses: 0, off: false }
-  count++
-  return { misses: count, off: count >= 2 }
+  if (reading) {
+    count += 2
+  } else {
+    count += 1
+  }
+  return { misses: count, off: count >= 4 }
 }
 
 // Hotplug handling applies the same plan at most twice in 20 seconds. The
@@ -877,14 +914,21 @@ function autoApplyStep(last, signature, now) {
 
 // Monitors that should be left off right now, keyed by fingerprint. The
 // internal panel is off while the lid is shut and another monitor is
-// connected; Omarchy's clamshell handling turns it off and on.
+// connected; Omarchy's clamshell handling turns it off and on. Never mark
+// the last external monitor auto-off while the lid is shut, or the internal
+// panel would be forced back on behind a closed lid.
 function autoOffFor(plan, lidClosed, ddcOff) {
   var out = {}
-  var others = plan.filter(function(o) { return !o.internal }).length
+  var externals = plan.filter(function(o) { return !o.internal })
+  var remainingExternal = externals.filter(function(o) { return !(ddcOff && ddcOff[o.fp]) }).length
   for (var i = 0; i < plan.length; i++) {
     var o = plan[i]
-    if (o.internal && lidClosed && others > 0) out[o.fp] = "lid"
-    else if (ddcOff && ddcOff[o.fp]) out[o.fp] = "input"
+    if (o.internal && lidClosed && externals.length > 0) {
+      out[o.fp] = "lid"
+    } else if (ddcOff && ddcOff[o.fp]) {
+      if (lidClosed && remainingExternal === 0) continue
+      out[o.fp] = "input"
+    }
   }
   return out
 }

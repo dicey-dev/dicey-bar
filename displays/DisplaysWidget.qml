@@ -38,10 +38,15 @@ Panel {
   property bool textSizeEdited: false
 
   // OS-wide Night Light draft (controlled via hyprsunset; remembered per
-  // monitor combination on Apply and reverted on Discard).
+  // monitor combination on Apply when edited and reverted on Discard).
   property var openedNightLight: ({ enabled: false, kelvin: 4000 })
   property var draftNightLight: ({ enabled: false, kelvin: 4000 })
   property bool nightLightEdited: false
+
+  // Snapshot of per-monitor brightness as first read on open, so Discard and
+  // confirmation rollback undo hardware brightness changes cleanly.
+  property var openedBrightness: ({})
+  property bool brightnessEdited: false
 
   // Per-monitor DDC/CI input probing state (lazy-loaded on click).
   property string ddcProbeFor: ""
@@ -50,10 +55,21 @@ Panel {
   property var ddcAvailableInputs: []
   property string ddcProbeError: ""
 
+  function monitorByName(name) {
+    for (var i = 0; i < liveMonitors.length; i++)
+      if (liveMonitors[i] && liveMonitors[i].name === name) return liveMonitors[i]
+    return null
+  }
+
+  function draftTopologyKey(list) {
+    return (Array.isArray(list) ? list : []).map(function(o) { return o ? o.name : "" }).sort().join("\n")
+  }
+
   readonly property bool dirty: {
     if (!draft.length || draft.length !== live.length) return false
     if (textSizeEdited && draftTextSize !== openedTextSize) return true
     if (nightLightEdited && !Model.sameNightLight(draftNightLight, openedNightLight)) return true
+    if (brightnessEdited) return true
     if (!Model.planMatchesLive(draft, live)) return true
     for (var i = 0; i < draft.length; i++) {
       if (draft[i].ddcWatch !== live[i].ddcWatch) return true
@@ -62,7 +78,7 @@ Panel {
     return false
   }
   readonly property var current: selected >= 0 && selected < draft.length ? draft[selected] : null
-  readonly property var currentMonitor: selected >= 0 && selected < liveMonitors.length ? liveMonitors[selected] : null
+  readonly property var currentMonitor: current ? monitorByName(current.name) : null
   readonly property var currentGroups: currentMonitor ? Model.modeGroups(currentMonitor.availableModes) : []
   readonly property var currentRates: {
     if (!current || !current.mode) return []
@@ -122,6 +138,7 @@ Panel {
     return (isFinite(k) && k >= 1500 && k <= 6400) ? k : 4000
   }
   readonly property bool currentHasSavedProfile: !!(service && current && service.hasSavedProfile(current.fp))
+  readonly property bool currentSavedDdcWatch: !!(service && current && service.hasSavedDdcWatch(current.fp))
   readonly property string currentLearnedDdcInput: (service && current) ? service.savedDdcInput(current.fp) : ""
 
   // Theme-derived palette — strictly Commons.Color tokens so theme swaps apply live.
@@ -183,8 +200,9 @@ Panel {
   }
 
   function shortModelName(index) {
-    var m = index >= 0 && index < liveMonitors.length ? liveMonitors[index] : null
-    if (!m) return draft[index] ? draft[index].name : ""
+    var o = index >= 0 && index < draft.length ? draft[index] : null
+    var m = o ? monitorByName(o.name) : (index >= 0 && index < liveMonitors.length ? liveMonitors[index] : null)
+    if (!m) return o ? o.name : ""
     var model = String(m.model || "").trim()
     if (model && !/^0x[0-9a-f]+$/i.test(model)) return model
     var desc = String(m.description || "").trim()
@@ -207,16 +225,24 @@ Panel {
   }
 
   function discardDraft() {
-    if (textSizeEdited && openedTextSize >= 9 && openedTextSize <= 20) {
-      applyTextSizeLive(openedTextSize)
+    if (textSizeEdited && openedTextSize >= 9 && openedTextSize <= 20 && service) {
+      service.applyTextSize(openedTextSize)
     }
     if (nightLightEdited && service) {
       service.setNightLight(openedNightLight.enabled, openedNightLight.kelvin, null)
+    }
+    if (brightnessEdited && service) {
+      for (var name in openedBrightness) {
+        service.enqueueBrightness(name, openedBrightness[name])
+      }
+      if (current && Object.prototype.hasOwnProperty.call(openedBrightness, current.name))
+        brightness = openedBrightness[current.name]
     }
     textSizeEdited = false
     draftTextSize = openedTextSize
     nightLightEdited = false
     draftNightLight = { enabled: openedNightLight.enabled, kelvin: openedNightLight.kelvin }
+    brightnessEdited = false
     resetDraft()
     showNotice("Discarded unsaved changes")
   }
@@ -274,7 +300,7 @@ Panel {
     if (clean === null) return
     draftTextSize = clean
     textSizeEdited = true
-    applyTextSizeLive(clean)
+    if (service) service.applyTextSize(clean)
   }
 
   function setNightLightDraft(enabled, kelvin, immediate) {
@@ -298,6 +324,7 @@ Panel {
     }
     draft = next
     edited = true
+    brightnessEdited = true
     service.setAllBrightness(pct, draft)
     showNotice("Synced brightness to " + pct + "% across all displays")
   }
@@ -374,17 +401,27 @@ Panel {
   function apply() {
     if (!service || !dirty || service.confirming) return
     var plan = Model.solve(draft)
-    var options = {
-      textSize: textSizeEdited ? draftTextSize : Style.font.baseSize,
-      nightLight: { enabled: shownNightLightOn, kelvin: shownKelvin }
+    // Only persist OS-wide text size / night light when explicitly edited in
+    // this session so an unrelated display change never overwrites them.
+    var options = {}
+    if (textSizeEdited) options.textSize = draftTextSize
+    if (nightLightEdited) options.nightLight = { enabled: shownNightLightOn, kelvin: shownKelvin }
+    var snap = {
+      textSizeEdited: textSizeEdited,
+      openedTextSize: openedTextSize,
+      nightLightEdited: nightLightEdited,
+      openedNightLight: { enabled: openedNightLight.enabled, kelvin: openedNightLight.kelvin },
+      openedBrightness: brightnessEdited ? Object.assign({}, openedBrightness) : null
     }
     edited = false
+    if (textSizeEdited) openedTextSize = draftTextSize
     textSizeEdited = false
-    openedTextSize = options.textSize
+    if (nightLightEdited) openedNightLight = { enabled: shownNightLightOn, kelvin: shownKelvin }
     nightLightEdited = false
-    openedNightLight = { enabled: options.nightLight.enabled, kelvin: options.nightLight.kelvin }
+    brightnessEdited = false
+    openedBrightness = ({})
     noticeText = ""
-    service.applyFromPanel(plan, options)
+    service.applyFromPanel(plan, options, snap)
   }
 
   function offText(o) {
@@ -414,12 +451,14 @@ Panel {
     target: "omarchy.monitor"
 
     function brightness(percent: string): string {
+      var val = Number(percent)
       var target = root.focusedOutputName()
-      if (target) {
-        root.brightnessFor = target
-        root.setBrightness(Number(percent), false)
-      }
-      return "got " + root.brightness
+      if (!target || !isFinite(val)) return "error invalid brightness"
+      var clamped = Math.max(1, Math.min(100, Math.round(val)))
+      if (root.service) root.service.enqueueBrightness(target, clamped)
+      if (root.opened && root.current && root.current.name === target)
+        root.brightness = clamped
+      return "got " + clamped
     }
 
     function state(): string {
@@ -442,7 +481,12 @@ Panel {
   Connections {
     target: root.service
     function onRefreshed() {
-      if (!root.edited) root.resetDraft()
+      if (!root.edited) {
+        root.resetDraft()
+      } else if (root.draftTopologyKey(root.draft) !== root.draftTopologyKey(root.live)) {
+        root.resetDraft()
+        root.showNotice("Display topology changed — refreshed")
+      }
       root.syncNightLightFromService()
     }
   }
@@ -453,6 +497,8 @@ Panel {
     draftTextSize = Style.font.baseSize
     textSizeEdited = false
     nightLightEdited = false
+    openedBrightness = ({})
+    brightnessEdited = false
     noticeText = ""
     ddcProbeFor = ""
     ddcProbing = false
@@ -477,7 +523,6 @@ Panel {
   property int brightness: 0
   property bool brightnessAvailable: false
   property string brightnessFor: ""
-  property bool brightnessQueued: false
   property bool brightnessReadQueued: false
 
   function readBrightness() {
@@ -494,18 +539,15 @@ Panel {
   }
 
   function setBrightness(value, recordInDraft) {
-    var pct = Math.max(1, Math.min(100, Math.round(value)))
+    var v = Number(value)
+    if (!isFinite(v) || !brightnessFor) return
+    var pct = Math.max(1, Math.min(100, Math.round(v)))
     brightness = pct
-    if (recordInDraft !== false && current && current.name === brightnessFor)
+    if (recordInDraft !== false && current && current.name === brightnessFor) {
+      brightnessEdited = true
       update(selected, { brightness: pct }, false)
-    if (brightnessWrite.running) {
-      brightnessQueued = true
-      return
     }
-    brightnessQueued = false
-    if (!brightnessFor) return
-    brightnessWrite.command = ["omarchy-brightness-display", "--no-osd", "--monitor", brightnessFor, pct + "%"]
-    brightnessWrite.running = true
+    if (service) service.enqueueBrightness(brightnessFor, pct)
   }
 
   Process {
@@ -516,8 +558,14 @@ Panel {
         var value = parseInt(String(text || "").trim(), 10)
         var asked = brightnessRead.command.length ? brightnessRead.command[brightnessRead.command.length - 1] : ""
         if (isFinite(value) && asked === root.brightnessFor) {
-          root.brightness = Math.max(1, Math.min(100, value))
+          var clamped = Math.max(1, Math.min(100, value))
+          root.brightness = clamped
           root.brightnessAvailable = true
+          if (!Object.prototype.hasOwnProperty.call(root.openedBrightness, asked)) {
+            var nextMap = Object.assign({}, root.openedBrightness)
+            nextMap[asked] = clamped
+            root.openedBrightness = nextMap
+          }
         }
       }
     }
@@ -528,11 +576,6 @@ Panel {
     }
   }
 
-  Process {
-    id: brightnessWrite
-    onRunningChanged: if (!running && root.brightnessQueued) root.setBrightness(root.brightness, false)
-  }
-
   Timer {
     id: brightnessDebounce
     interval: 140
@@ -541,12 +584,6 @@ Panel {
 
   // ---------------------------------------------------------------- text size (OS-wide, remembered per setup)
   readonly property var textSizeStops: [9, 10, 11, 12, 14, 16, 20]
-  Process { id: textSizeProc }
-
-  function applyTextSizeLive(px) {
-    textSizeProc.command = ["omarchy-display-text-size", String(px)]
-    if (!textSizeProc.running) textSizeProc.running = true
-  }
 
   // ---------------------------------------------------------------- night light (OS-wide via hyprsunset)
   readonly property var nightLightPresets: [
@@ -1154,7 +1191,17 @@ Panel {
                   anchors.verticalCenter: parent.verticalCenter
                   checked: !!root.current && root.current.enabled && !root.current.autoOff
                   interactive: !!root.current && !root.current.autoOff && root.canTurnOff(root.selected)
-                  onToggled: root.update(root.selected, { enabled: !root.current.enabled }, true)
+                  onToggled: {
+                    var turningOn = !root.current.enabled
+                    var patch = { enabled: turningOn }
+                    if (turningOn) {
+                      var saved = root.service && root.service.memory && root.service.memory.monitors
+                        ? root.service.memory.monitors[root.current.fp] : null
+                      var mode = Model.ensureEnabledMode(root.current, root.currentMonitor ? root.currentMonitor.availableModes : [], saved)
+                      if (mode) patch.mode = mode
+                    }
+                    root.update(root.selected, patch, true)
+                  }
                 }
               }
             }
@@ -1752,7 +1799,7 @@ Panel {
                       spacing: Style.space(6)
 
                       TinyChipButton {
-                        visible: !!root.current && root.current.ddcWatch
+                        visible: root.currentSavedDdcWatch
                         text: "Re-learn input"
                         onClicked: root.relearnSelectedDdc()
                       }

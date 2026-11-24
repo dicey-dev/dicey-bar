@@ -21,6 +21,9 @@ Item {
   property var bar: null
 
   readonly property string helperPath: decodeURIComponent(String(Qt.resolvedUrl("display_ctl.py")).replace(/^(file|qs):\/\//, ""))
+  // Development deployments (`dicey.bar.dev`) skip automatic startup/hotplug
+  // reconcile so starting dev mode never mutates real displays unasked.
+  readonly property bool isDevInstance: String(Qt.resolvedUrl(".")).indexOf("dicey.bar.dev") !== -1
 
   property var monitors: []
   property var memory: ({})
@@ -46,6 +49,7 @@ Item {
   property int confirmSeconds: 0
   property var pendingCommit: null
   property var revertPlan: null
+  property var revertPrefs: null
 
   property bool identifying: false
 
@@ -53,6 +57,10 @@ Item {
   // Hyprland keeps reporting something else (for instance a mode it cannot
   // drive), so record the last one.
   property var lastAuto: null
+  // Tracks which monitor topology last had its saved preferences restored so
+  // login/hotplug restores brightness/text/nightlight even when monitors.lua
+  // already matched the geometry.
+  property string lastPrefsTopology: ""
 
   signal refreshed()
 
@@ -76,6 +84,12 @@ Item {
     helper.command = ["python3", "-I", service.helperPath].concat(job.args)
     helper.stdinEnabled = job.input !== undefined && job.input !== null
     helper.running = true
+    if (!helper.running) {
+      // Spawn failed synchronously without firing onExited; never wedge queue.
+      service.currentJob = null
+      if (job && job.done) job.done(1, null, "Failed to start display helper")
+      Qt.callLater(service.pump)
+    }
   }
 
   Process {
@@ -110,6 +124,10 @@ Item {
 
   function hasSavedProfile(fp) {
     return !!(memory && memory.monitors && fp && Object.prototype.hasOwnProperty.call(memory.monitors, fp))
+  }
+
+  function hasSavedDdcWatch(fp) {
+    return !!(hasSavedProfile(fp) && memory.monitors[fp] && memory.monitors[fp].ddcWatch === true)
   }
 
   function savedDdcInput(fp) {
@@ -160,69 +178,111 @@ Item {
     ddcMisses = misses
   }
 
-  // ---------------------------------------------------------------- side effects
-  property var brightnessRestoreQueue: []
+  // ---------------------------------------------------------------- unified brightness & text-size queues
+  // Single immutable { name, pct } queue so slider drags, tab switches, Sync all,
+  // and IPC brightness calls never collide or write to the wrong monitor.
+  property var brightnessQueue: []
+  property int pendingTextSize: 0
 
-  Process { id: textSizeApplyProc }
   Process {
-    id: brightnessRestoreProc
-    onRunningChanged: if (!running) service.pumpBrightnessRestore()
+    id: textSizeProc
+    onExited: {
+      if (service.pendingTextSize >= 9 && service.pendingTextSize <= 20) {
+        var nextPx = service.pendingTextSize
+        service.pendingTextSize = 0
+        service.applyTextSize(nextPx)
+      }
+    }
   }
 
-  function pumpBrightnessRestore() {
-    if (brightnessRestoreProc.running || brightnessRestoreQueue.length === 0) return
-    var next = brightnessRestoreQueue[0]
-    brightnessRestoreQueue = brightnessRestoreQueue.slice(1)
-    brightnessRestoreProc.command = ["omarchy-brightness-display", "--no-osd", "--monitor", next.name, next.pct + "%"]
-    brightnessRestoreProc.running = true
+  function applyTextSize(px) {
+    var clean = Model.cleanTextSize(px)
+    if (clean === null) return
+    if (textSizeProc.running) {
+      pendingTextSize = clean
+      return
+    }
+    textSizeProc.command = ["omarchy-display-text-size", String(clean)]
+    textSizeProc.running = true
+  }
+
+  Process {
+    id: brightnessProc
+    onExited: service.pumpBrightness()
+  }
+
+  function pumpBrightness() {
+    if (brightnessProc.running || brightnessQueue.length === 0) return
+    var next = brightnessQueue[0]
+    brightnessQueue = brightnessQueue.slice(1)
+    brightnessProc.command = ["omarchy-brightness-display", "--no-osd", "--monitor", next.name, next.pct + "%"]
+    brightnessProc.running = true
+    if (!brightnessProc.running) Qt.callLater(service.pumpBrightness)
+  }
+
+  function enqueueBrightness(name, pct) {
+    var n = String(name || "").trim()
+    var v = Number(pct)
+    if (!n || !isFinite(v)) return false
+    var clamped = Math.max(1, Math.min(100, Math.round(v)))
+    // Coalesce any already-queued write for the same monitor so dragging stays snappy.
+    var next = []
+    for (var i = 0; i < brightnessQueue.length; i++) {
+      if (brightnessQueue[i].name !== n) next.push(brightnessQueue[i])
+    }
+    next.push({ name: n, pct: clamped })
+    brightnessQueue = next
+    pumpBrightness()
+    return true
   }
 
   function setAllBrightness(pct, outputs) {
-    var clamped = Math.max(1, Math.min(100, Math.round(Number(pct))))
+    var v = Number(pct)
+    if (!isFinite(v)) return
+    var clamped = Math.max(1, Math.min(100, Math.round(v)))
     var list = Array.isArray(outputs) ? outputs : livePlan
-    var queue = []
     for (var i = 0; i < list.length; i++) {
       var o = list[i]
-      if (o && o.enabled && !o.autoOff) queue.push({ name: o.name, pct: clamped })
+      if (o && o.enabled && !o.autoOff) enqueueBrightness(o.name, clamped)
     }
-    if (!queue.length) return
-    brightnessRestoreQueue = queue
-    pumpBrightnessRestore()
   }
 
   function setNightLight(enabled, kelvin, done) {
     var k = Math.max(1500, Math.min(6400, Math.round(Number(kelvin) || 4000)))
-    liveNightLight = { enabled: !!enabled, kelvin: k }
     var args = enabled ? ["nightlight", "on", String(k)] : ["nightlight", "off"]
     run(args, null, function(code, data, stderr) {
-      if (code !== 0) service.lastError = service.errorText(data, stderr)
+      if (code === 0 && data && data.nightLight) {
+        var actual = data.nightLight
+        var prevK = k
+        service.liveNightLight = {
+          enabled: actual.enabled === true,
+          kelvin: (actual.enabled === true && actual.kelvin >= 1500 && actual.kelvin <= 6400) ? Math.round(actual.kelvin) : prevK
+        }
+        service.lastError = ""
+      } else {
+        service.lastError = service.errorText(data, stderr)
+      }
       if (done) done(code === 0, data, stderr)
     })
   }
 
   // Restore per-monitor brightness and per-setup OS-wide text size & night
   // light after a hotplug reconcile or Apply commit.
-  function applyMonitorPreferences(plan, savedMemory, restoreBrightness) {
+  function applyMonitorPreferences(plan, savedMemory, restoreSavedPrefs) {
     if (!Array.isArray(plan) || !plan.length) return
-    if (restoreBrightness) {
-      var queue = []
+    if (restoreSavedPrefs) {
       for (var i = 0; i < plan.length; i++) {
         var o = plan[i]
         if (o && o.enabled && !o.autoOff && o.brightness !== null && o.brightness !== undefined)
-          queue.push({ name: o.name, pct: Math.round(Number(o.brightness)) })
-      }
-      if (queue.length) {
-        brightnessRestoreQueue = queue
-        pumpBrightnessRestore()
+          enqueueBrightness(o.name, Math.round(Number(o.brightness)))
       }
     }
     var mem = savedMemory || memory
     var textSize = Model.layoutTextSize(mem, plan)
     if (textSize !== null && textSize !== Style.font.baseSize) {
-      textSizeApplyProc.command = ["omarchy-display-text-size", String(textSize)]
-      if (!textSizeApplyProc.running) textSizeApplyProc.running = true
+      applyTextSize(textSize)
     }
-    if (restoreBrightness) {
+    if (restoreSavedPrefs) {
       var savedNl = Model.layoutNightLight(mem, plan)
       if (savedNl && !Model.sameNightLight(savedNl, liveNightLight)) {
         setNightLight(savedNl.enabled, savedNl.kelvin, null)
@@ -232,11 +292,27 @@ Item {
 
   // ---------------------------------------------------------------- memory & DDC actions
   function forgetMonitor(fp, done) {
-    if (!fp) return
+    if (!fp || confirming) return
     var nextMemory = Model.forgetMonitor(memory, fp)
-    memory = nextMemory
-    run(["persist"], JSON.stringify({ memory: nextMemory }), function(code, data, stderr) {
-      service.lastError = code === 0 ? "" : service.errorText(data, stderr)
+    var off = {}
+    var misses = {}
+    for (var k in ddcOff) if (k !== fp) off[k] = ddcOff[k]
+    for (var m in ddcMisses) if (m !== fp) misses[m] = ddcMisses[m]
+    ddcOff = off
+    ddcMisses = misses
+    var payload = { memory: nextMemory }
+    if (!Model.hasMemory(nextMemory)) {
+      payload.removeManagedBlock = true
+    } else if (livePlan.length) {
+      payload.plan = livePlan
+    }
+    run(["persist"], JSON.stringify(payload), function(code, data, stderr) {
+      if (code === 0) {
+        service.memory = nextMemory
+        service.lastError = ""
+      } else {
+        service.lastError = service.errorText(data, stderr)
+      }
       service.refresh(function() {
         if (done) done(code === 0)
       })
@@ -244,7 +320,7 @@ Item {
   }
 
   function relearnDdcInput(name, fp, done) {
-    if (!name || !fp) return
+    if (!name || !fp || confirming) return
     run(["ddc-relearn", name, fp], null, function(code, data, stderr) {
       if (code === 0 && data && data.ok) {
         if (data.memory) service.memory = Model.normalizeMemory(data.memory)
@@ -290,10 +366,26 @@ Item {
   }
 
   // ---------------------------------------------------------------- automatic
+  function topologySignature(plan) {
+    return plan.filter(function(o) { return o && !o.autoOff })
+      .map(function(o) { return o.fp })
+      .sort()
+      .join("\n")
+  }
+
   function reconcile() {
-    if (!loaded || confirming || !Model.hasMemory(memory) || monitors.length === 0) return
+    if (isDevInstance || !loaded || confirming || !Model.hasMemory(memory) || monitors.length === 0) return
     var plan = Model.derive(monitors, memory, currentAutoOff)
-    if (Model.planMatchesLive(plan, livePlan)) return
+    var topo = topologySignature(plan)
+    if (Model.planMatchesLive(plan, livePlan)) {
+      // Even when monitors.lua already restored geometry at login, still apply
+      // remembered brightness, text size, and night light once per topology.
+      if (topo && topo !== lastPrefsTopology) {
+        lastPrefsTopology = topo
+        applyMonitorPreferences(plan, memory, true)
+      }
+      return
+    }
     var signature = JSON.stringify(plan)
     var step = Model.autoApplyStep(lastAuto, signature, Date.now())
     lastAuto = step.last
@@ -301,9 +393,8 @@ Item {
     run(["apply"], signature, function(code, data, stderr) {
       service.fallbacks = data && Array.isArray(data.fallbacks) ? data.fallbacks : []
       service.lastError = code === 0 ? "" : service.errorText(data, stderr)
-      // Keep monitors.lua in step so a config reload shows the same layout.
-      // The memory itself only changes on Apply.
       if (code === 0) {
+        service.lastPrefsTopology = topo
         service.applyMonitorPreferences(plan, service.memory, true)
         service.run(["persist"], JSON.stringify({ plan: plan }), null)
       }
@@ -318,7 +409,7 @@ Item {
     id: settle
     interval: 1200
     repeat: false
-    onTriggered: service.refresh(service.reconcile)
+    onTriggered: if (!service.confirming) service.refresh(service.reconcile)
   }
 
   Connections {
@@ -338,7 +429,9 @@ Item {
     onTriggered: service.refresh(service.reconcile)
   }
 
-  // ---------------------------------------------------------------- DDC/CI
+  // ---------------------------------------------------------------- DDC/CI (dedicated Process)
+  // Runs in its own Process so a slow DDC bus probe never blocks Apply, Revert,
+  // refresh, or Night Light.
   readonly property var watchedOutputs: {
     var out = []
     var mem = Model.normalizeMemory(memory)
@@ -350,11 +443,22 @@ Item {
     return out
   }
 
-  function pollInputs() {
-    var watched = watchedOutputs
-    if (!watched.length || currentJob) return
-    run(["ddc-poll"].concat(watched.map(function(w) { return w.name })), null, function(code, data) {
-      if (code !== 0 || !data) return
+  property var ddcPollTargets: []
+
+  Process {
+    id: ddcPollProc
+    stdout: StdioCollector { id: ddcPollOut }
+    onExited: function(exitCode) {
+      var watched = service.ddcPollTargets
+      service.ddcPollTargets = []
+      if (exitCode !== 0 || service.confirming) return
+      var data = null
+      try {
+        data = JSON.parse(String(ddcPollOut.text || "null"))
+      } catch (e) {
+        data = null
+      }
+      if (!data) return
       var off = {}
       var misses = {}
       for (var k in service.ddcOff) off[k] = service.ddcOff[k]
@@ -371,52 +475,82 @@ Item {
       if (!changed) return
       service.ddcOff = off
       service.refresh(service.reconcile)
-    })
+    }
+  }
+
+  function pollInputs() {
+    var watched = watchedOutputs
+    if (!watched.length || ddcPollProc.running || confirming || isDevInstance) return
+    ddcPollTargets = watched
+    ddcPollProc.command = ["python3", "-I", service.helperPath, "ddc-poll"].concat(watched.map(function(w) { return w.name }))
+    ddcPollProc.running = true
   }
 
   Timer {
     interval: 5000
     repeat: true
-    running: service.watchedOutputs.length > 0 && !service.confirming
+    running: service.watchedOutputs.length > 0 && !service.confirming && !service.isDevInstance
     onTriggered: service.pollInputs()
   }
 
   // ---------------------------------------------------------------- Apply
   // `plan` is the panel's full arrangement. Applying it saves each monitor's
   // settings and this combination's layout; a mode/power/rotation/mirror change
-  // first waits for the user to keep it.
-  function applyFromPanel(plan, options) {
+  // first waits for the user to keep it, and safely reverts both displays and
+  // any previewed OS-wide preferences if rejected or timed out.
+  function applyFromPanel(plan, options, revertSnapshot) {
     if (confirming || !plan || !plan.length) return
     var before = livePlan
     var mustConfirm = Model.needsConfirmation(plan, before)
-    var nextMemory = Model.remember(memory, plan, new Date().toISOString(), options)
+    var opts = options || {}
     run(["apply"], JSON.stringify(plan), function(code, data, stderr) {
       service.fallbacks = data && Array.isArray(data.fallbacks) ? data.fallbacks : []
       if (code !== 0) {
         service.lastError = service.errorText(data, stderr)
-        // Part of the plan may have landed; put back what was there.
-        service.run(["apply"], JSON.stringify(before), function() { service.refresh() })
+        service.restorePreviewPrefs(revertSnapshot)
+        service.run(["revert"], JSON.stringify(before), function() { service.refresh() })
         return
       }
       service.lastError = ""
       if (mustConfirm) {
-        service.pendingCommit = { plan: plan, memory: nextMemory }
+        service.pendingCommit = { plan: plan, options: opts }
         service.revertPlan = before
+        service.revertPrefs = revertSnapshot || null
         service.confirmSeconds = 10
         service.confirming = true
         confirmTimer.restart()
         service.refresh()
       } else {
-        service.commit(plan, nextMemory)
+        service.commit(plan, opts)
       }
     })
   }
 
-  function commit(plan, nextMemory) {
-    memory = nextMemory
-    applyMonitorPreferences(plan, nextMemory, false)
+  function restorePreviewPrefs(snap) {
+    if (!snap) return
+    if (snap.textSizeEdited && snap.openedTextSize >= 9 && snap.openedTextSize <= 20)
+      applyTextSize(snap.openedTextSize)
+    if (snap.nightLightEdited && snap.openedNightLight)
+      setNightLight(snap.openedNightLight.enabled, snap.openedNightLight.kelvin, null)
+    if (snap.openedBrightness) {
+      for (var name in snap.openedBrightness)
+        enqueueBrightness(name, snap.openedBrightness[name])
+    }
+  }
+
+  function commit(plan, options) {
+    // Recompute against the latest memory at commit time so any concurrent
+    // changes aren't lost.
+    var nextMemory = Model.remember(memory, plan, new Date().toISOString(), options)
+    lastPrefsTopology = topologySignature(plan)
     run(["persist"], JSON.stringify({ plan: plan, memory: nextMemory }), function(code, data, stderr) {
-      service.lastError = code === 0 ? "" : service.errorText(data, stderr)
+      if (code === 0) {
+        service.memory = nextMemory
+        service.lastError = ""
+        service.applyMonitorPreferences(plan, nextMemory, false)
+      } else {
+        service.lastError = service.errorText(data, stderr)
+      }
       service.refresh()
     })
   }
@@ -428,7 +562,8 @@ Item {
     var pending = pendingCommit
     pendingCommit = null
     revertPlan = null
-    if (pending) commit(pending.plan, pending.memory)
+    revertPrefs = null
+    if (pending) commit(pending.plan, pending.options)
   }
 
   function revert() {
@@ -436,9 +571,14 @@ Item {
     confirmTimer.stop()
     confirming = false
     var previous = revertPlan
+    var snap = revertPrefs
     pendingCommit = null
     revertPlan = null
-    if (previous) run(["apply"], JSON.stringify(previous), function() { service.refresh() })
+    revertPrefs = null
+    restorePreviewPrefs(snap)
+    // Uses `revert` (not `apply`) so if a monitor was unplugged during the
+    // confirmation window, we never disable the last remaining connected display.
+    if (previous) run(["revert"], JSON.stringify(previous), function() { service.refresh() })
   }
 
   Timer {

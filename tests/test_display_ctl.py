@@ -64,13 +64,14 @@ class LuaTest(unittest.TestCase):
         self.assertEqual(rule, 'hl.monitor({ output = "desc:BNQ BenQ GW2790Q ET97T00426087", '
                                'disabled = false, mode = "2560x1440@100.00", position = "1920x-200", '
                                'scale = 1.25, transform = 1, vrr = 2, cm = "hdr", bitdepth = 10, '
-                               'sdrbrightness = 1.35, sdrsaturation = 1.1 })')
+                               'sdrbrightness = 1.35, sdrsaturation = 1.1, mirror = "" })')
         sdr_rule = ctl.monitor_rule(output(sdrBrightness=1.5))
-        self.assertIn('cm = "srgb", bitdepth = 8, sdrbrightness = 1, sdrsaturation = 1', sdr_rule)
+        self.assertIn('cm = "srgb", bitdepth = 8, sdrbrightness = 1, sdrsaturation = 1, mirror = ""', sdr_rule)
         mirror_rule = ctl.monitor_rule(output(mirrorOf="eDP-1"))
         self.assertIn('mirror = "eDP-1"', mirror_rule)
-        clear_rule = ctl.monitor_rule(output(), include_clear_mirror=True)
-        self.assertIn('mirror = ""', clear_rule)
+        connector_rule = ctl.monitor_rule(output(), use_connector_name=True)
+        self.assertIn('output = "HDMI-A-1"', connector_rule)
+        self.assertNotIn("desc:", connector_rule)
 
     def test_disabled_rule(self):
         self.assertEqual(ctl.monitor_rule(output(enabled=False)),
@@ -106,7 +107,9 @@ class LuaTest(unittest.TestCase):
         ])
         lines = lua.split("\n")
         self.assertEqual(len(lines), 3)
-        self.assertIn("desc:BNQ", lines[0])
+        # Live rules always address exact connector names, never prefix-matched desc:
+        self.assertIn('output = "HDMI-A-1"', lines[0])
+        self.assertNotIn("desc:", lines[0])
         self.assertIn('mirror = ""', lines[0])
         self.assertIn('output = "DP-3"', lines[1])
         self.assertIn('mirror = "HDMI-A-1"', lines[1])
@@ -116,9 +119,22 @@ class LuaTest(unittest.TestCase):
     def test_input_switched_monitor_is_turned_off_live_but_lid_is_left_alone(self):
         lua = ctl.live_lua([output(**LAPTOP, autoOff=True, enabled=False, offReason="lid"),
                             output(autoOff=True, offReason="input")])
-        self.assertEqual(lua, 'hl.monitor({ output = "desc:BNQ BenQ GW2790Q ET97T00426087", disabled = true })')
+        self.assertEqual(lua, 'hl.monitor({ output = "HDMI-A-1", disabled = true })')
         with self.assertRaises(ValueError):
             output(offReason="sleep")
+
+    def test_safe_revert_plan_never_disables_last_connected_monitor(self):
+        # Start with A on and B disabled; preview enabling B, then A is unplugged!
+        previous_plan = [
+            output(name="DP-1", selector="DP-1", enabled=True),
+            output(name="HDMI-A-1", selector="HDMI-A-1", enabled=False),
+        ]
+        only_b_connected = [{"name": "HDMI-A-1", "width": 2560, "height": 1440, "refreshRate": 100}]
+        safe = ctl.safe_revert_plan(previous_plan, only_b_connected, lid_is_closed=False)
+        self.assertEqual(len(safe), 1)
+        self.assertEqual(safe[0]["name"], "HDMI-A-1")
+        self.assertTrue(safe[0]["enabled"])
+        self.assertEqual(safe[0]["mirrorOf"], "")
 
 
 class MonitorsLuaTest(unittest.TestCase):
@@ -128,9 +144,48 @@ class MonitorsLuaTest(unittest.TestCase):
         self.assertIn(ctl.TAKEOVER_HEADER, text)
         self.assertNotIn("PROBE-1", text)
         self.assertIn('hl.env("GDK_SCALE"', text)
+        # Carried non-monitor config is hoisted OUTSIDE our managed block so
+        # later rewrites can never drop or corrupt it.
+        before_block = text[:text.index(ctl.BEGIN)]
         block = text[text.index(ctl.BEGIN):text.index(ctl.END)]
-        self.assertIn("hl.config({ misc = { vrr = 0 }, render = { cm_auto_hdr = 0 } })", block)
+        self.assertIn("hl.config({ misc = { vrr = 0 }, render = { cm_auto_hdr = 0 } })", before_block)
+        self.assertNotIn("hl.config(", block)
         self.assertIn('output = "eDP-1", disabled = false, mode = "1920x1080@60.02", position = "313x1440"', block)
+
+    def test_multiline_foreign_takeover_and_double_splice_stay_valid_lua(self):
+        multiline_foreign = """-- Managed by im0001gt.screens
+-- BEGIN im0001gt.screens
+hl.monitor({
+    output = "DP-1",
+    mode = "1920x1080@60",
+    position = "0x0",
+})
+hl.config({
+    misc = { vrr = 0 },
+    render = { cm_auto_hdr = 0 },
+})
+hl.workspace_rule({ workspace = 1, monitor = "DP-1" })
+-- END im0001gt.screens
+"""
+        first = ctl.splice_block(multiline_foreign, [output()])
+        second = ctl.splice_block(first, [output(x=1920)])
+        self.assertNotIn('output = "DP-1"', second)
+        self.assertIn("hl.config({", second)
+        self.assertIn("render = { cm_auto_hdr = 0 }", second)
+        self.assertIn("hl.workspace_rule(", second)
+        self.assertIn('position = "1920x0"', second)
+        ctl.validate_lua_syntax(second)
+
+    def test_stray_begin_marker_does_not_swallow_user_lines(self):
+        with_stray = (
+            f"{ctl.BEGIN}\n"
+            'hl.env("KEEP_ME", "1")\n'
+            f"{ctl.BEGIN}\n"
+            f"{ctl.CATCH_ALL}\n"
+            f"{ctl.END}\n"
+        )
+        updated = ctl.splice_block(with_stray, [output()])
+        self.assertIn('hl.env("KEEP_ME", "1")', updated)
 
     def test_rewrites_its_own_block_in_place(self):
         first = ctl.splice_block(FOREIGN, [output()])
@@ -230,17 +285,48 @@ class PersistTest(unittest.TestCase):
             self.assertFalse(lua.exists())
             self.assertEqual(json.loads((Path(tmp) / "state" / "dicey-bar" / "displays.json").read_text()), memory)
 
-    def test_ddc_relearn_updates_memory(self):
+    def test_ddc_relearn_requires_saved_watch_and_updates_memory(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = {"XDG_STATE_HOME": str(Path(tmp) / "state")}
             fp = "BNQ|BenQ GW2790Q|ET97T00426087"
             with mock.patch.dict(os.environ, env), \
                     mock.patch.object(ctl, "ddc_poll", return_value={"HDMI-A-1": "0x0f"}):
+                # Refuses before ddcWatch is actually applied & saved
+                denied = ctl.ddc_relearn("HDMI-A-1", fp)
+                self.assertFalse(denied["ok"])
+                # Once ddcWatch is saved, relearn updates ddcInput cleanly
+                ctl.persist({"memory": {"version": 1, "monitors": {fp: {"ddcWatch": True}}, "layouts": {}}})
                 result = ctl.ddc_relearn("HDMI-A-1", fp)
                 saved = json.loads((Path(tmp) / "state" / "dicey-bar" / "displays.json").read_text())
             self.assertTrue(result["ok"])
             self.assertEqual(result["ddcInput"], "0x0f")
             self.assertEqual(saved["monitors"][fp]["ddcInput"], "0x0f")
+
+    def test_cached_buses_rate_limits_detect_for_powered_off_monitor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"XDG_RUNTIME_DIR": tmp}
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(ctl, "ddc_buses", return_value={"HDMI-A-1": "3"}) as detect:
+                ctl.cached_buses(["HDMI-A-1", "DP-2"], now=1000.0)
+                # DP-2 is missing (powered off); polling again 5s later must NOT re-run detect
+                ctl.cached_buses(["HDMI-A-1", "DP-2"], now=1005.0)
+                self.assertEqual(detect.call_count, 1)
+                # After 60s, a fresh detect is allowed
+                ctl.cached_buses(["HDMI-A-1", "DP-2"], now=1065.0)
+                self.assertEqual(detect.call_count, 2)
+
+    def test_persist_aborts_before_memory_write_if_monitors_lua_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "real.lua"
+            target.write_text("")
+            link = Path(tmp) / "monitors.lua"
+            link.symlink_to(target)
+            state_home = Path(tmp) / "state"
+            env = {"XDG_STATE_HOME": str(state_home), "DICEY_DISPLAYS_MONITORS_LUA": str(link)}
+            with mock.patch.dict(os.environ, env):
+                with self.assertRaises(ValueError):
+                    ctl.persist({"plan": [dict(output())], "memory": {"version": 1, "monitors": {"x": {}}, "layouts": {}}})
+            self.assertFalse((state_home / "dicey-bar" / "displays.json").exists())
 
     def test_persist_writes_memory_and_learns_watched_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -253,7 +339,7 @@ class PersistTest(unittest.TestCase):
                     mock.patch.object(ctl, "ddc_poll", return_value={"HDMI-A-1": "0x11"}) as poll:
                 result = ctl.persist({"plan": plan, "memory": memory})
                 saved = json.loads((Path(tmp) / "state" / "dicey-bar" / "displays.json").read_text())
-                poll.assert_called_once_with(["HDMI-A-1"])
+                poll.assert_called_once_with(["HDMI-A-1"], force_refresh=True)
                 # Already learned: no second read.
                 ctl.persist({"plan": plan, "memory": saved})
                 poll.assert_called_once()
