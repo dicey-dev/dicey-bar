@@ -1,8 +1,7 @@
 # Dicey Bar
 
-**A floating-island status bar for [Omarchy](https://omarchy.org/).** It uses
-your theme and your widgets, splits them into three rounded islands, and keeps
-working when you change monitor layout or scale.
+**A refined floating-island status bar for [Omarchy](https://omarchy.org/).**
+Theme-aware, drop-in, and built to feel native to your desktop.
 
 [![Release](https://img.shields.io/github/v/release/dicey-dev/dicey-bar?include_prereleases&label=release)](https://github.com/dicey-dev/dicey-bar/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0%20AND%20MIT-blue)](THIRD_PARTY_NOTICES.md)
@@ -10,7 +9,7 @@ working when you change monitor layout or scale.
 
 ![Dicey Bar: workspaces, clock and status islands floating over the desktop](preview.png)
 
-**Alpha software (0.x).** The current release is **v0.1.1**. Expect rough edges
+**Alpha software (0.x).** The current release is **v0.2.0**. Expect rough edges
 and possible compatibility changes; validation is not a stability guarantee.
 
 An independent Omarchy plugin repository. The plugin ID is **`dicey.bar`**;
@@ -31,9 +30,16 @@ other center widgets. The clock stays where it is:
 
 ![Center island expanded on hover, with indicators to the left of the clock and more widgets to the right](docs/screenshots/island-center-hover.png)
 
-These captures use the Starship theme and the author's own widget layout. The
-islands show whatever widgets your bar layout lists, so some icons above come
-from separate widget plugins rather than from Dicey Bar itself.
+Click the monitor icon in the right island to open the built-in **Displays**
+panel — drag-and-drop monitor arrangement, Extend/Mirror toggle, per-monitor
+mode/scale/orientation/VRR/HDR/brightness/DDC controls, and OS-wide text size
+and Night Light:
+
+![Built-in Displays panel showing drag-and-drop canvas, Extend/Mirror toggle, per-monitor controls, and All Displays card](docs/screenshots/displays-panel.png)
+
+These captures use the author's own theme and widget layout. The islands show
+whatever widgets your bar layout lists, so some icons above come from separate
+widget plugins rather than from Dicey Bar itself.
 
 ## Features
 
