@@ -301,12 +301,14 @@ function sanitizeMirrors(outputs) {
 }
 
 // Moves `rect` the shortest distance to a spot where it touches the placed
-// rectangles along an edge without covering any of them. Hyprland lets the
-// pointer fall into gaps between monitors, so every monitor must touch the
-// rest. `alignWithin` also snaps edges and centres into line when they are
-// that close, which is what makes dragging feel magnetic.
-function attach(rect, placed, alignWithin) {
-  if (!placed.length) return { x: rect.x, y: rect.y, w: rect.w, h: rect.h }
+// rectangles along an edge without covering any of them, and returns both
+// the snapped rectangle and any active alignment guide line (edge or H/V center).
+// Hyprland lets the pointer fall into gaps between monitors, so every monitor
+// must touch the rest. `alignWithin` magnetically snaps edges and centers into
+// line when within that logical-pixel threshold, always picking the closest
+// matching guide line.
+function attachWithGuides(rect, placed, alignWithin) {
+  if (!placed.length) return { rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h }, snap: null }
   var snap = Number(alignWithin) > 0 ? Number(alignWithin) : 0
   var free = true
   var touching = false
@@ -314,7 +316,17 @@ function attach(rect, placed, alignWithin) {
     if (overlaps(rect, placed[i])) free = false
     if (sharedEdge(rect, placed[i]) > 0) touching = true
   }
-  if (free && touching && !snap) return { x: rect.x, y: rect.y, w: rect.w, h: rect.h }
+  if (free && touching && !snap) return { rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h }, snap: null }
+
+  // Group bounding box so dragging also assists snapping to the overall
+  // horizontal or vertical center of multi-monitor arrangements.
+  var gMinX = Infinity, gMinY = Infinity, gMaxX = -Infinity, gMaxY = -Infinity
+  for (var g = 0; g < placed.length; g++) {
+    gMinX = Math.min(gMinX, placed[g].x)
+    gMinY = Math.min(gMinY, placed[g].y)
+    gMaxX = Math.max(gMaxX, placed[g].x + placed[g].w)
+    gMaxY = Math.max(gMaxY, placed[g].y + placed[g].h)
+  }
 
   var best = null
   for (var p = 0; p < placed.length; p++) {
@@ -327,16 +339,77 @@ function attach(rect, placed, alignWithin) {
     ]
     for (var s = 0; s < sides.length; s++) {
       var c = { x: sides[s].x, y: sides[s].y, w: rect.w, h: rect.h }
+      var matchedGuide = null
       if (snap) {
-        var lines = sides[s].axis === "y"
-          ? [o.y, o.y + o.h - c.h, o.y + Math.round((o.h - c.h) / 2)]
-          : [o.x, o.x + o.w - c.w, o.x + Math.round((o.w - c.w) / 2)]
-        for (var l = 0; l < lines.length; l++) {
-          var current = sides[s].axis === "y" ? c.y : c.x
-          if (Math.abs(current - lines[l]) <= snap) {
-            if (sides[s].axis === "y") c.y = lines[l]
-            else c.x = lines[l]
-            break
+        var candidates = []
+        if (sides[s].axis === "y") {
+          for (var t = 0; t < placed.length; t++) {
+            var refY = placed[t]
+            candidates.push({ pos: refY.y, guidePos: refY.y, kind: "top", label: "Top aligned" })
+            candidates.push({ pos: refY.y + refY.h - c.h, guidePos: refY.y + refY.h, kind: "bottom", label: "Bottom aligned" })
+            candidates.push({
+              pos: refY.y + Math.round((refY.h - c.h) / 2),
+              guidePos: refY.y + Math.round(refY.h / 2),
+              kind: "v-center",
+              label: "V-centered"
+            })
+          }
+          if (placed.length > 1) {
+            var gH = gMaxY - gMinY
+            candidates.push({
+              pos: gMinY + Math.round((gH - c.h) / 2),
+              guidePos: gMinY + Math.round(gH / 2),
+              kind: "v-center",
+              label: "V-centered"
+            })
+          }
+        } else {
+          for (var u = 0; u < placed.length; u++) {
+            var refX = placed[u]
+            candidates.push({ pos: refX.x, guidePos: refX.x, kind: "left", label: "Left aligned" })
+            candidates.push({ pos: refX.x + refX.w - c.w, guidePos: refX.x + refX.w, kind: "right", label: "Right aligned" })
+            candidates.push({
+              pos: refX.x + Math.round((refX.w - c.w) / 2),
+              guidePos: refX.x + Math.round(refX.w / 2),
+              kind: "h-center",
+              label: "H-centered"
+            })
+          }
+          if (placed.length > 1) {
+            var gW = gMaxX - gMinX
+            candidates.push({
+              pos: gMinX + Math.round((gW - c.w) / 2),
+              guidePos: gMinX + Math.round(gW / 2),
+              kind: "h-center",
+              label: "H-centered"
+            })
+          }
+        }
+        var currentVal = sides[s].axis === "y" ? c.y : c.x
+        var bestSnap = null
+        for (var l = 0; l < candidates.length; l++) {
+          var cand = candidates[l]
+          var delta = Math.abs(currentVal - cand.pos)
+          if (delta <= snap && (!bestSnap || delta < bestSnap.delta)) {
+            bestSnap = { pos: cand.pos, guidePos: cand.guidePos, kind: cand.kind, label: cand.label, delta: delta }
+          }
+        }
+        if (bestSnap) {
+          var snappedC = {
+            x: sides[s].axis === "x" ? bestSnap.pos : c.x,
+            y: sides[s].axis === "y" ? bestSnap.pos : c.y,
+            w: c.w,
+            h: c.h
+          }
+          if (sharedEdge(snappedC, o) > 0) {
+            c.x = snappedC.x
+            c.y = snappedC.y
+            matchedGuide = {
+              axis: sides[s].axis,
+              guidePos: bestSnap.guidePos,
+              kind: bestSnap.kind,
+              label: bestSnap.label
+            }
           }
         }
       }
@@ -346,7 +419,7 @@ function attach(rect, placed, alignWithin) {
       var dx = c.x - rect.x
       var dy = c.y - rect.y
       var distance = dx * dx + dy * dy
-      if (!best || distance < best.distance) best = { x: c.x, y: c.y, distance: distance }
+      if (!best || distance < best.distance) best = { x: c.x, y: c.y, distance: distance, snap: matchedGuide }
     }
   }
   if (!best) {
@@ -356,9 +429,13 @@ function attach(rect, placed, alignWithin) {
       right = Math.max(right, placed[b].x + placed[b].w)
       top = Math.min(top, placed[b].y)
     }
-    best = { x: right, y: top }
+    best = { x: right, y: top, snap: null }
   }
-  return { x: best.x, y: best.y, w: rect.w, h: rect.h }
+  return { rect: { x: best.x, y: best.y, w: rect.w, h: rect.h }, snap: best.snap }
+}
+
+function attach(rect, placed, alignWithin) {
+  return attachWithGuides(rect, placed, alignWithin).rect
 }
 
 function byPosition(a, b) {
