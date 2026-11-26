@@ -63,6 +63,9 @@ Item {
   property int ddcPollStartEpoch: 0
   // Connectors seen plugged in since the last refresh; they relearn their input.
   property var hotpluggedConnectors: ({})
+  // When each connector last disconnected, so brief HPD pulses on input switch
+  // are never mistaken for a physical cable swap that overwrites ddc.json.
+  property var removedConnectorsAt: ({})
   // Cumulative suspend time reported by CLOCK_BOOTTIME - CLOCK_MONOTONIC (ms).
   property double lastSuspendMs: -1
   property double resumeAt: 0
@@ -275,12 +278,28 @@ Item {
     var plugged = {}
     for (var h in hotpluggedConnectors) plugged[h] = true
     hotpluggedConnectors = ({})
+    var currentNames = {}
+    for (var ci = 0; ci < monitors.length; ci++) {
+      var cn = monitors[ci] ? String(monitors[ci].name || "") : ""
+      if (cn) currentNames[cn] = true
+    }
     if (previousNames && now - resumeAt > 30000) {
       for (var i = 0; i < monitors.length; i++) {
         var name = monitors[i] ? String(monitors[i].name || "") : ""
-        if (name && previousNames[name] !== true) plugged[name] = true
+        if (name && previousNames[name] !== true && Model.ddcIsHotplug(removedConnectorsAt[name], now))
+          plugged[name] = true
       }
     }
+    var nextRemoved = {}
+    for (var r in removedConnectorsAt) {
+      if (!currentNames[r]) nextRemoved[r] = removedConnectorsAt[r]
+    }
+    if (previousNames) {
+      for (var prev in previousNames) {
+        if (!currentNames[prev] && !nextRemoved[prev]) nextRemoved[prev] = now
+      }
+    }
+    removedConnectorsAt = nextRemoved
     var before = Model.ddcOffMap(ddcStates)
     var identified = Model.planFromLive(monitors, memory, {})
     var next = Model.ddcPrune(ddcStates, identified, plugged, now)
@@ -309,14 +328,28 @@ Item {
       reconcilePending = true
   }
 
+  function noteMonitorRemoved(connector) {
+    var name = String(connector || "")
+    if (!name || !loaded) return
+    var next = {}
+    for (var k in removedConnectorsAt) next[k] = removedConnectorsAt[k]
+    if (!next[name]) next[name] = Date.now()
+    removedConnectorsAt = next
+  }
+
   // A monitor that shows up re-enabled after being off (our own wake, or the
-  // user turning it back on) is not a fresh plug-in; one that was lit or
-  // absent is.
+  // user turning it back on) or after a brief HPD pulse (<8s) is not a fresh
+  // plug-in; only a newly connected or genuinely unplugged connector relearns.
   function noteMonitorAdded(connector) {
     var name = String(connector || "")
-    if (!name || !loaded || Date.now() - resumeAt < 30000) return
+    var now = Date.now()
+    if (!name || !loaded || now - resumeAt < 30000) return
+    var removedAt = Number(removedConnectorsAt[name] || 0)
+    if (!Model.ddcIsHotplug(removedAt, now)) return
     for (var i = 0; i < monitors.length; i++) {
-      if (monitors[i] && monitors[i].name === name && monitors[i].disabled === true) return
+      if (monitors[i] && monitors[i].name === name) {
+        if (monitors[i].disabled === true || removedAt <= 0) return
+      }
     }
     var next = {}
     for (var k in hotpluggedConnectors) next[k] = true
@@ -991,6 +1024,9 @@ Item {
     target: Hyprland
     function onRawEvent(event) {
       var name = event ? String(event.name || "") : ""
+      if (name === "monitorremoved" || name === "monitorremovedv2") {
+        service.noteMonitorRemoved(Model.monitorAddedName(name, event.data))
+      }
       if (name === "monitoradded" || name === "monitoraddedv2") {
         service.noteMonitorAdded(Model.monitorAddedName(name, event.data))
       }
