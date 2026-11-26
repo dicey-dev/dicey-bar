@@ -14,6 +14,11 @@ import "DisplayModel.js" as Model
 //
 // Nothing is applied automatically until the panel's Apply has saved a
 // memory at least once, so installing the bar changes no display by itself.
+//
+// External monitors are also paused automatically, with no setting, when they
+// are switched to another input, and woken when they come back (or stop
+// answering). DisplayModel.js holds that DDC/CI state machine; this service
+// only runs its read-only probes and carries out what it decides.
 Item {
   id: service
 
@@ -21,9 +26,6 @@ Item {
   property var bar: null
 
   readonly property string helperPath: decodeURIComponent(String(Qt.resolvedUrl("display_ctl.py")).replace(/^(file|qs):\/\//, ""))
-  // Development deployments (`dicey.bar.dev`) skip automatic startup/hotplug
-  // reconcile so starting dev mode never mutates real displays unasked.
-  readonly property bool isDevInstance: String(Qt.resolvedUrl(".")).indexOf("dicey.bar.dev") !== -1
 
   property var monitors: []
   property var memory: ({})
@@ -33,15 +35,46 @@ Item {
   // Monitors left off for now (lid shut, switched to another input), keyed by
   // fingerprint, and the current state as a plan with those marked.
   readonly property var currentAutoOff: Model.autoOffFor(Model.planFromLive(monitors, memory), lidClosed, ddcOff)
-  readonly property var livePlan: Model.planFromLive(monitors, memory, currentAutoOff)
+  readonly property var livePlan: Model.planFromLive(monitors, memory, currentAutoOff, ddcPauseModes, appliedParks)
+  // Mirror-parks this service applied ({ connector: [target, ...] }), recorded
+  // before each apply and narrowed to what Hyprland shows on every refresh, so
+  // a live park (paused, woken and not yet undone, or left behind by a failed
+  // repark) is never taken for a mirror the user set up, and a user's mirror
+  // is never taken for a park. Live only, never saved.
+  property var appliedParks: ({})
+  // The newest DPMS state per enabled monitor ({ name: on }), from refresh
+  // and from every ddc-read, and whether the whole desktop is DPMS-idle.
+  property var liveDpms: ({})
+  property bool liveGlobalIdle: false
+  readonly property var liveMonitors: Model.ddcLiveDpms(monitors, liveDpms)
 
-  // Monitors left off because they were switched to another input (or off),
-  // keyed by fingerprint, and the consecutive DDC misses behind that.
-  property var ddcOff: ({})
-  property var ddcMisses: ({})
-  // Per-fingerprint auto-relearn state ({ connector, inFlight, failures, nextRetryAt })
-  // so transient wake-up timeouts back off and retry instead of sticking forever.
-  property var autoRelearnState: ({})
+  // DDC/CI auto-pause: learned inputs (ddc.json), one state per external
+  // monitor, and the pauses derived from those states alone, so a pause can
+  // never outlive the state behind it.
+  property var ddcMemory: ({ version: 1, monitors: {} })
+  property var ddcStates: ({})
+  readonly property var ddcOff: Model.ddcOffMap(ddcStates)
+  // How each paused monitor is kept off: "mirror" (HDMI SCDC: parked lit as a
+  // mirror, live only) or "disable" (DDC/CI). Never decides whether a live
+  // mirror is a park; that is `appliedParks`.
+  readonly property var ddcPauseModes: Model.ddcPauseModes(ddcStates)
+  // Bumped whenever an in-flight reading must be ignored (wake, forget, apply).
+  property int ddcPollEpoch: 0
+  property int ddcPollStartEpoch: 0
+  // Connectors seen plugged in since the last refresh; they relearn their input.
+  property var hotpluggedConnectors: ({})
+  // Cumulative suspend time reported by CLOCK_BOOTTIME - CLOCK_MONOTONIC (ms).
+  property double lastSuspendMs: -1
+  property double resumeAt: 0
+  property bool reconcilePending: false
+  // A deferred hotplug/startup reconcile still owes monitors.lua a write;
+  // automatic DDC pause/wake reconciles are live only and never persist.
+  property bool reconcileNeedsPersist: false
+  property bool reconcileInFlight: false
+  property var reconcileIdleWaiters: []
+  readonly property bool wakePending: reconcileInFlight
+    || (reconcilePending && !liveGlobalIdle && loaded && Model.hasMemory(memory)
+        && Model.planWakes(Model.derive(monitors, memory, currentAutoOff, ddcPauseModes, appliedParks), livePlan))
 
   // Modes Hyprland did not take on the last apply, usually link bandwidth.
   property var fallbacks: []
@@ -50,6 +83,8 @@ Item {
   // After an Apply that changes a mode, rotation, HDR, mirror, or power state.
   property bool applyInFlight: false
   property bool persistInFlight: false
+  // A safety rollback is running: no reconcile, no DDC read, no reading kept.
+  property bool revertInFlight: false
   property bool confirming: false
   property int confirmSeconds: 0
   property var pendingCommit: null
@@ -148,15 +183,6 @@ Item {
     return !!(memory && memory.monitors && fp && Object.prototype.hasOwnProperty.call(memory.monitors, fp))
   }
 
-  function hasSavedDdcWatch(fp) {
-    return !!(hasSavedProfile(fp) && memory.monitors[fp] && memory.monitors[fp].ddcWatch === true)
-  }
-
-  function savedDdcInput(fp) {
-    if (!memory || !memory.monitors || !fp || !memory.monitors[fp]) return ""
-    return String(memory.monitors[fp].ddcInput || "")
-  }
-
   // ---------------------------------------------------------------- state
   function refresh(then) {
     if (then) refreshWaiters = refreshWaiters.concat([then])
@@ -164,8 +190,24 @@ Item {
     refreshQueued = true
     run(["state"], null, function(code, data, stderr) {
       service.refreshQueued = false
-      if (code === 0 && data && Array.isArray(data.monitors)) {
+      var refreshOk = code === 0 && data && Array.isArray(data.monitors)
+      if (refreshOk) {
+        var previousNames = null
+        if (service.loaded) {
+          previousNames = {}
+          for (var p = 0; p < service.monitors.length; p++)
+            if (service.monitors[p] && service.monitors[p].name) previousNames[service.monitors[p].name] = true
+        }
         service.monitors = data.monitors
+        var dpms = {}
+        for (var d = 0; d < data.monitors.length; d++) {
+          var dm = data.monitors[d]
+          if (dm && dm.name && dm.disabled !== true) dpms[dm.name] = dm.dpmsStatus !== false
+        }
+        service.liveDpms = dpms
+        service.liveGlobalIdle = Model.ddcGlobalIdle(data.monitors)
+        var pruned = Model.pruneAppliedParks(service.appliedParks, data.monitors)
+        if (pruned.changed) service.appliedParks = pruned.parks
         service.memory = Model.normalizeMemory(data.memory)
         service.lidClosed = data.lidClosed === true
         if (data.nightLight && typeof data.nightLight === "object") {
@@ -177,35 +219,389 @@ Item {
             kelvin: (data.nightLight.enabled === true && isFinite(k) && k >= 1500 && k <= 6400) ? Math.round(k) : prevK
           }
         }
+        if (data.ddcMemory && typeof data.ddcMemory === "object")
+          service.ddcMemory = Model.normalizeDdcMemory(data.ddcMemory)
         service.loaded = true
-        service.forgetGoneMonitors()
+        service.checkSuspendClock(data.suspendMs, Date.now())
+        service.syncDdcStates(previousNames)
       } else {
         service.lastError = service.errorText(data, stderr)
       }
       var waiters = service.refreshWaiters
       service.refreshWaiters = []
-      for (var i = 0; i < waiters.length; i++) waiters[i]()
+      for (var i = 0; i < waiters.length; i++) waiters[i](refreshOk)
+      if (refreshOk && service.reconcilePending) service.reconcile(true)
       service.refreshed()
     })
   }
 
+  // Re-probe: monitors that stopped watching (unsupported, suspended,
+  // snoozed, waiting) start over and may learn the input they show now.
   function reprobe(then) {
-    autoRelearnState = Model.ddcRelearnClearBackoff(autoRelearnState)
-    refresh(function() {
-      reconcile()
+    ddcStates = Model.ddcReprobe(ddcStates, Date.now())
+    ddcPollEpoch = ddcPollEpoch + 1
+    refresh(function(ok) {
+      if (ok) service.reconcile(true)
       if (then) then()
     })
   }
 
-  function forgetGoneMonitors() {
-    // Identify connected monitors independently of stale ddcOff so moving an
-    // auto-disabled monitor to a new PC connector clears its stale ddcOff/misses
-    // immediately before reconcile() computes currentAutoOff.
+  // ---------------------------------------------------------------- DDC/CI auto-pause
+  // The layout with no monitor paused for an input switch: what monitors.lua
+  // holds, so pausing and waking never rewrite it (and never trigger a reload).
+  function unpausedPlan(mem) {
+    var m = mem || memory
+    var identified = Model.planFromLive(monitors, m, {})
+    return Model.derive(monitors, m, Model.autoOffFor(identified, lidClosed, {}), ddcPauseModes, appliedParks)
+  }
+
+  // Records the parks an apply of `plan` sets: before the apply is queued (so
+  // the old and new park are both the bar's while it runs, even if it fails)
+  // and again once it has run (a refresh in between may have narrowed it).
+  function noteAppliedParks(plan) {
+    appliedParks = Model.recordAppliedParks(appliedParks, plan)
+  }
+
+  // `plan` for monitors.lua: input-paused outputs go back to their unpaused
+  // entry; every other output keeps exactly what `plan` (e.g. an edit) says.
+  function persistablePlan(plan, mem) {
+    return Model.persistablePlan(plan, unpausedPlan(mem))
+  }
+
+  // Keeps one state per connected external monitor after every refresh, and
+  // wakes any paused monitor it is no longer safe to keep dark.
+  function syncDdcStates(previousNames) {
+    var now = Date.now()
+    var plugged = {}
+    for (var h in hotpluggedConnectors) plugged[h] = true
+    hotpluggedConnectors = ({})
+    if (previousNames && now - resumeAt > 30000) {
+      for (var i = 0; i < monitors.length; i++) {
+        var name = monitors[i] ? String(monitors[i].name || "") : ""
+        if (name && previousNames[name] !== true) plugged[name] = true
+      }
+    }
+    var before = Model.ddcOffMap(ddcStates)
     var identified = Model.planFromLive(monitors, memory, {})
-    var pruned = Model.pruneDdcState(identified, memory, ddcOff, ddcMisses, autoRelearnState)
-    ddcOff = pruned.ddcOff
-    ddcMisses = pruned.ddcMisses
-    autoRelearnState = pruned.relearnState
+    var next = Model.ddcPrune(ddcStates, identified, plugged, now)
+    // A read in flight from before a connect, disconnect, port move or
+    // same-port replug belongs to the old connection: drop it.
+    if (Model.ddcConnectionsChanged(ddcStates, next, plugged)) ddcPollEpoch = ddcPollEpoch + 1
+    var ready = Model.hasMemory(memory)
+    var plan = unpausedPlan()
+    for (var fp in next) {
+      if (!next[fp] || next[fp].state !== "PAUSED") continue
+      // A desktop gone DPMS-idle is never a reason to wake (ddcCanPause).
+      if (!ready || !Model.ddcCanPause(plan, fp, lidClosed, Model.ddcOffMap(next), liveMonitors, appliedParks))
+        next = Model.ddcWake(next, fp, now, false)
+    }
+    ddcStates = next
+    var heldNow = Model.ddcHold(ddcStates, ddcPollableMap(), now)
+    if (heldNow.changed) ddcStates = heldNow.states
+    var after = Model.ddcOffMap(ddcStates)
+    if (JSON.stringify(before) !== JSON.stringify(after)) reconcilePending = true
+    // A mirror-parked monitor whose target went away, changed, or can no
+    // longer be parked on is re-parked (or woken) by the next reconcile.
+    var modes = Model.ddcPauseModes(next)
+    var off = Model.autoOffFor(Model.planFromLive(monitors, memory), lidClosed, after)
+    if (ready && Model.parkedMirrorsStale(Model.derive(monitors, memory, off, modes, appliedParks),
+                                          Model.planFromLive(monitors, memory, off, modes, appliedParks)))
+      reconcilePending = true
+  }
+
+  // A monitor that shows up re-enabled after being off (our own wake, or the
+  // user turning it back on) is not a fresh plug-in; one that was lit or
+  // absent is.
+  function noteMonitorAdded(connector) {
+    var name = String(connector || "")
+    if (!name || !loaded || Date.now() - resumeAt < 30000) return
+    for (var i = 0; i < monitors.length; i++) {
+      if (monitors[i] && monitors[i].name === name && monitors[i].disabled === true) return
+    }
+    var next = {}
+    for (var k in hotpluggedConnectors) next[k] = true
+    next[name] = true
+    hotpluggedConnectors = next
+  }
+
+  // Suspend shows up directly as CLOCK_BOOTTIME - CLOCK_MONOTONIC advancing
+  // (catches any suspend regardless of duration or poll interval, without
+  // NTP wall-clock false positives): paused monitors wake and every monitor
+  // re-probes without relearning.
+  function checkSuspendClock(suspendMs, now) {
+    var ms = Number(suspendMs)
+    if (!isFinite(ms) || ms < 0) return false
+    if (lastSuspendMs < 0) {
+      lastSuspendMs = ms
+      return false
+    }
+    // Never move the high-water mark backward on an older out-of-order sample.
+    if (ms - lastSuspendMs < 500) return false
+    lastSuspendMs = ms
+    resumeAt = now
+    hotpluggedConnectors = ({})
+    var wasPaused = Object.keys(Model.ddcOffMap(ddcStates)).length > 0
+    ddcStates = Model.ddcResume(ddcStates, now)
+    ddcPollEpoch = ddcPollEpoch + 1
+    // The wake must survive a settle or confirmation that skips this refresh.
+    if (wasPaused) reconcilePending = true
+    return true
+  }
+
+  // Which monitors can be read now. While the whole desktop is DPMS-idle no
+  // unpaused monitor is (its evidence is held), and paused ones stay paused.
+  function ddcPollableMap() {
+    var out = {}
+    var plan = unpausedPlan()
+    var lm = liveMonitors
+    var intended = {}
+    for (var p = 0; p < plan.length; p++) intended[plan[p].fp] = plan[p]
+    var identified = Model.planFromLive(monitors, memory, {})
+    for (var i = 0; i < identified.length; i++) {
+      var o = identified[i]
+      if (!o || o.internal) continue
+      var st = ddcStates[o.fp]
+      // Paused monitors are always read: dark (DDC/CI) or mirror-parked
+      // (SCDC, which Hyprland reports as a mirror).
+      if (st && st.state === "PAUSED") {
+        out[o.fp] = true
+        continue
+      }
+      var m = lm[i]
+      var want = intended[o.fp]
+      out[o.fp] = !liveGlobalIdle && !!m && m.disabled !== true && m.dpmsStatus !== false
+        && !(want && want.enabled === false) && !o.mirrorOf
+    }
+    return out
+  }
+
+  property var ddcPollTargets: []
+  property bool ddcPollBusy: false
+  property bool ddcPollExited: false
+  property bool ddcPollStreamDone: false
+  property int ddcPollExitCode: 0
+  property string ddcPollText: ""
+
+  function pollInputs() {
+    if (!loaded || !Model.hasMemory(memory)) return
+    if (confirming || applyInFlight || persistInFlight || revertInFlight || brightnessBusy || ddcPollBusy || ddcPollProc.running) return
+    var now = Date.now()
+    var pollable = ddcPollableMap()
+    var held = Model.ddcHold(ddcStates, pollable, now)
+    if (held.changed) ddcStates = held.states
+    // While idle every monitor is still asked at its pace: the helper reads
+    // no bus then, and its answer is how the end of the idle is noticed.
+    var duePollable = pollable
+    if (liveGlobalIdle) {
+      duePollable = {}
+      for (var fp in ddcStates) duePollable[fp] = true
+    }
+    var due = Model.ddcDue(ddcStates, duePollable, now)
+    var targets = []
+    for (var i = 0; i < due.length; i++) {
+      var st = ddcStates[due[i]]
+      if (!st || !st.connector) continue
+      targets.push({ fp: due[i], name: st.connector, mode: String(st.mode || "") })
+    }
+    // Nothing due, but a DPMS wake is awaited (idle, or one monitor asleep on
+    // its own): a power-state-only read (no connector, no I2C) notices it.
+    if (!targets.length && !Model.ddcNeedsDpmsProbe(ddcStates, liveDpms, liveGlobalIdle)) return
+    ddcPollTargets = targets
+    ddcPollStartEpoch = ddcPollEpoch
+    ddcPollBusy = true
+    ddcPollExited = false
+    ddcPollStreamDone = false
+    ddcPollExitCode = 0
+    ddcPollText = ""
+    // Each connector with the bus a detect found for it, `@scdc` for monitors
+    // watched through HDMI SCDC; `--detect` only for DDC connectors still
+    // probing with no bus known.
+    ddcPollProc.command = ["python3", "-I", service.helperPath, "ddc-read"]
+      .concat(Model.ddcReadArgs(targets, ddcStates))
+    ddcPollProc.running = true
+    if (!ddcPollProc.running) {
+      ddcPollTargets = []
+      ddcPollBusy = false
+      pumpBrightness()
+    }
+  }
+
+  function finishDdcPoll() {
+    if (!ddcPollBusy || !ddcPollExited || !ddcPollStreamDone) return
+    var exitCode = ddcPollExitCode
+    var rawText = ddcPollText
+    var targets = ddcPollTargets
+    ddcPollTargets = []
+    ddcPollBusy = false
+    ddcPollExited = false
+    ddcPollStreamDone = false
+    ddcPollText = ""
+    var stale = ddcPollStartEpoch !== ddcPollEpoch
+      || confirming || applyInFlight || persistInFlight
+      || revertInFlight || !Model.hasMemory(memory)
+    var data = null
+    try {
+      data = JSON.parse(String(rawText || "null"))
+    } catch (e) {
+      data = null
+    }
+    var good = exitCode === 0 && data && data.readings && typeof data.readings === "object"
+    // Hyprland's power state unknown: the helper read nothing, and unknown
+    // is never taken for awake (or for a failed read).
+    var known = good && data.dpmsKnown !== false
+    var wasIdle = liveGlobalIdle
+    if (known && data.dpms && typeof data.dpms === "object") {
+      var dpms = {}
+      for (var k in liveDpms) dpms[k] = liveDpms[k]
+      for (var n in data.dpms) dpms[n] = data.dpms[n] !== false
+      liveDpms = dpms
+    }
+    if (known && typeof data.globalIdle === "boolean") liveGlobalIdle = data.globalIdle
+    var resumed = good && checkSuspendClock(data.suspendMs, Date.now())
+    if (resumed) {
+      if (reconcilePending && !liveGlobalIdle) refresh(function(ok) { if (ok) service.reconcile(true) })
+    } else if (good && !known) {
+      // Nothing was read: no evidence either way.
+    } else if (!good && wasIdle) {
+      // A failed read during a known idle: paused monitors stay as they are.
+    } else if (good && (liveGlobalIdle || wasIdle || !targets.length)) {
+      // Idle, or a power-state-only probe (no bus was read): hold every
+      // unpaused monitor's evidence and keep paused ones as they are. Back
+      // from idle, or a monitor woken from DPMS on its own: a fresh settle
+      // grace starts at once (ddcHold), and an idle batch is dropped.
+      var held = Model.ddcHold(ddcStates, ddcPollableMap(), Date.now())
+      if (held.changed) ddcStates = held.states
+      if (wasIdle && !liveGlobalIdle && reconcilePending)
+        refresh(function(ok) { if (ok) service.reconcile(true) })
+    } else if (!stale) {
+      // Sync hold state against the fresh DPMS snapshot first so any output
+      // that just went asleep or woke on its own gets an immediate hold/grace.
+      var syncHeld = Model.ddcHold(ddcStates, ddcPollableMap(), Date.now())
+      if (syncHeld.changed) ddcStates = syncHeld.states
+      // A failed read is never dropped: it counts as ambiguous, so a paused
+      // monitor still fails open and a pause streak is broken.
+      observeReadings(targets, good ? data.readings : Model.ddcFailedReadings(targets))
+    }
+    pumpBrightness()
+    flushBrightnessIdleWaiters()
+  }
+
+  // Dedicated Process so a slow I2C read never blocks Apply, Revert, or
+  // refresh; it shares the bus with brightness, so the two take turns.
+  // Waits for BOTH process exit and stdout EOF (StdioCollector.onStreamFinished)
+  // because fast <1ms SCDC reads can fire onExited before stdout finishes flushing.
+  Process {
+    id: ddcPollProc
+    stdout: StdioCollector {
+      id: ddcPollOut
+      waitForEnd: true
+      onStreamFinished: {
+        service.ddcPollText = String(ddcPollOut.text || "")
+        service.ddcPollStreamDone = true
+        service.finishDdcPoll()
+      }
+    }
+    onExited: function(exitCode) {
+      service.ddcPollExitCode = exitCode
+      service.ddcPollExited = true
+      service.finishDdcPoll()
+    }
+  }
+
+  function observeReadings(targets, readings) {
+    var now = Date.now()
+    var plan = unpausedPlan()
+    var states = ddcStates
+    var offChanged = false
+    var learns = []
+    for (var i = 0; i < targets.length; i++) {
+      var t = targets[i]
+      var st = states[t.fp]
+      if (!st || st.connector !== t.name) continue
+      var reading = readings[t.name] || { status: "ambiguous" }
+      var res = Model.ddcObserve(states, t.fp, reading, {
+        now: now,
+        savedL: Model.ddcSavedInput(ddcMemory, t.fp, t.name),
+        canPause: Model.ddcCanPause(plan, t.fp, lidClosed, Model.ddcOffMap(states), liveMonitors, appliedParks)
+      })
+      states = res.states
+      if (res.offChanged) offChanged = true
+      if (res.learn) learns.push(res.learn)
+    }
+    ddcStates = states
+    for (var l = 0; l < learns.length; l++) learnDdcInput(learns[l])
+    if (offChanged) service.reconcile(true)
+  }
+
+  function learnDdcInput(learn) {
+    var mem = Model.normalizeDdcMemory(ddcMemory)
+    mem.monitors[learn.fp] = { input: learn.code, connector: learn.connector, learnedAt: "" }
+    ddcMemory = mem
+    run(["ddc-learn", learn.connector, learn.fp, learn.code], null, function(code, data, stderr) {
+      // A Forget queued behind this write supplies the final ddc.json.
+      if (!service.ddcStates[learn.fp]) return
+      if (code === 0 && data && data.ddcMemory) service.ddcMemory = Model.normalizeDdcMemory(data.ddcMemory)
+      else service.lastError = service.errorText(data, stderr)
+    })
+  }
+
+  // Wake by hand (the panel's Wake now / power switch, or IPC): the monitor
+  // stays on, snoozed, until this PC's input is seen again.
+  function wakeDisplay(fp) {
+    var st = fp ? ddcStates[fp] : null
+    if (!st || st.state !== "PAUSED") return false
+    ddcStates = Model.ddcWake(ddcStates, fp, Date.now(), true)
+    ddcPollEpoch = ddcPollEpoch + 1
+    // A wake by hand is never held back by the hotplug retry limit.
+    lastAuto = null
+    service.reconcile(true)
+    return true
+  }
+
+  function wakeAllDisplays() {
+    var now = Date.now()
+    var next = ddcStates
+    var count = 0
+    for (var fp in ddcStates) {
+      if (!ddcStates[fp] || ddcStates[fp].state !== "PAUSED") continue
+      next = Model.ddcWake(next, fp, now, true)
+      count++
+    }
+    if (!count) return 0
+    ddcStates = next
+    ddcPollEpoch = ddcPollEpoch + 1
+    lastAuto = null
+    service.reconcile(true)
+    return count
+  }
+
+  // Read-only status for the panel: { state, mode, code, pausedCode, label, pausedLabel, text }.
+  function ddcStatusFor(fp) {
+    var st = fp ? ddcStates[fp] : null
+    var status = {
+      state: st ? String(st.state) : "",
+      mode: st ? String(st.mode || "") : "",
+      code: st ? String(st.expected || "") : "",
+      pausedCode: st ? String(st.pausedCode || "") : "",
+      connector: st ? String(st.connector || "") : ""
+    }
+    status.label = Model.ddcInputLabel(status.code)
+    status.pausedLabel = Model.ddcInputLabel(status.pausedCode)
+    status.text = Model.ddcStatusText(status, Model.hasMemory(memory))
+    return status
+  }
+
+  Timer {
+    id: ddcTimer
+    interval: Math.max(1000, Model.ddcPollInterval(service.ddcStates, 0, service.liveDpms, service.liveGlobalIdle) || 5000)
+    repeat: true
+    running: true
+    onTriggered: {
+      if (service.reconcilePending && !service.reconcileInFlight && !service.liveGlobalIdle
+          && !service.confirming && !service.applyInFlight && !service.persistInFlight && !service.revertInFlight)
+        service.refresh(function(ok) { if (ok) service.reconcile(true) })
+      service.pollInputs()
+    }
   }
 
   // ---------------------------------------------------------------- unified brightness & text-size queues
@@ -305,7 +701,8 @@ Item {
   }
 
   function pumpBrightness() {
-    if (brightnessProc.running || brightnessQueue.length === 0) return
+    // DDC/CI brightness and input reads share the monitor's I2C bus.
+    if (brightnessProc.running || brightnessQueue.length === 0 || ddcPollBusy || ddcPollProc.running) return
     var next = brightnessQueue[0]
     brightnessQueue = brightnessQueue.slice(1)
     activeBrightnessJob = next
@@ -416,199 +813,73 @@ Item {
     }
   }
 
-  // ---------------------------------------------------------------- memory & DDC actions
+  // ---------------------------------------------------------------- memory actions
   function forgetMonitor(fp, done) {
-    if (!fp || confirming || applyInFlight) return
-    // Invalidate and abort any in-flight/queued DDC probe before persisting
-    // the Forget so a slow probe can never resurrect the deleted profile.
-    relearnEpoch = relearnEpoch + 1
-    cancelQueuedAutoRelearn()
+    if (!fp || confirming || applyInFlight || revertInFlight) return
+    // Any reading in flight belongs to the monitor as it was before Forget.
+    ddcPollEpoch = ddcPollEpoch + 1
     var nextMemory = Model.forgetMonitor(memory, fp)
-    var off = {}
-    var misses = {}
-    var relearn = {}
-    for (var k in ddcOff) if (k !== fp) off[k] = ddcOff[k]
-    for (var m in ddcMisses) if (m !== fp) misses[m] = ddcMisses[m]
-    for (var r in autoRelearnState) if (r !== fp) relearn[r] = autoRelearnState[r]
-    ddcOff = off
-    ddcMisses = misses
-    autoRelearnState = relearn
-    var payload = { memory: nextMemory }
+    var now = Date.now()
+    var before = Model.ddcOffMap(ddcStates)
+    var states = {}
+    for (var k in ddcStates) if (k !== fp) states[k] = ddcStates[k]
+    // With nothing remembered, automation stops: nothing may stay paused.
     if (!Model.hasMemory(nextMemory)) {
-      payload.removeManagedBlock = true
-    } else if (livePlan.length) {
-      payload.plan = livePlan
+      for (var p in states) if (states[p] && states[p].state === "PAUSED") states = Model.ddcWake(states, p, now, false)
+    }
+    ddcStates = states
+    var previousDdcMemory = ddcMemory
+    var ddcMem = Model.normalizeDdcMemory(ddcMemory)
+    delete ddcMem.monitors[fp]
+    ddcMemory = ddcMem
+    var after = Model.ddcOffMap(states)
+    var woke = Object.keys(before).some(function(f) { return !after[f] })
+    var payload = { memory: nextMemory, forgetDdcFp: fp }
+    if (!Model.hasMemory(nextMemory)) payload.removeManagedBlock = true
+    var persistNow = function() {
+      service.run(["persist"], JSON.stringify(payload), function(code, data, stderr) {
+        service.persistInFlight = false
+        if (code === 0) {
+          service.memory = nextMemory
+          if (data && data.ddcMemory) service.ddcMemory = Model.normalizeDdcMemory(data.ddcMemory)
+          service.lastError = ""
+        } else {
+          service.lastError = service.errorText(data, stderr)
+        }
+        service.refresh(function() {
+          if (done) done(code === 0)
+        })
+      })
     }
     persistInFlight = true
-    run(["persist"], JSON.stringify(payload), function(code, data, stderr) {
-      service.persistInFlight = false
-      if (code === 0) {
-        service.memory = nextMemory
-        service.lastError = ""
-      } else {
+    if (woke) {
+      // Turn the woken monitor back on first, and forget only once it is lit:
+      // with memory gone, no automatic reconcile could turn it on later.
+      var wakePlan = Model.derive(monitors, memory, Model.autoOffFor(Model.planFromLive(monitors, memory), lidClosed, after),
+                                  Model.ddcPauseModes(states), appliedParks)
+      // monitors.lua gets the whole unpaused layout for what is still
+      // remembered, never the live geometry packed around a pause.
+      if (Model.hasMemory(nextMemory)) payload.plan = unpausedPlan(nextMemory)
+      noteAppliedParks(wakePlan)
+      run(["apply"], JSON.stringify(wakePlan), function(code, data, stderr) {
+        service.noteAppliedParks(wakePlan)
+        if (code === 0) {
+          persistNow()
+          return
+        }
+        // Forget is abandoned: memory stays, and the next reconcile retries the wake.
+        service.persistInFlight = false
         service.lastError = service.errorText(data, stderr)
-      }
-      service.refresh(function() {
-        if (done) done(code === 0)
+        service.ddcMemory = previousDdcMemory
+        service.reconcilePending = true
+        service.refresh(function() {
+          if (done) done(false)
+        })
       })
-    })
-  }
-
-  // Dedicated read-only DDC probe Process for BOTH manual and automatic
-  // re-learning. Slow I2C probes run here (never on `helper`) so they can
-  // never block Apply, Keep, or safety Revert; only the fast, serialized
-  // `ddc-save` write touches displays.json after validating current state.
-  property var autoRelearnQueue: []
-  property var activeAutoRelearn: null
-  property int relearnEpoch: 0
-
-  function relearnDdcInput(name, fp, done) {
-    if (!name || !fp) return
-    if (confirming || applyInFlight || persistInFlight) {
-      var busyErr = "Wait for pending display changes to finish first"
-      if (done) done(false, { error: busyErr })
       return
     }
-    if (!hasSavedDdcWatch(fp)) {
-      if (done) done(false, { error: "Apply Auto-Disable first before re-learning input" })
-      return
-    }
-    autoRelearnQueue = autoRelearnQueue.concat([{
-      name: name,
-      fp: fp,
-      manual: true,
-      epoch: relearnEpoch,
-      wasOff: !!(ddcOff && ddcOff[fp]),
-      done: done || null
-    }])
-    pumpAutoRelearn()
-  }
-
-  Process {
-    id: ddcRelearnProc
-    stdout: StdioCollector { id: ddcRelearnOut }
-    onExited: function(exitCode) {
-      var job = service.activeAutoRelearn
-      service.activeAutoRelearn = null
-      var reading = ""
-      if (exitCode === 0) {
-        try {
-          var parsed = JSON.parse(String(ddcRelearnOut.text || "null"))
-          if (parsed && job && parsed[job.name]) reading = String(parsed[job.name])
-        } catch (e) {
-          reading = ""
-        }
-      }
-      if (job) {
-        var invalidated = job.cancelled || job.epoch !== service.relearnEpoch
-          || service.confirming || service.applyInFlight || service.persistInFlight
-          || !service.hasSavedDdcWatch(job.fp)
-        if (invalidated) {
-          if (!job.manual) {
-            service.autoRelearnState = Model.ddcRelearnCancelQueued(service.autoRelearnState, [job.fp])
-          }
-          if (job.done) job.done(false, { error: "Cancelled while display changes were in progress" })
-        } else if (!reading) {
-          var readErr = "Could not read DDC/CI input for " + job.name
-          if (job.manual) service.lastError = readErr
-          else service.autoRelearnState = Model.ddcRelearnFinish(service.autoRelearnState, job.fp, job.name, false, Date.now())
-          if (job.done) job.done(false, { error: readErr })
-        } else {
-          // Fast, serialized memory update on `helper`; re-checks ddcWatch on disk.
-          ;(function(savedJob, codeHex) {
-            service.run(["ddc-save", savedJob.name, savedJob.fp, codeHex], null, function(code, data, stderr) {
-              var ok = code === 0 && data && data.ok
-              if (ok) {
-                if (data.memory) service.memory = Model.normalizeMemory(data.memory)
-                var off = {}
-                var misses = {}
-                for (var k in service.ddcOff) if (k !== savedJob.fp) off[k] = service.ddcOff[k]
-                for (var m in service.ddcMisses) if (m !== savedJob.fp) misses[m] = service.ddcMisses[m]
-                service.ddcOff = off
-                service.ddcMisses = misses
-                if (savedJob.manual) service.lastError = ""
-                else service.autoRelearnState = Model.ddcRelearnFinish(service.autoRelearnState, savedJob.fp, savedJob.name, true, Date.now())
-                if (savedJob.done) savedJob.done(true, data)
-                if (savedJob.wasOff && !service.confirming && !service.applyInFlight) {
-                  service.refresh(service.reconcile)
-                }
-              } else {
-                var err = service.errorText(data, stderr)
-                if (savedJob.manual) service.lastError = err
-                else service.autoRelearnState = Model.ddcRelearnFinish(service.autoRelearnState, savedJob.fp, savedJob.name, false, Date.now())
-                if (savedJob.done) savedJob.done(false, { error: err })
-              }
-            })
-          })(job, reading)
-        }
-      }
-      Qt.callLater(service.pumpAutoRelearn)
-    }
-  }
-
-  function cancelQueuedAutoRelearn() {
-    var queued = autoRelearnQueue
-    autoRelearnQueue = []
-    var fps = []
-    for (var i = 0; i < queued.length; i++) {
-      if (!queued[i].manual) fps.push(queued[i].fp)
-      if (queued[i].done) queued[i].done(false, { error: "Cancelled while display changes were in progress" })
-    }
-    if (activeAutoRelearn && ddcRelearnProc.running) {
-      activeAutoRelearn.cancelled = true
-      if (!activeAutoRelearn.manual) fps.push(activeAutoRelearn.fp)
-      ddcRelearnProc.running = false
-    }
-    if (fps.length) autoRelearnState = Model.ddcRelearnCancelQueued(autoRelearnState, fps)
-  }
-
-  function pumpAutoRelearn() {
-    if (ddcRelearnProc.running || autoRelearnQueue.length === 0) return
-    if (confirming || applyInFlight || persistInFlight) {
-      cancelQueuedAutoRelearn()
-      return
-    }
-    var job = autoRelearnQueue[0]
-    autoRelearnQueue = autoRelearnQueue.slice(1)
-    if (!job.manual && isDevInstance) {
-      autoRelearnState = Model.ddcRelearnCancelQueued(autoRelearnState, [job.fp])
-      Qt.callLater(service.pumpAutoRelearn)
-      return
-    }
-    activeAutoRelearn = job
-    ddcRelearnProc.command = ["python3", "-I", service.helperPath, "ddc-poll", "--fresh", job.name]
-    ddcRelearnProc.running = true
-    if (!ddcRelearnProc.running) {
-      activeAutoRelearn = null
-      if (!job.manual) autoRelearnState = Model.ddcRelearnFinish(autoRelearnState, job.fp, job.name, false, Date.now())
-      if (job.done) job.done(false, { error: "Failed to start DDC probe" })
-      Qt.callLater(service.pumpAutoRelearn)
-    }
-  }
-
-  function autoRelearnMovedConnectors(plan) {
-    if (isDevInstance || confirming || applyInFlight || persistInFlight || !Array.isArray(plan) || !memory || !memory.monitors) return
-    var now = Date.now()
-    for (var i = 0; i < plan.length; i++) {
-      var o = plan[i]
-      // Skip internal panels and manually disabled monitors, but allow relearning
-      // even if an output had been auto-disabled before a port swap.
-      if (!o || o.internal || (!o.enabled && !o.autoOff)) continue
-      var profile = memory.monitors[o.fp]
-      if (!Model.ddcNeedsRelearn(profile, o.name)) continue
-      var step = Model.ddcRelearnBegin(autoRelearnState, o.fp, o.name, now)
-      if (!step.allowed) continue
-      autoRelearnState = step.state
-      autoRelearnQueue = autoRelearnQueue.concat([{
-        name: o.name,
-        fp: o.fp,
-        manual: false,
-        epoch: relearnEpoch,
-        wasOff: !!(service.ddcOff && service.ddcOff[o.fp]),
-        done: null
-      }])
-    }
-    pumpAutoRelearn()
+    if (Model.hasMemory(nextMemory) && livePlan.length) payload.plan = unpausedPlan(nextMemory)
+    persistNow()
   }
 
   // ---------------------------------------------------------------- automatic
@@ -619,9 +890,45 @@ Item {
       .join("\n")
   }
 
-  function reconcile() {
-    if (isDevInstance || !loaded || confirming || !Model.hasMemory(memory) || monitors.length === 0) return
-    var plan = Model.derive(monitors, memory, currentAutoOff)
+  function flushReconcileIdleWaiters(ready) {
+    if (reconcileInFlight || reconcileIdleWaiters.length === 0) return
+    var waiters = reconcileIdleWaiters
+    reconcileIdleWaiters = []
+    for (var i = 0; i < waiters.length; i++) waiters[i](ready === true)
+  }
+
+  function whenReconcileIdle(done) {
+    if (!done) return
+    if (!reconcileInFlight && !wakePending) {
+      done(true)
+      return
+    }
+    if (!reconcileInFlight && wakePending) {
+      reconcile(true)
+      if (!reconcileInFlight) {
+        done(!wakePending)
+        return
+      }
+    }
+    reconcileIdleWaiters = reconcileIdleWaiters.concat([done])
+  }
+
+  // `liveOnly` (automatic DDC pause, wake, resume): apply live and never write
+  // monitors.lua, which holds the unpaused layout anyway, so an input switch
+  // can never race a panel preview or Forget on disk. Hotplug and startup
+  // reconciles (no argument) also persist the layout for the new set.
+  function reconcile(liveOnly) {
+    if (!loaded || !Model.hasMemory(memory) || monitors.length === 0) return
+    if (liveOnly !== true) reconcileNeedsPersist = true
+    if (confirming || applyInFlight || persistInFlight || revertInFlight || reconcileInFlight || liveGlobalIdle) {
+      // Picked up again once the panel's change has finished or DPMS wakes.
+      reconcilePending = true
+      return
+    }
+    reconcilePending = false
+    var persistToo = reconcileNeedsPersist
+    reconcileNeedsPersist = false
+    var plan = Model.derive(monitors, memory, currentAutoOff, ddcPauseModes, appliedParks)
     var topo = topologySignature(plan)
     if (Model.planMatchesLive(plan, livePlan)) {
       // Even when monitors.lua already restored geometry at login, still apply
@@ -630,23 +937,43 @@ Item {
         lastPrefsTopology = topo
         applyMonitorPreferences(plan, memory, true)
       }
-      autoRelearnMovedConnectors(plan)
       return
     }
     var signature = JSON.stringify(plan)
     var step = Model.autoApplyStep(lastAuto, signature, Date.now())
     lastAuto = step.last
-    if (!step.allowed) return
+    if (!step.allowed) {
+      if (persistToo) reconcileNeedsPersist = true
+      // A monitor left dark keeps being retried once the limit allows it.
+      if (Model.planWakes(plan, livePlan)) reconcilePending = true
+      return
+    }
+    reconcileInFlight = true
+    noteAppliedParks(plan)
     run(["apply"], signature, function(code, data, stderr) {
+      // Even a failed apply may have parked some outputs; unseen ones are pruned.
+      service.noteAppliedParks(plan)
       service.fallbacks = data && Array.isArray(data.fallbacks) ? data.fallbacks : []
       service.lastError = code === 0 ? "" : service.errorText(data, stderr)
       if (code === 0) {
         service.lastPrefsTopology = topo
         service.applyMonitorPreferences(plan, service.memory, true)
-        service.autoRelearnMovedConnectors(plan)
-        service.run(["persist"], JSON.stringify({ plan: plan }), null)
+        // monitors.lua gets the unpaused layout itself (never the positions a
+        // paused plan packed the others into), so an input pause or wake
+        // leaves the file (and Hyprland's config) untouched.
+        if (persistToo)
+          service.run(["persist"], JSON.stringify({ plan: service.unpausedPlan(service.memory) }), null)
+      } else {
+        // Never lose a wake (or a change) to a failed apply: retry next tick.
+        service.reconcilePending = true
+        if (persistToo) service.reconcileNeedsPersist = true
       }
-      service.refresh()
+      service.refresh(function(refreshOk) {
+        if (!refreshOk) service.reconcilePending = true
+        service.reconcileInFlight = false
+        var confirmed = refreshOk === true && !service.wakePending
+        Qt.callLater(function() { service.flushReconcileIdleWaiters(confirmed) })
+      })
     })
   }
 
@@ -657,13 +984,16 @@ Item {
     id: settle
     interval: 1200
     repeat: false
-    onTriggered: if (!service.confirming) service.refresh(service.reconcile)
+    onTriggered: if (!service.confirming) service.refresh(function(ok) { if (ok) service.reconcile() })
   }
 
   Connections {
     target: Hyprland
     function onRawEvent(event) {
       var name = event ? String(event.name || "") : ""
+      if (name === "monitoradded" || name === "monitoraddedv2") {
+        service.noteMonitorAdded(Model.monitorAddedName(name, event.data))
+      }
       if (name === "monitoradded" || name === "monitoraddedv2" || name === "monitorremoved"
           || name === "monitorremovedv2" || name === "configreloaded")
         settle.restart()
@@ -674,91 +1004,7 @@ Item {
     interval: 1500
     running: true
     repeat: false
-    onTriggered: service.refresh(service.reconcile)
-  }
-
-  // ---------------------------------------------------------------- DDC/CI (dedicated Process)
-  // Runs in its own Process so a slow DDC bus probe never blocks Apply, Revert,
-  // refresh, or Night Light.
-  readonly property var watchedOutputs: {
-    var out = []
-    var mem = Model.normalizeMemory(memory)
-    for (var i = 0; i < livePlan.length; i++) {
-      var o = livePlan[i]
-      var profile = mem.monitors[o.fp]
-      // Poll only once connector tracking & input are in sync; moved connectors
-      // and legacy profiles without ddcConnector are migrated via auto-relearn first.
-      if (!o.internal && profile && profile.ddcWatch && profile.ddcInput
-          && !Model.ddcNeedsRelearn(profile, o.name))
-        out.push({ name: o.name, fp: o.fp, input: profile.ddcInput })
-    }
-    return out
-  }
-
-  readonly property var pendingRelearnOutputs: {
-    var out = []
-    var mem = Model.normalizeMemory(memory)
-    for (var i = 0; i < livePlan.length; i++) {
-      var o = livePlan[i]
-      if (!o || o.internal || (!o.enabled && !o.autoOff)) continue
-      var profile = mem.monitors[o.fp]
-      if (Model.ddcNeedsRelearn(profile, o.name)) out.push(o)
-    }
-    return out
-  }
-
-  property var ddcPollTargets: []
-
-  Process {
-    id: ddcPollProc
-    stdout: StdioCollector { id: ddcPollOut }
-    onExited: function(exitCode) {
-      var watched = service.ddcPollTargets
-      service.ddcPollTargets = []
-      if (exitCode !== 0 || service.confirming) return
-      var data = null
-      try {
-        data = JSON.parse(String(ddcPollOut.text || "null"))
-      } catch (e) {
-        data = null
-      }
-      if (!data) return
-      var off = {}
-      var misses = {}
-      for (var k in service.ddcOff) off[k] = service.ddcOff[k]
-      var changed = false
-      for (var i = 0; i < watched.length; i++) {
-        var w = watched[i]
-        var step = Model.ddcStep(service.ddcMisses[w.fp], data[w.name], w.input)
-        misses[w.fp] = step.misses
-        if (step.off !== !!off[w.fp]) changed = true
-        if (step.off) off[w.fp] = true
-        else delete off[w.fp]
-      }
-      service.ddcMisses = misses
-      if (!changed) return
-      service.ddcOff = off
-      service.refresh(service.reconcile)
-    }
-  }
-
-  function pollInputs() {
-    var watched = watchedOutputs
-    if (!watched.length || ddcPollProc.running || confirming || isDevInstance) return
-    ddcPollTargets = watched
-    ddcPollProc.command = ["python3", "-I", service.helperPath, "ddc-poll"].concat(watched.map(function(w) { return w.name }))
-    ddcPollProc.running = true
-  }
-
-  Timer {
-    interval: 5000
-    repeat: true
-    running: (service.watchedOutputs.length > 0 || service.pendingRelearnOutputs.length > 0)
-      && !service.confirming && !service.applyInFlight && !service.persistInFlight && !service.isDevInstance
-    onTriggered: {
-      if (service.pendingRelearnOutputs.length > 0) service.autoRelearnMovedConnectors(service.livePlan)
-      service.pollInputs()
-    }
+    onTriggered: service.refresh(function(ok) { if (ok) service.reconcile() })
   }
 
   // ---------------------------------------------------------------- Apply
@@ -768,25 +1014,34 @@ Item {
   // any previewed OS-wide preferences if rejected or timed out.
   function applyFromPanel(plan, options, revertSnapshot) {
     if (confirming || applyInFlight || !plan || !plan.length) return
-    relearnEpoch = relearnEpoch + 1
-    cancelQueuedAutoRelearn()
+    // A mirror-parked monitor never goes out parked on a target the edit
+    // turned off or mirrored: it is re-parked, or turned on with none left.
+    plan = Model.settleParkedMirrors(plan)
+    ddcPollEpoch = ddcPollEpoch + 1
     applyInFlight = true
     var before = livePlan
     var mustConfirm = Model.needsConfirmation(plan, before)
     var opts = options || {}
+    noteAppliedParks(plan)
     run(["apply"], JSON.stringify(plan), function(code, data, stderr) {
       service.applyInFlight = false
+      service.noteAppliedParks(plan)
       service.fallbacks = data && Array.isArray(data.fallbacks) ? data.fallbacks : []
       if (code !== 0) {
         service.lastError = service.errorText(data, stderr)
         service.restorePreviewPrefs(revertSnapshot)
         service.panelApplyReverted(revertSnapshot)
-        service.runFront(["revert"], JSON.stringify(before), function() { service.refresh() })
+        service.revertInFlight = true
+        service.noteAppliedParks(before)
+        service.runFront(["revert"], JSON.stringify(before), function() {
+          service.revertInFlight = false
+          service.noteAppliedParks(before)
+          service.refresh()
+        })
         return
       }
       service.lastError = ""
       if (mustConfirm) {
-        service.cancelQueuedAutoRelearn()
         service.pendingCommit = { plan: plan, options: opts }
         service.revertPlan = before
         service.revertPrefs = revertSnapshot || null
@@ -818,9 +1073,10 @@ Item {
     var nextMemory = Model.remember(memory, plan, new Date().toISOString(), options)
     lastPrefsTopology = topologySignature(plan)
     persistInFlight = true
-    relearnEpoch = relearnEpoch + 1
-    cancelQueuedAutoRelearn()
-    run(["persist"], JSON.stringify({ plan: plan, memory: nextMemory }), function(code, data, stderr) {
+    ddcPollEpoch = ddcPollEpoch + 1
+    // A monitor paused for an input switch keeps its unpaused place in monitors.lua.
+    var filePlan = persistablePlan(plan, nextMemory)
+    run(["persist"], JSON.stringify({ plan: filePlan, memory: nextMemory }), function(code, data, stderr) {
       service.persistInFlight = false
       if (code === 0) {
         service.memory = nextMemory
@@ -849,8 +1105,7 @@ Item {
     if (!confirming) return
     confirmTimer.stop()
     confirming = false
-    relearnEpoch = relearnEpoch + 1
-    cancelQueuedAutoRelearn()
+    ddcPollEpoch = ddcPollEpoch + 1
     var previous = revertPlan
     var snap = revertPrefs
     pendingCommit = null
@@ -860,7 +1115,15 @@ Item {
     panelApplyReverted(snap)
     // Uses `runFront` + `revert` so safety rollback jumps ahead of any queued
     // refresh/nightlight job and never disables the last connected display.
-    if (previous) runFront(["revert"], JSON.stringify(previous), function() { service.refresh() })
+    if (previous) {
+      revertInFlight = true
+      noteAppliedParks(previous)
+      runFront(["revert"], JSON.stringify(previous), function() {
+        service.revertInFlight = false
+        service.noteAppliedParks(previous)
+        service.refresh()
+      })
+    }
   }
 
   Timer {

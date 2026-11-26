@@ -8,13 +8,20 @@
 // A plan is a list of outputs:
 //   { name, fp, selector, internal, enabled, autoOff, offReason,
 //     mode: { w, h, hz }, x, y, scale, vrr, hdr, sdrBrightness, sdrSaturation,
-//     transform, mirrorOf, ddcWatch, brightness }
+//     transform, mirrorOf, parkMirrorOf, brightness }
 // `autoOff` marks a monitor that is connected but off for now: "lid" (the
 // laptop is shut; Omarchy's clamshell handling owns the panel) or "input"
-// (it was switched to another input, or off; this bar turns it off and on).
+// (the monitor was switched to another input; this bar pauses it and wakes it
+// when it comes back — see the auto-pause state machine at the end of this
+// file). An input pause seen through HDMI SCDC is "mirror-parked": the monitor
+// stays lit as a mirror of `parkMirrorOf` (live only, never in monitors.lua),
+// so its link stays up and the moment it relocks it is unparked; one seen
+// through DDC/CI is simply disabled.
 // Memory (displays.json) keeps two things apart:
 //   monitors[fp]  settings that belong to one monitor wherever it is plugged in
 //   layouts[key]  positions, on/off, mirror, text size & night light for one set
+// Learned DDC/CI inputs live separately in ddc.json ({ monitors: { fp: { input,
+// connector, learnedAt } } }), written only by display_ctl.py's ddc-learn.
 
 var SCALE_PRESETS = [1, 1.25, 1.5, 1.6, 2, 3]
 var MAX_LAYOUTS = 64
@@ -486,6 +493,29 @@ function byPosition(a, b) {
   return (a.x - b.x) || (a.y - b.y)
 }
 
+function layoutValid(result, order) {
+  if (order.length <= 1) return true
+  var rects = order.map(function(idx) { return rectOf(result[idx]) })
+  for (var i = 0; i < rects.length; i++) {
+    for (var j = i + 1; j < rects.length; j++) {
+      if (overlaps(rects[i], rects[j])) return false
+    }
+  }
+  var seen = [0]
+  var visited = { 0: true }
+  for (var q = 0; q < seen.length; q++) {
+    var cur = seen[q]
+    for (var k = 0; k < rects.length; k++) {
+      if (visited[k]) continue
+      if (sharedEdge(rects[cur], rects[k]) > 0) {
+        visited[k] = true
+        seen.push(k)
+      }
+    }
+  }
+  return seen.length === rects.length
+}
+
 // Closes gaps and removes overlaps among the enabled, non-mirrored outputs,
 // moving each as little as possible, then puts the layout's top-left corner
 // at 0,0. `fixed` (an index) is the output the user is dragging: it is placed
@@ -501,18 +531,22 @@ function solve(outputs, fixed, alignWithin) {
   var order = []
   for (var i = 0; i < result.length; i++)
     if (result[i].enabled && !result[i].autoOff && !result[i].mirrorOf) order.push(i)
-  order.sort(function(a, b) {
-    if (a === fixed) return 1
-    if (b === fixed) return -1
-    return byPosition(rectOf(result[a]), rectOf(result[b]))
-  })
   var placed = []
-  for (var j = 0; j < order.length; j++) {
-    var output = result[order[j]]
-    var r = attach(rectOf(output), placed, order[j] === fixed ? alignWithin : 0)
-    output.x = r.x
-    output.y = r.y
-    placed.push(r)
+  if (fixed === undefined && layoutValid(result, order)) {
+    for (var v = 0; v < order.length; v++) placed.push(rectOf(result[order[v]]))
+  } else {
+    order.sort(function(a, b) {
+      if (a === fixed) return 1
+      if (b === fixed) return -1
+      return byPosition(rectOf(result[a]), rectOf(result[b]))
+    })
+    for (var j = 0; j < order.length; j++) {
+      var output = result[order[j]]
+      var r = attach(rectOf(output), placed, order[j] === fixed ? alignWithin : 0)
+      output.x = r.x
+      output.y = r.y
+      placed.push(r)
+    }
   }
   if (placed.length) {
     var minX = Infinity
@@ -755,23 +789,65 @@ function liveOutput(monitor, id, allMonitors) {
     sdrSaturation: cleanSdrSaturation(monitor.sdrSaturation),
     transform: cleanTransform(monitor.transform),
     mirrorOf: cleanMirrorOf(monitor.mirrorOf, allMonitors),
-    ddcWatch: false,
+    parkMirrorOf: "",
+    pauseMode: "",
     textSize: null,
     brightness: null,
     nightLight: null
   }
 }
 
+// The bar-owned targets `appliedParks` lists for `connectorName`, as an array.
+function appliedParkTargets(appliedParks, connectorName) {
+  var parks = appliedParks && typeof appliedParks === "object" ? appliedParks : {}
+  var name = clean(connectorName)
+  if (!name || !Object.prototype.hasOwnProperty.call(parks, name)) return []
+  var raw = Array.isArray(parks[name]) ? parks[name] : [parks[name]]
+  var out = []
+  for (var i = 0; i < raw.length; i++) {
+    var t = cleanMirrorOf(raw[i])
+    if (t && out.indexOf(t) === -1) out.push(t)
+  }
+  return out
+}
+
+// `liveMirror` (the target connector `connectorName` mirrors live) when it is
+// the bar's own park, else "". Ownership is only ever explicit: `appliedParks`
+// ({ connector: [target, ...] }, the parks the bar applied and has not yet
+// seen undone) must list that target. How a monitor is watched or paused
+// never claims a mirror; any other mirror is the user's and is kept.
+function liveParkOf(connectorName, liveMirror, appliedParks) {
+  var target = cleanMirrorOf(liveMirror)
+  if (!target) return ""
+  return appliedParkTargets(appliedParks, connectorName).indexOf(target) !== -1 ? target : ""
+}
+
+// liveParkOf for a Hyprland monitor: "" when it is disabled or not a mirror.
+function liveParkOfMonitor(monitor, allMonitors, appliedParks) {
+  if (!monitor || monitor.disabled === true) return ""
+  return liveParkOf(monitor.name, cleanMirrorOf(monitor.mirrorOf, allMonitors), appliedParks)
+}
+
 // The current state as a plan: what the panel starts editing from, and what a
-// revert goes back to.
-function planFromLive(monitors, memory, autoOff) {
+// revert goes back to. `pauseModes` ({ fp: "mirror" | "disable" }, from
+// ddcPauseModes) says how an input-paused monitor is kept off; `appliedParks`
+// (see liveParkOf) which live mirrors are the bar's own parks. A park is
+// reported as `parkMirrorOf` (paused, or still parked after a wake until the
+// reconcile undoes it), never as a mirror the user set up. A mirror-paused
+// monitor that is not parked live is reported as it is: on, not paused.
+function planFromLive(monitors, memory, autoOff, pauseModes, appliedParks) {
   var mem = normalizeMemory(memory)
   var off = autoOff || {}
+  var modes = pauseModes || {}
   var ids = identify(monitors, mem)
+  var activeNames = {}
+  for (var a = 0; a < monitors.length; a++) {
+    var lm = monitors[a]
+    if (lm && lm.name && lm.disabled !== true && !cleanMirrorOf(lm.mirrorOf, monitors)) activeNames[clean(lm.name)] = true
+  }
   return monitors.map(function(m, i) {
     var out = liveOutput(m, ids[i], monitors)
     var profile = mem.monitors[out.fp]
-    out.ddcWatch = !!(profile && profile.ddcWatch)
     // Hyprland reports whether VRR is active, not the Off/On/Fullscreen
     // setting, so the remembered setting is the one to edit and revert to.
     if (profile && [0, 1, 2].indexOf(Number(profile.vrr)) !== -1) out.vrr = Number(profile.vrr)
@@ -784,19 +860,130 @@ function planFromLive(monitors, memory, autoOff) {
         if (profile.sdrSaturation !== undefined) out.sdrSaturation = cleanSdrSaturation(profile.sdrSaturation)
       }
     }
+    var pausedAsMirror = off[out.fp] === "input" && modes[out.fp] === "mirror"
+    var park = liveParkOfMonitor(m, monitors, appliedParks)
+    if (park) {
+      // Woken but still parked live, it keeps `parkMirrorOf` as a marker, so
+      // the plan that unparks it is never mistaken for one already applied.
+      out.mirrorOf = ""
+      out.parkMirrorOf = park
+    }
     if (off[out.fp]) {
       out.autoOff = true
       out.offReason = String(off[out.fp])
+      if (out.offReason === "input") out.pauseMode = modes[out.fp] === "mirror" || modes[out.fp] === "disable" ? modes[out.fp] : ""
+      if (out.parkMirrorOf && !(out.offReason === "input" && park !== out.name && activeNames[park])) out.parkMirrorOf = ""
+      if (pausedAsMirror && !out.parkMirrorOf) {
+        // Not parked (yet): it is lit and extended, never "off".
+        out.autoOff = false
+        out.offReason = ""
+        out.pauseMode = ""
+      }
     }
     return out
   })
+}
+
+// The active output an input-paused monitor is parked on as a mirror: enabled,
+// not off for now, not itself a mirror or parked. The internal panel first
+// while the lid is open, else the first such external; "" when there is none.
+function pickParkMirrorTarget(outputs, pausedFp, lidClosed) {
+  var list = Array.isArray(outputs) ? outputs : []
+  var paused = null
+  for (var p = 0; p < list.length; p++) if (list[p] && list[p].fp === pausedFp) paused = list[p]
+  var candidates = list.filter(function(o) {
+    return !!o && o.fp !== pausedFp && (!paused || o.name !== paused.name) && o.enabled !== false
+      && !o.autoOff && !cleanMirrorOf(o.mirrorOf) && !cleanMirrorOf(o.parkMirrorOf) && !!clean(o.name)
+  })
+  var internal = candidates.filter(function(o) { return o.internal })
+  var external = candidates.filter(function(o) { return !o.internal })
+  var ordered = lidClosed ? external.concat(internal) : internal.concat(external)
+  return ordered.length ? clean(ordered[0].name) : ""
+}
+
+function isParked(o) {
+  return !!o && o.autoOff === true && o.offReason === "input" && !!cleanMirrorOf(o.parkMirrorOf)
+}
+
+function lidShutIn(plan) {
+  return (Array.isArray(plan) ? plan : []).some(function(o) { return o && o.autoOff && o.offReason === "lid" })
+}
+
+// A plan about to be applied keeps every mirror-park valid: a parked monitor
+// whose target is no longer an active output (or a mirror-pausing one with no
+// target yet) is parked on another one, or, with none left, turned back on:
+// never left as an unparkable mirror, and never `autoOff` with no park (which
+// would disable it and drop the link it relocks on).
+function settleParkedMirrors(plan) {
+  var list = (Array.isArray(plan) ? plan : []).map(function(o) {
+    var c = {}
+    for (var k in o) c[k] = o[k]
+    if (o.mode) c.mode = { w: o.mode.w, h: o.mode.h, hz: o.mode.hz }
+    return c
+  })
+  var lid = lidShutIn(list)
+  for (var i = 0; i < list.length; i++) {
+    var o = list[i]
+    var inputPaused = o.autoOff === true && o.offReason === "input"
+    if (!inputPaused) {
+      o.parkMirrorOf = ""
+      o.pauseMode = ""
+      continue
+    }
+    if (!cleanMirrorOf(o.parkMirrorOf) && o.pauseMode !== "mirror") {
+      o.parkMirrorOf = ""
+      continue
+    }
+    var target = null
+    for (var j = 0; j < list.length; j++) if (list[j].name === cleanMirrorOf(o.parkMirrorOf)) target = list[j]
+    var valid = target && target !== o && target.enabled !== false && !target.autoOff
+      && !cleanMirrorOf(target.mirrorOf) && !cleanMirrorOf(target.parkMirrorOf)
+    if (valid) {
+      o.pauseMode = "mirror"
+      continue
+    }
+    o.parkMirrorOf = ""
+    var next = pickParkMirrorTarget(list, o.fp, lid)
+    if (next) {
+      o.parkMirrorOf = next
+      o.pauseMode = "mirror"
+    } else {
+      o.autoOff = false
+      o.offReason = ""
+      o.pauseMode = ""
+      o.enabled = true
+    }
+  }
+  return list
 }
 
 // The layout to run for the connected monitors. `autoOff` maps fingerprints
 // to a reason ("lid", "input") for monitors that are connected but should be
 // left off; the layout is chosen for the rest, as if they were unplugged.
 // Monitors without a saved profile keep their live mode/VRR/HDR/scale/rotation.
-function derive(monitors, memory, autoOff) {
+// An input-paused monitor whose `pauseModes` entry is "mirror" is parked on an
+// active output (`parkMirrorOf`, `pauseMode: "mirror"`); with no output to
+// park on it is not paused. `appliedParks` (see liveParkOf) keeps the bar's
+// own live parks from being taken for mirrors the user set up.
+function derive(monitors, memory, autoOff, pauseModes, appliedParks) {
+  var modes = pauseModes || {}
+  var outputs = deriveLayout(monitors, memory, autoOff, modes, appliedParks)
+  var lid = lidShutIn(outputs)
+  var unparkable = []
+  for (var i = 0; i < outputs.length; i++) {
+    var o = outputs[i]
+    if (!(o.autoOff && o.offReason === "input" && modes[o.fp] === "mirror")) continue
+    o.parkMirrorOf = pickParkMirrorTarget(outputs, o.fp, lid)
+    if (!o.parkMirrorOf) unparkable.push(o.fp)
+  }
+  if (!unparkable.length) return outputs
+  var off = {}
+  for (var fp in autoOff || {}) if (unparkable.indexOf(fp) === -1) off[fp] = autoOff[fp]
+  return derive(monitors, memory, off, modes, appliedParks)
+}
+
+function deriveLayout(monitors, memory, autoOff, pauseModes, appliedParks) {
+  var modes = pauseModes || {}
   var mem = normalizeMemory(memory)
   var off = autoOff || {}
   var ids = identify(monitors, mem)
@@ -816,7 +1003,6 @@ function derive(monitors, memory, autoOff) {
       out.sdrBrightness = profile.sdrBrightness !== undefined ? cleanSdrBrightness(profile.sdrBrightness) : out.sdrBrightness
       out.sdrSaturation = profile.sdrSaturation !== undefined ? cleanSdrSaturation(profile.sdrSaturation) : out.sdrSaturation
       out.transform = profile.transform !== undefined ? cleanTransform(profile.transform) : out.transform
-      out.ddcWatch = profile.ddcWatch === true
       out.textSize = cleanTextSize(profile.textSize)
       out.brightness = cleanBrightness(profile.brightness)
       out.nightLight = cleanNightLight(profile.nightLight)
@@ -831,6 +1017,8 @@ function derive(monitors, memory, autoOff) {
     }
     out.autoOff = !!off[out.fp]
     out.offReason = off[out.fp] ? String(off[out.fp]) : ""
+    out.pauseMode = out.offReason === "input" && (modes[out.fp] === "mirror" || modes[out.fp] === "disable")
+      ? modes[out.fp] : ""
     out.enabled = true
     out.mirrorOf = ""
     outputs.push(out)
@@ -859,7 +1047,10 @@ function derive(monitors, memory, autoOff) {
     for (var l = 0; l < active.length; l++) {
       known[active[l].fp] = true
       var origMonitor = monitors[outputs.indexOf(active[l])]
-      active[l].mirrorOf = cleanMirrorOf(origMonitor ? origMonitor.mirrorOf : "", monitors)
+      // A live mirror the bar parked (and has not seen undone yet) is never a
+      // mirror to keep; any other live mirror is the user's and stays.
+      active[l].mirrorOf = liveParkOfMonitor(origMonitor, monitors, appliedParks)
+        ? "" : cleanMirrorOf(origMonitor ? origMonitor.mirrorOf : "", monitors)
     }
   }
   for (var a = 0; source && a < active.length; a++) {
@@ -917,11 +1108,16 @@ function derive(monitors, memory, autoOff) {
 
 function outputMatchesLive(output, live) {
   if (!live) return false
-  if (output.autoOff) return output.offReason !== "input" || live.enabled === false
+  if (output.autoOff) {
+    if (output.offReason !== "input") return true
+    var park = cleanMirrorOf(output.parkMirrorOf)
+    if (park) return live.enabled === true && cleanMirrorOf(live.mirrorOf || live.parkMirrorOf) === park
+    return live.enabled === false
+  }
   if (output.enabled !== live.enabled) return false
   if (!output.enabled) return true
   var mirrorA = cleanMirrorOf(output.mirrorOf)
-  var mirrorB = cleanMirrorOf(live.mirrorOf)
+  var mirrorB = cleanMirrorOf(live.mirrorOf || live.parkMirrorOf)
   if (mirrorA !== mirrorB) return false
   if (!mirrorA && (output.x !== live.x || output.y !== live.y)) return false
   if (!sameMode(output.mode, live.mode)) return false
@@ -934,6 +1130,21 @@ function outputMatchesLive(output, live) {
     if (Math.abs(cleanSdrSaturation(output.sdrSaturation) - cleanSdrSaturation(live.sdrSaturation)) >= 0.015) return false
   }
   return true
+}
+
+// True when a mirror-park in `plan` or `livePlan` is out of step with the other
+// (its target went away or changed, or a park can no longer be kept), so the
+// service reconciles to re-park or wake it.
+function parkedMirrorsStale(plan, livePlan) {
+  var list = Array.isArray(plan) ? plan : []
+  var liveList = Array.isArray(livePlan) ? livePlan : []
+  for (var i = 0; i < list.length; i++) {
+    var live = null
+    for (var j = 0; j < liveList.length; j++) if (liveList[j] && liveList[j].name === list[i].name) live = liveList[j]
+    if (!isParked(list[i]) && !isParked(live)) continue
+    if (!outputMatchesLive(list[i], live)) return true
+  }
+  return false
 }
 
 // True when applying `plan` would change nothing Hyprland shows.
@@ -968,6 +1179,17 @@ function copyMemory(memory) {
   return JSON.parse(JSON.stringify(normalizeMemory(memory)))
 }
 
+// Older releases kept a per-monitor input watch toggle and its learned input
+// inline in displays.json; display_ctl.py migrates the input to ddc.json, and
+// every later save drops the old fields.
+function stripLegacyDdc(profile) {
+  if (!profile || typeof profile !== "object") return profile
+  delete profile.ddcWatch
+  delete profile.ddcInput
+  delete profile.ddcConnector
+  return profile
+}
+
 // The memory after the user presses Apply on `plan`: every monitor's own
 // settings, and the arrangement (plus explicitly edited OS-wide text size /
 // night light) for this combination of monitors.
@@ -1000,13 +1222,7 @@ function remember(memory, plan, now, options) {
     // choice; keep what was saved for it.
     if (!o.enabled || o.autoOff) {
       if (mem.monitors[o.fp]) {
-        if (o.ddcWatch !== (previous.ddcWatch === true)) {
-          mem.monitors[o.fp].ddcWatch = o.ddcWatch === true
-          if (!o.ddcWatch) {
-            delete mem.monitors[o.fp].ddcInput
-            delete mem.monitors[o.fp].ddcConnector
-          }
-        }
+        stripLegacyDdc(mem.monitors[o.fp])
         continue
       }
     }
@@ -1017,20 +1233,12 @@ function remember(memory, plan, now, options) {
       hdr: o.hdr === true,
       sdrBrightness: cleanSdrBrightness(o.sdrBrightness !== undefined ? o.sdrBrightness : previous.sdrBrightness),
       sdrSaturation: cleanSdrSaturation(o.sdrSaturation !== undefined ? o.sdrSaturation : previous.sdrSaturation),
-      transform: cleanTransform(o.transform),
-      ddcWatch: o.ddcWatch === true
+      transform: cleanTransform(o.transform)
     }
     var desc = clean(o.description || previous.description)
     if (desc) profile.description = desc
     var brightness = cleanBrightness(o.brightness !== null && o.brightness !== undefined ? o.brightness : previous.brightness)
     if (brightness !== null) profile.brightness = brightness
-    // The input a watched monitor is expected on is learned when the watch is
-    // switched on, and kept while it stays on. Also keep the PC connector name
-    // so moving the monitor to a different PC port auto-relearns its input.
-    if (profile.ddcWatch && previous.ddcWatch && previous.ddcInput) {
-      profile.ddcInput = previous.ddcInput
-      if (previous.ddcConnector) profile.ddcConnector = previous.ddcConnector
-    }
     var neighbour = o.enabled && !o.autoOff && !o.mirrorOf ? neighbourOf(o, members) : null
     if (neighbour) profile.lastNeighbour = neighbour
     else if (previous.lastNeighbour) profile.lastNeighbour = previous.lastNeighbour
@@ -1046,125 +1254,6 @@ function remember(memory, plan, now, options) {
     for (var d = 0; d < keys.length - MAX_LAYOUTS; d++) delete mem.layouts[keys[d]]
   }
   return mem
-}
-
-// One DDC/CI reading of a watched monitor's input source.
-// - Explicit different input reading (non-empty, != expected): 2 misses -> off.
-// - No reply (null/empty, e.g. I2C bus contention from brightness slider or
-//   powered off): 4 consecutive no-replies (20s) -> off.
-// - Reading the expected input resets misses and restores the output.
-function ddcStep(misses, reading, expected) {
-  var count = Number(misses) || 0
-  if (reading && expected && String(reading).toLowerCase() === String(expected).toLowerCase())
-    return { misses: 0, off: false }
-  if (reading) {
-    count += 2
-  } else {
-    count += 1
-  }
-  return { misses: count, off: count >= 4 }
-}
-
-// True when a watched external monitor needs its VCP 0x60 input learned:
-// missing input, moved to a different PC connector, or legacy profile saved
-// before ddcConnector tracking existed.
-function ddcNeedsRelearn(profile, connectorName) {
-  if (!profile || profile.ddcWatch !== true) return false
-  if (!profile.ddcInput) return true
-  return !profile.ddcConnector || String(profile.ddcConnector) !== String(connectorName || "")
-}
-
-// Clear DDC state for disconnected monitors AND for watched monitors that
-// reconnected on a different PC connector (or require legacy migration) so a
-// quick port swap while auto-disabled never leaves the monitor stuck off.
-function pruneDdcState(identifiedOutputs, memory, ddcOff, ddcMisses, relearnState) {
-  var mem = normalizeMemory(memory)
-  var present = {}
-  var connectors = {}
-  for (var i = 0; i < (identifiedOutputs || []).length; i++) {
-    var o = identifiedOutputs[i]
-    if (!o || !o.fp) continue
-    present[o.fp] = true
-    connectors[o.fp] = o.name
-  }
-  var off = {}
-  var misses = {}
-  var relearn = {}
-  for (var fp in ddcOff || {}) {
-    if (!present[fp]) continue
-    var profOff = mem.monitors[fp]
-    if (profOff && ddcNeedsRelearn(profOff, connectors[fp])) continue
-    off[fp] = ddcOff[fp]
-  }
-  for (var mp in ddcMisses || {}) {
-    if (!present[mp]) continue
-    var profMiss = mem.monitors[mp]
-    if (profMiss && ddcNeedsRelearn(profMiss, connectors[mp])) continue
-    misses[mp] = ddcMisses[mp]
-  }
-  for (var rp in relearnState || {}) {
-    if (!present[rp]) continue
-    var entry = relearnState[rp]
-    if (!entry || entry.connector !== connectors[rp]) continue
-    relearn[rp] = entry
-  }
-  return { ddcOff: off, ddcMisses: misses, relearnState: relearn }
-}
-
-function ddcRelearnBegin(state, fp, connector, now) {
-  var cur = state && state[fp] ? state[fp] : null
-  var sameConn = !!(cur && cur.connector === connector)
-  if (sameConn && cur.inFlight) return { allowed: false, state: state || {} }
-  if (sameConn && cur.nextRetryAt && now < cur.nextRetryAt) return { allowed: false, state: state || {} }
-  var next = {}
-  for (var k in state || {}) next[k] = state[k]
-  next[fp] = {
-    connector: connector,
-    inFlight: true,
-    failures: sameConn ? (Number(cur.failures) || 0) : 0,
-    nextRetryAt: 0
-  }
-  return { allowed: true, state: next }
-}
-
-function ddcRelearnFinish(state, fp, connector, ok, now) {
-  var next = {}
-  for (var k in state || {}) next[k] = state[k]
-  var cur = next[fp]
-  if (!cur || cur.connector !== connector) return next
-  if (ok) {
-    delete next[fp]
-    return next
-  }
-  var failures = (Number(cur.failures) || 0) + 1
-  var backoffMs = Math.min(60000, 5000 * Math.pow(2, failures - 1))
-  next[fp] = {
-    connector: connector,
-    inFlight: false,
-    failures: failures,
-    nextRetryAt: now + backoffMs
-  }
-  return next
-}
-
-function ddcRelearnClearBackoff(state) {
-  var next = {}
-  for (var k in state || {}) {
-    var cur = state[k]
-    if (cur && cur.inFlight) next[k] = cur
-  }
-  return next
-}
-
-function ddcRelearnCancelQueued(state, fps) {
-  var drop = {}
-  for (var i = 0; i < (fps || []).length; i++) drop[fps[i]] = true
-  var next = {}
-  for (var k in state || {}) {
-    if (drop[k]) continue
-    next[k] = state[k]
-  }
-  return next
 }
 
 // Merge confirmed live hardware brightness into enabled outputs of a plan on
@@ -1330,7 +1419,11 @@ function autoApplyStep(last, signature, now) {
 function autoOffFor(plan, lidClosed, ddcOff) {
   var out = {}
   var externals = plan.filter(function(o) { return !o.internal })
-  var remainingExternal = externals.filter(function(o) { return !(ddcOff && ddcOff[o.fp]) }).length
+  // Only externals that would actually stay lit count: a user-disabled one
+  // does not, so a lid-shut laptop never ends up with nothing on.
+  var remainingExternal = externals.filter(function(o) {
+    return o.enabled !== false && !(ddcOff && ddcOff[o.fp])
+  }).length
   for (var i = 0; i < plan.length; i++) {
     var o = plan[i]
     if (o.internal && lidClosed && externals.length > 0) {
@@ -1341,6 +1434,1000 @@ function autoOffFor(plan, lidClosed, ddcOff) {
     }
   }
   return out
+}
+
+
+// ---------------------------------------------------------------- auto-pause
+// A zero-toggle state machine, one entry per external monitor fingerprint,
+// fed with read-only readings from display_ctl.py:
+//   Tier 1, HDMI 2.0/2.1 SCDC signal lock (I2C 0x54, Status_Flags_0):
+//     { status: "ok", signal: "scdc", scdc: "locked" | "unlocked" | "absent" }
+//   Tier 2, DDC/CI VCP 0x60 (input source):
+//     { status: "ok", code: "0x11" }
+//   either: { status: "ambiguous" } | { status: "busy" } | { status: "no_tool" }
+//           | { status: "dpms_off" } (DPMS-blanked: no evidence, nothing read)
+// A monitor that answers "locked" twice while probing is watched through SCDC
+// (`mode: "scdc"`, `pauseMode: "mirror"`): 3 reads without a lock (switched
+// away, or a TV powered down) pause it by parking it as a mirror, which keeps
+// its link up, and the first "locked" wakes it. Otherwise VCP 0x60 is learned
+// (`mode: "ddc"`, `pauseMode: "disable"`). Either way it only ever pauses after
+// strong, repeated evidence, and it wakes on the first sign of doubt, so a
+// misbehaving monitor can never lock the user out:
+//   UNPROBED     waits out a settle grace after startup, connect, or resume
+//   PROBING      2 SCDC locks in a row -> WATCHING (scdc); else learns which
+//                input this PC is on (2 identical reads in a row); 3
+//                unreadable answers with no valid one -> UNSUPPORTED, and a
+//                monitor that answered once (VCP, or SCDC without a lock)
+//                gets 5 reads in all
+//   WATCHING     5s polls (2s for SCDC); 3 identical reads of another input,
+//                or 3 SCDC reads without a lock -> PAUSED
+//   PAUSED       3s polls (2s for SCDC); this PC's input / an SCDC lock ->
+//                wake; 2 unreadable -> wake. No lock keeps an SCDC pause (it
+//                is parked lit, so it can always relock)
+//   UNVERIFIED   started on another input than the learned one; never pauses
+//                until this PC's input is seen
+//   SNOOZED      woken by hand; never pauses until this PC's input is seen
+//   UNSUPPORTED  no usable DDC/CI answer; no more polls until reconnect/Re-probe
+//   SUSPENDED    paused too often (3 in 10 min); no polls until reconnect/Re-probe
+//   NO_TOOL      ddcutil is not installed and no SCDC sink answers
+// No I/O happens here; DisplayService runs the reads and carries out `learn`.
+
+var DDC_GRACE_MS = 10000
+var DDC_PROBE_READS = 3
+var DDC_PROBE_MAX_READS = 5
+var DDC_PAUSE_STREAK = 3
+var DDC_WAKE_AMBIGUOUS = 2
+var DDC_FLAP_WINDOW_MS = 600000
+var DDC_FLAP_LIMIT = 3
+var DDC_INTERVAL_PAUSED = 3000
+var DDC_INTERVAL_ACTIVE = 5000
+var DDC_INTERVAL_SLOW = 15000
+// An SCDC read is one sub-millisecond ioctl, no ddcutil.
+var DDC_INTERVAL_SCDC = 2000
+var DDC_SCDC_PROBE_LOCKS = 2
+
+var MCCS_INPUTS = {
+  "0x01": "VGA-1", "0x02": "VGA-2", "0x03": "DVI-1", "0x04": "DVI-2",
+  "0x05": "Composite-1", "0x06": "Composite-2", "0x07": "S-Video-1", "0x08": "S-Video-2",
+  "0x0f": "DP-1", "0x10": "DP-2", "0x11": "HDMI-1", "0x12": "HDMI-2",
+  "0x19": "USB-C-1", "0x1b": "USB-C"
+}
+
+// "0x01".."0xff" as two lowercase hex digits, else "". 0x00 is what many
+// monitors report while asleep or without a signal, never a real input.
+function ddcCode(code) {
+  var text = clean(code).toLowerCase()
+  if (!/^0x[0-9a-f]{1,2}$/.test(text)) return ""
+  var n = parseInt(text.slice(2), 16)
+  if (!(n >= 1 && n <= 255)) return ""
+  return "0x" + (n < 16 ? "0" : "") + n.toString(16)
+}
+
+function ddcInputLabel(code) {
+  var c = ddcCode(code)
+  if (!c) return ""
+  return MCCS_INPUTS[c] ? (MCCS_INPUTS[c] + " (" + c + ")") : ("Input " + c)
+}
+
+// The learned input for `fp` on `connector`, from ddc.json; "" when unknown or
+// learned on another PC port (a moved cable is relearned, never trusted).
+function ddcSavedInput(ddcMemory, fp, connector) {
+  var mons = ddcMemory && ddcMemory.monitors && typeof ddcMemory.monitors === "object" ? ddcMemory.monitors : {}
+  var entry = mons[fp]
+  if (!entry || clean(entry.connector) !== clean(connector)) return ""
+  return ddcCode(entry.input)
+}
+
+function ddcFresh(connector, now, hotplugged, recentPauses) {
+  return {
+    state: "UNPROBED",
+    connector: clean(connector),
+    readyAt: Number(now) || 0,
+    hotplugged: hotplugged === true,
+    expected: "",
+    code: "",
+    pausedCode: "",
+    probeReads: 0,
+    probeCode: "",
+    probeSawValid: false,
+    probeAmbiguous: 0,
+    // An SCDC sink answered (locked or unlocked) during this probe.
+    probeSawScdc: false,
+    detectedBus: "",
+    // How this monitor is watched once probed: "scdc" (signal lock, paused by
+    // mirror-parking) or "ddc" (VCP 0x60, paused by disabling).
+    mode: "",
+    pauseMode: "",
+    // Watched through SCDC before (resume / Re-probe): probe it through SCDC.
+    scdcCapable: false,
+    scdcLocks: 0,
+    pausedReason: "",
+    otherCode: "",
+    otherStreak: 0,
+    ambiguousStreak: 0,
+    seenL: false,
+    lastPollAt: 0,
+    held: false,
+    recentPauses: Array.isArray(recentPauses) ? recentPauses.slice() : []
+  }
+}
+
+function ddcCopyState(st) {
+  var c = {}
+  for (var k in st) c[k] = st[k]
+  c.recentPauses = Array.isArray(st.recentPauses) ? st.recentPauses.slice() : []
+  return c
+}
+
+function ddcCopyStates(states) {
+  var next = {}
+  for (var fp in states || {}) if (states[fp]) next[fp] = states[fp]
+  return next
+}
+
+function ddcToWatching(s, expected, now) {
+  s.state = "WATCHING"
+  s.expected = expected
+  s.seenL = true
+  s.hotplugged = false
+  s.pausedCode = ""
+  s.otherCode = ""
+  s.otherStreak = 0
+  s.ambiguousStreak = 0
+  s.probeReads = 0
+  s.probeCode = ""
+  s.probeSawValid = false
+  s.probeAmbiguous = 0
+  s.probeSawScdc = false
+  s.scdcLocks = 0
+  s.pausedReason = ""
+  if (now !== undefined) s.readyAt = now
+  return s
+}
+
+function ddcResetProbe(s) {
+  s.probeReads = 0
+  s.probeCode = ""
+  s.probeSawValid = false
+  s.probeAmbiguous = 0
+  s.probeSawScdc = false
+  s.scdcLocks = 0
+}
+
+function ddcSetMode(s, mode) {
+  s.mode = mode
+  s.pauseMode = mode === "scdc" ? "mirror" : "disable"
+  if (mode === "scdc") s.scdcCapable = true
+  return s
+}
+
+// After 3 strong reads of "away": PAUSED, or SUSPENDED once it has paused 3
+// times in 10 minutes. Only when pausing is safe and past the settle grace.
+function ddcTryPause(s, now, canPause, pausedCode, reason) {
+  if (!(s.otherStreak >= DDC_PAUSE_STREAK && canPause === true && s.seenL && now - s.readyAt >= DDC_GRACE_MS)) return s
+  var recent = s.recentPauses.filter(function(t) { return now - Number(t) < DDC_FLAP_WINDOW_MS })
+  s.recentPauses = recent
+  s.otherStreak = 0
+  if (recent.length >= DDC_FLAP_LIMIT) {
+    s.state = "SUSPENDED"
+    s.otherCode = ""
+  } else {
+    s.recentPauses = recent.concat([now])
+    s.state = "PAUSED"
+    s.pausedCode = pausedCode
+    s.pausedReason = reason
+    s.ambiguousStreak = 0
+  }
+  return s
+}
+
+// One reading for one monitor. ctx: { fp, now, savedL, canPause }.
+// Returns { state, learn: null | { fp, connector, code } }.
+function ddcTransition(st, reading, ctx) {
+  var c = ctx || {}
+  var now = Number(c.now) || 0
+  var s = ddcCopyState(st || ddcFresh("", now, false))
+  var status = reading && reading.status ? String(reading.status) : "ambiguous"
+  var scdc = ""
+  if (status === "ok" && reading.signal === "scdc") {
+    scdc = String(reading.scdc || "")
+    if (scdc !== "locked" && scdc !== "unlocked" && scdc !== "absent") {
+      scdc = ""
+      status = "ambiguous"
+    }
+  }
+  var code = status === "ok" && !scdc ? ddcCode(reading.code) : ""
+  if (status === "ok" && !code && !scdc) status = "ambiguous"
+  var away = scdc === "unlocked" || scdc === "absent"
+  var learn = null
+  // A bus found by `ddcutil detect` is kept for this connection and passed
+  // back as a hint, so detect runs once per connection, not once per read.
+  var bus = reading && reading.bus !== undefined && reading.bus !== null ? String(reading.bus) : ""
+  if (/^[0-9]{1,6}$/.test(bus)) s.detectedBus = bus
+  if (status === "busy") return { state: s, learn: null }
+  s.lastPollAt = now
+  if (status === "dpms_off") {
+    // The monitor (or desktop) is DPMS-blanked: no evidence either way. A
+    // half-built pause streak is dropped, and the monitor is marked held at
+    // once so waking before the next poll still starts a fresh settle grace.
+    if (s.state !== "PAUSED") {
+      s.held = true
+      s.otherCode = ""
+      s.otherStreak = 0
+      if (s.state === "PROBING") {
+        s.state = "UNPROBED"
+        ddcResetProbe(s)
+      }
+    }
+    return { state: s, learn: null }
+  }
+  // Without ddcutil, a monitor that answered SCDC (or is known to) is still
+  // watched through SCDC: a stray "needs ddcutil" is only an unreadable answer.
+  if (status === "no_tool" && (s.probeSawScdc || s.scdcCapable === true || s.mode === "scdc")) status = "ambiguous"
+  if (status === "no_tool") {
+    var nt = ddcFresh(s.connector, now, false, s.recentPauses)
+    nt.state = "NO_TOOL"
+    nt.expected = s.expected
+    return { state: nt, learn: null }
+  }
+  if (code) s.code = code
+
+  if (s.state === "UNPROBED") {
+    if (now - s.readyAt < DDC_GRACE_MS) return { state: s, learn: null }
+    s.state = "PROBING"
+    ddcResetProbe(s)
+  }
+
+  if (s.state === "PROBING") {
+    // Tier 1: an SCDC lock proves this PC is on screen; no input to learn.
+    if (scdc === "locked") {
+      s.scdcLocks = (Number(s.scdcLocks) || 0) + 1
+      s.probeSawScdc = true
+      if (s.scdcLocks >= DDC_SCDC_PROBE_LOCKS) ddcToWatching(ddcSetMode(s, "scdc"), s.expected)
+      return { state: s, learn: null }
+    }
+    s.scdcLocks = 0
+    if (away && s.scdcCapable === true) {
+      // A monitor watched through SCDC before (resume, Re-probe) that shows
+      // something else now: wait for its lock, never pause.
+      ddcSetMode(s, "scdc")
+      s.state = "UNVERIFIED"
+      ddcResetProbe(s)
+      return { state: s, learn: null }
+    }
+    if (away) {
+      // An SCDC sink answering without a lock (switched away at startup, with
+      // or without ddcutil): after 3 reads without a lock, keep polling SCDC
+      // in UNVERIFIED until it locks (never pause, never give up as unsupported).
+      s.probeSawScdc = true
+      s.probeSawValid = true
+      s.probeCode = ""
+      s.probeReads += 1
+      if (s.probeReads >= DDC_PROBE_READS) {
+        ddcSetMode(s, "scdc")
+        s.state = "UNVERIFIED"
+        ddcResetProbe(s)
+      }
+      return { state: s, learn: null }
+    }
+    s.probeReads += 1
+    if (code) s.probeSawValid = true
+    else s.probeAmbiguous = (Number(s.probeAmbiguous) || 0) + 1
+    if (code && s.probeCode === code) {
+      var savedL = ddcCode(c.savedL)
+      ddcSetMode(s, "ddc")
+      if (!savedL || s.hotplugged) {
+        learn = { fp: String(c.fp || ""), connector: s.connector, code: code }
+        ddcToWatching(s, code)
+      } else if (code === savedL) {
+        ddcToWatching(s, savedL)
+      } else {
+        // Startup or resume with the monitor showing something else: keep the
+        // learned input and never pause until it is seen again.
+        s.state = "UNVERIFIED"
+        s.expected = savedL
+        ddcResetProbe(s)
+      }
+      return { state: s, learn: learn }
+    }
+    s.probeCode = code
+    // A TV without DDC/CI never answers: 3 reads (15s) give up. A monitor that
+    // answered at least once is only intermittent, so it gets a few more.
+    var giveUp = s.probeSawValid ? s.probeReads >= DDC_PROBE_MAX_READS : s.probeAmbiguous >= DDC_PROBE_READS
+    if (giveUp) {
+      if (s.probeSawScdc) {
+        ddcSetMode(s, "scdc")
+        s.state = "UNVERIFIED"
+      } else {
+        s.state = "UNSUPPORTED"
+      }
+      ddcResetProbe(s)
+    }
+    return { state: s, learn: null }
+  }
+
+  // A monitor watched through DDC/CI that now shows an SCDC lock is on this PC:
+  // from here on it is watched (and paused) through SCDC.
+  if (scdc === "locked" && s.mode !== "scdc" && (s.state === "WATCHING" || s.state === "PAUSED"
+      || s.state === "UNVERIFIED" || s.state === "SNOOZED")) {
+    var keepGrace = s.state === "WATCHING"
+    ddcToWatching(ddcSetMode(s, "scdc"), s.expected, keepGrace ? undefined : now)
+    return { state: s, learn: null }
+  }
+
+  if (s.mode === "scdc") {
+    if (s.state === "WATCHING") {
+      if (scdc === "locked") {
+        s.seenL = true
+        s.otherCode = ""
+        s.otherStreak = 0
+      } else if (away) {
+        s.otherStreak += 1
+        ddcTryPause(s, now, c.canPause, "", scdc)
+      } else {
+        // A failed helper read is never evidence of a switch.
+        s.otherStreak = 0
+      }
+      return { state: s, learn: null }
+    }
+    if (s.state === "PAUSED") {
+      if (scdc === "locked") return { state: ddcToWatching(s, s.expected, now), learn: null }
+      if (away) {
+        // Parked lit, so its link stays up: it stays paused until it relocks.
+        s.ambiguousStreak = 0
+        s.pausedReason = scdc
+        return { state: s, learn: null }
+      }
+      s.ambiguousStreak += 1
+      // Fail open: a helper that stops answering wakes the monitor.
+      if (s.ambiguousStreak >= DDC_WAKE_AMBIGUOUS) return { state: ddcToWatching(s, s.expected, now), learn: null }
+      return { state: s, learn: null }
+    }
+    if (s.state === "UNVERIFIED" || s.state === "SNOOZED") {
+      if (scdc === "locked") return { state: ddcToWatching(s, s.expected, now), learn: null }
+      return { state: s, learn: null }
+    }
+    return { state: s, learn: null }
+  }
+
+  if (s.state === "WATCHING") {
+    if (code && code === s.expected) {
+      s.seenL = true
+      s.otherCode = ""
+      s.otherStreak = 0
+    } else if (code) {
+      if (code === s.otherCode) s.otherStreak += 1
+      else {
+        s.otherCode = code
+        s.otherStreak = 1
+      }
+      ddcTryPause(s, now, c.canPause, code, "input")
+    } else {
+      // An unreadable answer is never evidence of a switch.
+      s.otherCode = ""
+      s.otherStreak = 0
+    }
+    return { state: s, learn: null }
+  }
+
+  if (s.state === "PAUSED") {
+    if (code && code === s.expected) return { state: ddcToWatching(s, s.expected, now), learn: null }
+    if (code) {
+      s.ambiguousStreak = 0
+      s.pausedCode = code
+      return { state: s, learn: null }
+    }
+    s.ambiguousStreak += 1
+    // Fail open: a monitor that stops answering (asleep, no signal, 0x00) is
+    // woken, so no-signal sleep can never keep it dark.
+    if (s.ambiguousStreak >= DDC_WAKE_AMBIGUOUS) return { state: ddcToWatching(s, s.expected, now), learn: null }
+    return { state: s, learn: null }
+  }
+
+  if (s.state === "UNVERIFIED" || s.state === "SNOOZED") {
+    if (code && code === s.expected) return { state: ddcToWatching(s, s.expected, now), learn: null }
+    return { state: s, learn: null }
+  }
+
+  return { state: s, learn: null }
+}
+
+// Applies one reading to the map of states. Returns { states, learn, offChanged }.
+function ddcObserve(states, fp, reading, ctx) {
+  var next = ddcCopyStates(states)
+  var cur = next[fp]
+  if (!cur) return { states: next, learn: null, offChanged: false }
+  var c = {}
+  for (var k in ctx || {}) c[k] = ctx[k]
+  c.fp = fp
+  var res = ddcTransition(cur, reading, c)
+  next[fp] = res.state
+  var offChanged = (cur.state === "PAUSED") !== (res.state.state === "PAUSED")
+  return { states: next, learn: res.learn, offChanged: offChanged }
+}
+
+// Fingerprints paused for an input switch, as autoOffFor's `ddcOff`. Derived
+// from the states alone, so a pause can never outlive its state.
+function ddcOffMap(states) {
+  var out = {}
+  for (var fp in states || {}) if (states[fp] && states[fp].state === "PAUSED") out[fp] = true
+  return out
+}
+
+// How each paused monitor is kept off, for derive/planFromLive: "mirror"
+// (parked as a mirror, SCDC) or "disable" (DDC/CI). Only paused monitors are
+// listed: how a monitor is watched never decides whether a live mirror is the
+// bar's park (that is `appliedParks`, see liveParkOf).
+function ddcPauseModes(states) {
+  var out = {}
+  for (var fp in states || {}) {
+    var st = states[fp]
+    if (!st || st.state !== "PAUSED") continue
+    out[fp] = st.mode === "scdc" ? "mirror" : "disable"
+  }
+  return out
+}
+
+// `appliedParks` ({ connector: [target, ...] }) for an apply of `plan`, recorded
+// before the apply runs (and again once it has): every target it parks an
+// output on is added, never replacing an earlier one, so whether the apply
+// works, half works or fails, both the old and the new park stay the bar's
+// until Hyprland's readback narrows them (pruneAppliedParks). A mirror the
+// user asked for (`mirrorOf` with no park) is the user's from then on.
+function recordAppliedParks(parks, plan) {
+  var next = {}
+  for (var k in parks || {}) {
+    var have = appliedParkTargets(parks, k)
+    if (have.length) next[k] = have
+  }
+  var list = Array.isArray(plan) ? plan : []
+  for (var i = 0; i < list.length; i++) {
+    var o = list[i]
+    var name = o ? clean(o.name) : ""
+    if (!name) continue
+    var park = cleanMirrorOf(o.parkMirrorOf)
+    var targets = next[name] ? next[name].slice() : []
+    if (park) {
+      if (targets.indexOf(park) === -1) targets.push(park)
+    } else {
+      var mirror = cleanMirrorOf(o.mirrorOf)
+      if (mirror) targets = targets.filter(function(t) { return t !== mirror })
+    }
+    if (targets.length) next[name] = targets
+    else delete next[name]
+  }
+  return next
+}
+
+// Narrows `parks` to what Hyprland (`monitors`) shows: an output gone, off,
+// or not mirroring is dropped; one mirroring a target the bar applied keeps
+// exactly that target; one mirroring anything else is the user's and is
+// dropped. Returns { parks, changed }.
+function pruneAppliedParks(parks, monitors) {
+  var list = Array.isArray(monitors) ? monitors : []
+  var byName = {}
+  for (var i = 0; i < list.length; i++) if (list[i] && list[i].name) byName[clean(list[i].name)] = list[i]
+  var next = {}
+  var changed = false
+  for (var name in parks || {}) {
+    var have = appliedParkTargets(parks, name)
+    var lm = byName[name]
+    var cur = lm && lm.disabled !== true ? cleanMirrorOf(lm.mirrorOf, list) : ""
+    if (cur && have.indexOf(cur) !== -1) {
+      next[name] = [cur]
+      if (!Array.isArray(parks[name]) || parks[name].length !== 1 || parks[name][0] !== cur) changed = true
+    } else {
+      changed = true
+    }
+  }
+  return { parks: next, changed: changed }
+}
+
+// True while every enabled monitor is DPMS-off: the desktop idled (or was
+// blanked on purpose), which is never a reason to pause or wake anything.
+function ddcGlobalIdle(monitors) {
+  var enabled = (Array.isArray(monitors) ? monitors : []).filter(function(m) { return m && m.disabled !== true })
+  return enabled.length > 0 && enabled.every(function(m) { return m.dpmsStatus === false })
+}
+
+// Hyprland's monitors with `dpms` ({ name: on }, the newest power state a
+// `ddc-read` saw) laid over their dpmsStatus.
+function ddcLiveDpms(monitors, dpms) {
+  var map = dpms && typeof dpms === "object" ? dpms : {}
+  return (Array.isArray(monitors) ? monitors : []).map(function(m) {
+    if (!m || !Object.prototype.hasOwnProperty.call(map, m.name)) return m
+    var c = {}
+    for (var k in m) c[k] = m[k]
+    c.dpmsStatus = map[m.name] !== false
+    return c
+  })
+}
+
+// Whether `fp` may be paused now: never the internal panel, a monitor the user
+// turned off, or a mirror source/target, and never the last lit display (the
+// internal panel does not count while the lid is shut). `plan` is the layout
+// as it would be with no monitor paused. With `liveMonitors` (Hyprland's
+// monitors), a mirror the user set up live (any live mirror `appliedParks`
+// does not list, see liveParkOf) on or onto it rules a pause out too, and
+// another display only counts when it is actually lit right now: enabled, not
+// DPMS-asleep and not a live mirror.
+function ddcCanPause(plan, fp, lidClosed, ddcOff, liveMonitors, appliedParks) {
+  var list = Array.isArray(plan) ? plan : []
+  var live = null
+  if (Array.isArray(liveMonitors)) {
+    live = {}
+    for (var m = 0; m < liveMonitors.length; m++)
+      if (liveMonitors[m] && liveMonitors[m].name) live[liveMonitors[m].name] = liveMonitors[m]
+  }
+  // While the whole desktop idles every display is DPMS-off on purpose: that
+  // never counts against keeping a monitor paused.
+  if (live && ddcGlobalIdle(liveMonitors)) live = null
+  var target = null
+  for (var i = 0; i < list.length; i++) if (list[i] && list[i].fp === fp) target = list[i]
+  if (!target || target.internal || target.enabled === false || target.autoOff) return false
+  if (cleanMirrorOf(target.mirrorOf)) return false
+  var liveList = Array.isArray(liveMonitors) ? liveMonitors : []
+  for (var u = 0; u < liveList.length; u++) {
+    var um = liveList[u]
+    if (!um || !um.name || um.disabled === true) continue
+    var umMirror = cleanMirrorOf(um.mirrorOf, liveList)
+    if (!umMirror || liveParkOf(um.name, umMirror, appliedParks)) continue
+    if (clean(um.name) === target.name || umMirror === target.name) return false
+  }
+  var lit = 0
+  for (var j = 0; j < list.length; j++) {
+    var o = list[j]
+    if (!o || o === target) continue
+    if (o.enabled !== false && cleanMirrorOf(o.mirrorOf) === target.name) return false
+    if (o.enabled === false || o.autoOff || cleanMirrorOf(o.mirrorOf)) continue
+    if (o.internal && lidClosed) continue
+    if (ddcOff && ddcOff[o.fp]) continue
+    if (live) {
+      var lm = live[o.name]
+      if (!lm || lm.disabled === true || lm.dpmsStatus === false) continue
+      if (cleanMirrorOf(lm.mirrorOf, liveMonitors)) continue
+    }
+    lit++
+  }
+  return lit > 0
+}
+
+// Wakes a paused monitor. By hand (`manual`), it is snoozed: it stays on until
+// this PC's input is seen again, and the learned input is kept. Otherwise
+// (lid, no longer safe to pause) it goes back to watching after a grace.
+function ddcWake(states, fp, now, manual) {
+  var next = ddcCopyStates(states)
+  var cur = next[fp]
+  if (!cur || cur.state !== "PAUSED") return next
+  var s = ddcToWatching(ddcCopyState(cur), cur.expected, Number(now) || 0)
+  if (manual === true) s.state = "SNOOZED"
+  next[fp] = s
+  return next
+}
+
+// After suspend/resume every monitor starts over (paused ones wake) without
+// trusting anything it reports in the first seconds; the learned input is
+// kept, so a monitor that came back on another input is UNVERIFIED, not relearned.
+function ddcResume(states, now) {
+  var next = {}
+  for (var fp in states || {}) {
+    var cur = states[fp]
+    if (!cur) continue
+    if (cur.state === "UNSUPPORTED" || cur.state === "SUSPENDED" || cur.state === "NO_TOOL") {
+      next[fp] = cur
+      continue
+    }
+    var fresh = ddcFresh(cur.connector, now, false, cur.recentPauses)
+    fresh.scdcCapable = cur.mode === "scdc" || cur.scdcCapable === true
+    next[fp] = fresh
+  }
+  return next
+}
+
+// Re-probe (by hand): monitors that stopped (unsupported, suspended, no
+// ddcutil) start over and may learn the input they show now. Snoozed and
+// waiting monitors keep their learned input and are simply read again at the
+// next tick, so a Re-probe while on another input never relearns that input.
+function ddcReprobe(states, now) {
+  var next = {}
+  for (var fp in states || {}) {
+    var cur = states[fp]
+    if (!cur) continue
+    if (cur.state === "SNOOZED" || cur.state === "UNVERIFIED") {
+      var s = ddcCopyState(cur)
+      s.lastPollAt = 0
+      next[fp] = s
+      continue
+    }
+    if (cur.state === "UNSUPPORTED" || cur.state === "SUSPENDED" || cur.state === "NO_TOOL") {
+      var fresh = ddcFresh(cur.connector, now, true, cur.state === "SUSPENDED" ? [] : cur.recentPauses)
+      fresh.scdcCapable = cur.mode === "scdc" || cur.scdcCapable === true
+      next[fp] = fresh
+      continue
+    }
+    next[fp] = cur
+  }
+  return next
+}
+
+// Keeps one state per connected external monitor. Unplugged monitors are
+// dropped, a monitor on another PC connector starts over and relearns, and so
+// does one freshly plugged in (`hotpluggedConnectors`: { name: true }), so a
+// cable moved to another port on the monitor relearns too.
+function ddcPrune(states, identifiedOutputs, hotpluggedConnectors, now) {
+  var next = {}
+  var hp = hotpluggedConnectors || {}
+  var list = Array.isArray(identifiedOutputs) ? identifiedOutputs : []
+  for (var i = 0; i < list.length; i++) {
+    var o = list[i]
+    if (!o || !o.fp || o.internal) continue
+    var cur = states ? states[o.fp] : null
+    var plugged = hp[o.name] === true
+    if (!cur) next[o.fp] = ddcFresh(o.name, now, plugged)
+    else if (cur.connector !== clean(o.name)) next[o.fp] = ddcFresh(o.name, now, true, cur.recentPauses)
+    else if (plugged) next[o.fp] = ddcFresh(o.name, now, true, cur.recentPauses)
+    else next[o.fp] = cur
+  }
+  return next
+}
+
+// Monitors that cannot be read right now (off, DPMS-asleep, user-disabled,
+// mirrored) hold still: half-built evidence is dropped, and the settle grace
+// starts over once they can be read again, so waking from DPMS can never count
+// toward a pause. `pollable` is { fp: bool }; paused monitors are always
+// pollable. Returns { states, changed }.
+function ddcHold(states, pollable, now) {
+  var next = ddcCopyStates(states)
+  var changed = false
+  for (var fp in next) {
+    var cur = next[fp]
+    if (!cur || cur.state === "PAUSED") continue
+    if (cur.state === "UNSUPPORTED" || cur.state === "SUSPENDED" || cur.state === "NO_TOOL") continue
+    var canRead = !!(pollable && pollable[fp])
+    if (canRead === !cur.held) continue
+    var s = ddcCopyState(cur)
+    if (canRead) {
+      s.held = false
+      s.readyAt = now
+    } else {
+      s.held = true
+      s.otherCode = ""
+      s.otherStreak = 0
+      if (s.state === "PROBING") {
+        s.state = "UNPROBED"
+        ddcResetProbe(s)
+      }
+    }
+    next[fp] = s
+    changed = true
+  }
+  return { states: next, changed: changed }
+}
+
+function ddcStateInterval(st) {
+  if (!st) return 0
+  if (st.mode === "scdc") {
+    if (st.state === "PAUSED" || st.state === "WATCHING") return DDC_INTERVAL_SCDC
+    if (st.state === "UNVERIFIED" || st.state === "SNOOZED") return DDC_INTERVAL_ACTIVE
+  }
+  if (st.state === "PROBING" && st.probeSawScdc === true) return DDC_INTERVAL_SCDC
+  if (st.state === "PAUSED") return DDC_INTERVAL_PAUSED
+  if (st.state === "PROBING" || st.state === "WATCHING" || st.state === "UNPROBED") return DDC_INTERVAL_ACTIVE
+  if (st.state === "UNVERIFIED" || st.state === "SNOOZED") return DDC_INTERVAL_SLOW
+  return 0
+}
+
+// True while a power-state-only `ddc-read` (no connector, no I2C) is needed to
+// notice a DPMS wake: the whole desktop idles (`liveGlobalIdle`), or a watched
+// monitor that is not paused is DPMS-off on its own (`liveDpms`: { name: on }),
+// held until it wakes. Hyprland sends no event for DPMS, so it is polled.
+function ddcNeedsDpmsProbe(states, liveDpms, liveGlobalIdle) {
+  if (liveGlobalIdle === true) return true
+  var dpms = liveDpms && typeof liveDpms === "object" ? liveDpms : {}
+  var watched = ["WATCHING", "PROBING", "UNPROBED", "UNVERIFIED", "SNOOZED"]
+  for (var fp in states || {}) {
+    var st = states[fp]
+    if (!st || watched.indexOf(st.state) === -1 || !st.connector) continue
+    if (dpms[st.connector] === false) return true
+  }
+  return false
+}
+
+// How often the service should tick: the fastest any monitor needs, 0 for none.
+// While a DPMS wake is being waited for (ddcNeedsDpmsProbe) it is never slower
+// than DDC_INTERVAL_ACTIVE.
+function ddcPollInterval(states, now, liveDpms, liveGlobalIdle) {
+  var best = 0
+  for (var fp in states || {}) {
+    var iv = ddcStateInterval(states[fp])
+    if (iv && (!best || iv < best)) best = iv
+  }
+  if (ddcNeedsDpmsProbe(states, liveDpms, liveGlobalIdle) && (!best || best > DDC_INTERVAL_ACTIVE))
+    best = DDC_INTERVAL_ACTIVE
+  return best
+}
+
+// Fingerprints to read now: pollable, due at their own pace, and past the
+// settle grace when still unprobed.
+function ddcDue(states, pollable, now) {
+  var out = []
+  for (var fp in states || {}) {
+    var st = states[fp]
+    var iv = ddcStateInterval(st)
+    if (!iv) continue
+    if (st.state !== "PAUSED" && !(pollable && pollable[fp])) continue
+    if (st.state === "UNPROBED" && now - st.readyAt < DDC_GRACE_MS) continue
+    if (st.lastPollAt && now - st.lastPollAt < iv - 250) continue
+    out.push(fp)
+  }
+  return out
+}
+
+// `ddc-read` arguments for `targets` ([{ fp, name, mode? }]): each connector,
+// with the bus an earlier detect found (`NAME:BUS`), `@scdc` for a monitor
+// watched through SCDC (read through SCDC only, never ddcutil), and `--detect
+// NAME` only for DDC connectors still probing with no bus known, so a watched
+// or paused monitor never makes the helper run `ddcutil detect`.
+function ddcReadArgs(targets, states) {
+  var detect = []
+  var specs = []
+  var list = Array.isArray(targets) ? targets : []
+  for (var i = 0; i < list.length; i++) {
+    var t = list[i]
+    var st = t && states ? states[t.fp] : null
+    if (!st || !t.name) continue
+    var bus = /^[0-9]{1,6}$/.test(String(st.detectedBus || "")) ? String(st.detectedBus) : ""
+    var mode = clean(t.mode) || clean(st.mode)
+    var scdc = mode === "scdc" || st.scdcCapable === true
+    specs.push((bus ? t.name + ":" + bus : t.name) + (scdc ? "@scdc" : ""))
+    if (!bus && !scdc && (st.state === "UNPROBED" || st.state === "PROBING")) detect.push("--detect", t.name)
+  }
+  return detect.concat(specs)
+}
+
+// Readings for a `ddc-read` that failed outright (crash, bad output): every
+// target reads as ambiguous, so a paused monitor still fails open and a
+// half-built pause streak is broken.
+function ddcFailedReadings(targets) {
+  var out = {}
+  var list = Array.isArray(targets) ? targets : []
+  for (var i = 0; i < list.length; i++) if (list[i] && list[i].name) out[list[i].name] = { status: "ambiguous" }
+  return out
+}
+
+// True when an external monitor connected, disconnected, moved PC port, or
+// was replugged (`plugged`: { connector: true }) between two state maps, so a
+// DDC read started before the change can be thrown away.
+function ddcConnectionsChanged(before, after, plugged) {
+  var a = before || {}
+  var b = after || {}
+  var hp = plugged || {}
+  for (var fp in b) {
+    var p = a[fp]
+    var n = b[fp]
+    if (!n) continue
+    if (!p || p.connector !== n.connector) return true
+    if (hp[n.connector] === true && p !== n) return true
+  }
+  for (var k in a) if (a[k] && !b[k]) return true
+  return false
+}
+
+// True when applying `plan` would turn on a monitor that is dark now, or bring
+// back one that is lit but parked as a mirror (an SCDC wake).
+function planWakes(plan, livePlan) {
+  var list = Array.isArray(plan) ? plan : []
+  var liveList = Array.isArray(livePlan) ? livePlan : []
+  for (var i = 0; i < list.length; i++) {
+    var o = list[i]
+    if (!o || o.enabled === false || o.autoOff) continue
+    var live = null
+    for (var j = 0; j < liveList.length; j++) if (liveList[j] && liveList[j].name === o.name) live = liveList[j]
+    if (!live || live.enabled === false || live.autoOff) return true
+    var liveMirror = cleanMirrorOf(live.parkMirrorOf) || cleanMirrorOf(live.mirrorOf)
+    if (liveMirror && !cleanMirrorOf(o.parkMirrorOf) && !cleanMirrorOf(o.mirrorOf)) return true
+  }
+  return false
+}
+
+// What monitors.lua gets for `plan`: each output paused for an input switch
+// is put back as it is in `unpaused` (the layout with nothing paused), and
+// every other output keeps exactly what `plan` says, edits included. A put-back
+// output that would overlap the others goes to their right.
+function persistablePlan(plan, unpaused) {
+  var list = Array.isArray(plan) ? plan : []
+  var byFp = {}
+  var base = Array.isArray(unpaused) ? unpaused : []
+  for (var u = 0; u < base.length; u++) if (base[u] && base[u].fp) byFp[base[u].fp] = base[u]
+  // Paused for an input switch, or still parked live after a wake: either way
+  // it goes back to its unpaused place.
+  var paused = function(o) {
+    return !!o && ((o.autoOff === true && o.offReason === "input") || (!o.autoOff && !!cleanMirrorOf(o.parkMirrorOf)))
+  }
+  // A mirror-park is live only: monitors.lua never gets one.
+  var unparked = function(o) {
+    if (!o || !o.parkMirrorOf) return o
+    var c = {}
+    for (var k in o) c[k] = o[k]
+    if (o.mode) c.mode = { w: o.mode.w, h: o.mode.h, hz: o.mode.hz }
+    c.parkMirrorOf = ""
+    c.pauseMode = ""
+    return c
+  }
+  if (!list.some(paused)) return list.some(function(o) { return !!o && !!o.parkMirrorOf }) ? list.map(unparked) : list
+  var out = list.map(function(o) {
+    var src = paused(o) ? byFp[o.fp] : null
+    // No unpaused entry: monitors.lua writes an auto-off output as on anyway.
+    if (!src || paused(src)) return unparked(o)
+    var c = {}
+    for (var k in src) c[k] = src[k]
+    if (src.mode) c.mode = { w: src.mode.w, h: src.mode.h, hz: src.mode.hz }
+    c.parkMirrorOf = ""
+    c.pauseMode = ""
+    return c
+  })
+  var lit = function(o) { return o && o.enabled !== false && !o.autoOff && !cleanMirrorOf(o.mirrorOf) && o.mode }
+  // Every output that stays as `plan` says is fixed; each put-back output is
+  // added once placed, so two put back never land on the same spot.
+  var occupied = []
+  for (var j = 0; j < out.length; j++) if (lit(out[j]) && !paused(list[j])) occupied.push(rectOf(out[j]))
+  for (var i = 0; i < out.length; i++) {
+    if (!paused(list[i]) || paused(out[i]) || !lit(out[i])) continue
+    if (overlapsAny(rectOf(out[i]), occupied)) {
+      var right = 0
+      var top = Infinity
+      for (var r = 0; r < occupied.length; r++) {
+        right = Math.max(right, occupied[r].x + occupied[r].w)
+        top = Math.min(top, occupied[r].y)
+      }
+      out[i].x = right
+      out[i].y = top === Infinity ? 0 : top
+    }
+    occupied.push(rectOf(out[i]))
+  }
+  return out
+}
+
+// An edited draft keeps the user's edits, but runtime pauses and wakes come
+// from `live`, so Wake now and the Paused banner never go stale and Apply never
+// submits an outdated pause. A woken monitor takes its live on/off & position.
+function syncDraftAutoOff(draft, live) {
+  var list = Array.isArray(draft) ? draft : []
+  var byFp = {}
+  var liveList = Array.isArray(live) ? live : []
+  for (var i = 0; i < liveList.length; i++) if (liveList[i] && liveList[i].fp) byFp[liveList[i].fp] = liveList[i]
+  var changed = false
+  var wokeIndices = []
+  var wokeLivePos = {}
+  var next = list.map(function(o, idx) {
+    var l = o ? byFp[o.fp] : null
+    if (!l) return o
+    var wasOff = o.autoOff === true
+    var nowOff = l.autoOff === true
+    var livePark = nowOff ? String(l.parkMirrorOf || "") : ""
+    var livePause = nowOff ? String(l.pauseMode || "") : ""
+    if (wasOff === nowOff && String(o.offReason || "") === String(l.offReason || "")
+        && String(o.parkMirrorOf || "") === livePark && String(o.pauseMode || "") === livePause) return o
+    // A wake was requested, but Hyprland readback has not yet confirmed the
+    // monitor is enabled and unparked: wait for the post-apply refresh so we
+    // never copy stale disabled/parked state into an edited draft.
+    if (wasOff && !nowOff && (l.enabled === false || !!cleanMirrorOf(l.parkMirrorOf))) return o
+    changed = true
+    var c = {}
+    for (var k in o) c[k] = o[k]
+    if (o.mode) c.mode = { w: o.mode.w, h: o.mode.h, hz: o.mode.hz }
+    c.autoOff = nowOff
+    c.offReason = nowOff ? String(l.offReason || "") : ""
+    c.parkMirrorOf = livePark
+    c.pauseMode = livePause
+    if (wasOff && !nowOff) {
+      c.enabled = l.enabled !== false
+      var hasMode = o.mode && Number(o.mode.w) > 0 && Number(o.mode.h) > 0 && Number(o.mode.hz) > 0
+      if (!hasMode && l.mode) c.mode = { w: l.mode.w, h: l.mode.h, hz: l.mode.hz }
+      wokeIndices.push(idx)
+      wokeLivePos[idx] = { x: l.x, y: l.y }
+    }
+    return c
+  })
+  if (wokeIndices.length) {
+    var wokeSet = {}
+    for (var w = 0; w < wokeIndices.length; w++) wokeSet[wokeIndices[w]] = true
+    var activeIndices = []
+    for (var p = 0; p < next.length; p++) {
+      var o = next[p]
+      if (!o || o.enabled === false || o.autoOff || cleanMirrorOf(o.mirrorOf)) continue
+      activeIndices.push(p)
+    }
+    // Keep waking outputs at their draft positions if that already forms a
+    // valid connected, non-overlapping layout (e.g. an edited A-C-B row);
+    // otherwise attach them from their live positions against the fixed others.
+    if (!layoutValid(next, activeIndices)) {
+      var placed = []
+      for (var q = 0; q < activeIndices.length; q++) {
+        if (!wokeSet[activeIndices[q]]) placed.push(rectOf(next[activeIndices[q]]))
+      }
+      for (var u = 0; u < wokeIndices.length; u++) {
+        var wi = wokeIndices[u]
+        var wo = next[wi]
+        if (!wo || wo.enabled === false || wo.autoOff || cleanMirrorOf(wo.mirrorOf)) continue
+        wo.x = wokeLivePos[wi].x
+        wo.y = wokeLivePos[wi].y
+        if (placed.length) {
+          var r = attach(rectOf(wo), placed, 0)
+          wo.x = r.x
+          wo.y = r.y
+          placed.push(r)
+        } else {
+          placed.push(rectOf(wo))
+        }
+      }
+    }
+    if (activeIndices.length) {
+      var minX = Infinity
+      var minY = Infinity
+      for (var m = 0; m < activeIndices.length; m++) {
+        minX = Math.min(minX, next[activeIndices[m]].x)
+        minY = Math.min(minY, next[activeIndices[m]].y)
+      }
+      if (minX !== 0 || minY !== 0) {
+        for (var s = 0; s < activeIndices.length; s++) {
+          var ai = activeIndices[s]
+          if (!wokeSet[ai]) {
+            var copy = {}
+            for (var key in next[ai]) copy[key] = next[ai][key]
+            if (next[ai].mode) copy.mode = { w: next[ai].mode.w, h: next[ai].mode.h, hz: next[ai].mode.hz }
+            next[ai] = copy
+          }
+          next[ai].x -= minX
+          next[ai].y -= minY
+        }
+      }
+    }
+  }
+  return { draft: next, changed: changed }
+}
+
+// What the Displays panel shows for one monitor's auto-pause.
+function ddcStatusText(status, ready) {
+  if (!ready) return "Apply a layout once to enable"
+  var st = status && status.state ? status.state : "UNPROBED"
+  if (status && status.mode === "scdc") {
+    if (st === "WATCHING") return "Active · HDMI signal lock"
+    if (st === "PAUSED") return "Paused · switched away or powered off"
+    if (st === "SNOOZED") return "Snoozed until HDMI lock returns"
+    if (st === "UNVERIFIED") return "Waiting for HDMI signal lock"
+  }
+  if (st === "WATCHING") return "Watching · " + (ddcInputLabel(status.code) || "this PC's input")
+  if (st === "PAUSED") return "Paused · switched to " + (ddcInputLabel(status.pausedCode) || "another input")
+  if (st === "UNVERIFIED") return "Waiting for this PC's input"
+  if (st === "SNOOZED") return "Snoozed until input returns"
+  if (st === "UNSUPPORTED") return "Not supported by this display"
+  if (st === "SUSPENDED") return "Suspended (unstable readings)"
+  if (st === "NO_TOOL") return "Needs ddcutil"
+  return "Checking input…"
+}
+
+// The connector a Hyprland monitoradded / monitoraddedv2 event names
+// ("HDMI-A-1" or "id,HDMI-A-1,description").
+function monitorAddedName(eventName, data) {
+  var text = String(data === undefined || data === null ? "" : data)
+  if (eventName === "monitoraddedv2") {
+    var parts = text.split(",")
+    return parts.length > 1 ? clean(parts[1]) : ""
+  }
+  return clean(text.split(",")[0])
+}
+
+function normalizeDdcMemory(ddcMemory) {
+  var m = ddcMemory && typeof ddcMemory === "object" ? ddcMemory : {}
+  var mons = m.monitors && typeof m.monitors === "object" ? m.monitors : {}
+  var out = {}
+  for (var fp in mons) {
+    var e = mons[fp]
+    var code = ddcCode(e && e.input)
+    if (code && e.connector) out[fp] = { input: code, connector: clean(e.connector), learnedAt: clean(e.learnedAt) }
+  }
+  return { version: 1, monitors: out }
 }
 
 if (typeof module !== "undefined") module.exports = {}
