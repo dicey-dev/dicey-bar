@@ -2407,11 +2407,22 @@ function ddcStatusText(status, ready) {
   return "Checking input…"
 }
 
-// The connector a Hyprland monitoradded / monitoraddedv2 event names
+// A brief HPD pulse (input switch, mode change, EDID refresh) drops and
+// restores the same connector within a few seconds; only longer absences count
+// as a physical same-port cable swap that may overwrite a saved DDC input.
+var DDC_HPD_BOUNCE_MS = 8000
+
+function ddcIsHotplug(removedAt, now) {
+  var r = Number(removedAt) || 0
+  if (r <= 0) return true
+  return (Number(now) || 0) - r >= DDC_HPD_BOUNCE_MS
+}
+
+// The connector a Hyprland monitoradded/monitorremoved (or v2) event names
 // ("HDMI-A-1" or "id,HDMI-A-1,description").
 function monitorAddedName(eventName, data) {
   var text = String(data === undefined || data === null ? "" : data)
-  if (eventName === "monitoraddedv2") {
+  if (eventName === "monitoraddedv2" || eventName === "monitorremovedv2") {
     var parts = text.split(",")
     return parts.length > 1 ? clean(parts[1]) : ""
   }

@@ -1232,7 +1232,14 @@ TestCase {
     function test_monitor_added_event_names() {
         compare(Model.monitorAddedName("monitoradded", "HDMI-A-1"), "HDMI-A-1")
         compare(Model.monitorAddedName("monitoraddedv2", "3,DP-2,Dell Inc. U2723QE"), "DP-2")
+        compare(Model.monitorAddedName("monitorremoved", "HDMI-A-1"), "HDMI-A-1")
+        compare(Model.monitorAddedName("monitorremovedv2", "1,HDMI-A-1,BNQ BenQ GW2790Q ET97T00426087"), "HDMI-A-1")
         compare(Model.monitorAddedName("monitoraddedv2", ""), "")
+        // Brief HPD bounce (<8s) does not count as a physical cable swap; longer unplug or new plug does.
+        verify(Model.ddcIsHotplug(0, 50000))
+        verify(!Model.ddcIsHotplug(50000, 51500))
+        verify(!Model.ddcIsHotplug(50000, 57999))
+        verify(Model.ddcIsHotplug(50000, 58000))
     }
 
     function test_input_pause_never_changes_the_persisted_unpaused_layout() {
