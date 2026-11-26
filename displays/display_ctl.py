@@ -24,9 +24,9 @@ The panel and its hotplug service decide what each monitor should do
   nightlight on KELVIN|off  JSON: control hyprsunset temperature & notify bar
 
 The bar decides when a monitor is paused for an input switch (DisplayModel.js);
-this helper only ever reads VCP 0x60 (DDC/CI) or the read-only HDMI SCDC
-Sink_Version / Config_1 / Status_Flags_0 registers (I2C 0x54), and never writes to a
-monitor over I2C.
+this helper only ever reads VCP 0x60 (DDC/CI), the read-only HDMI SCDC
+Sink_Version / Config_1 / Status_Flags_0 registers (I2C 0x54), or the read-only
+HDMI HDCP RX Bksv register (I2C 0x3A), and never writes to a monitor over I2C.
 
 Every value written into Lua is validated or emitted as an escaped string
 literal, because monitors.lua is code Hyprland runs.
@@ -93,6 +93,7 @@ HDCP_ADDR = 0x3A
 HDCP_BKSV_REG = 0x00
 HDCP_BKSV_LEN = 5
 INTERNAL_RE = re.compile(r"^(eDP|LVDS|DSI)-")
+HDMI_RE = re.compile(r"^HDMI-")
 # How an input-paused monitor is kept off: "mirror" (parked lit as a mirror,
 # HDMI SCDC) or "disable" (DDC/CI); "" for an older caller (disable).
 PAUSE_MODES = ("", "mirror", "disable")
@@ -854,13 +855,15 @@ def pick_rescue_monitor(live: list, lid_is_closed: bool) -> dict:
     return ordered[0] if ordered else live[0]
 
 
-def _unmirror_pre_disable_lua(outputs: list, live: list) -> str:
+def _unmirror_pre_disable_lua(outputs: list, live: list, lid_is_closed: bool = False) -> str:
     """Hyprland drops an output's wl_output global when it starts mirroring and
     does not recreate it on a direct `mirror = ""` transition, leaving the
     unmirrored monitor without wallpaper/bar/grim until disabled and re-enabled.
     Return `disabled = true` rules for any currently-mirrored output that is
-    about to become enabled and unmirrored, provided another lit non-mirrored
-    output stays on during the brief cycle."""
+    about to become enabled and unmirrored, provided another genuinely lit
+    (enabled, DPMS-on, non-mirrored, not behind a closed lid) output stays on
+    during the brief cycle. Note: cycling `disabled = true` momentarily drops
+    the link so the woken output performs a full resync."""
     if not live:
         return ""
     mirrored_live = {
@@ -878,7 +881,11 @@ def _unmirror_pre_disable_lua(outputs: list, live: list) -> str:
         return ""
     unmirror_set = set(unmirroring)
     other_lit = any(
-        str(m.get("name") or "") not in unmirror_set and not m.get("disabled") and not _live_mirror_of(m)
+        str(m.get("name") or "") not in unmirror_set
+        and not m.get("disabled")
+        and m.get("dpmsStatus", True) is not False
+        and not _live_mirror_of(m)
+        and not (lid_is_closed and INTERNAL_RE.match(str(m.get("name") or "")))
         for m in live
     )
     if not other_lit:
@@ -894,16 +901,26 @@ def apply(outputs: list) -> dict:
             pre_live = connected_monitors()
         except (OSError, ValueError, subprocess.SubprocessError):
             pre_live = []
-        pre_lua = _unmirror_pre_disable_lua(outputs, pre_live)
+        pre_lua = _unmirror_pre_disable_lua(outputs, pre_live, lid_closed())
         if pre_lua:
-            subprocess.run(["hyprctl", "eval", pre_lua], capture_output=True, text=True,
-                           timeout=HYPRCTL_TIMEOUT)
-            time.sleep(0.15)
-        result = subprocess.run(["hyprctl", "eval", lua], capture_output=True, text=True,
-                                timeout=HYPRCTL_TIMEOUT)
-        reply = (result.stdout + result.stderr).strip()
-        if result.returncode != 0 or (reply and reply != "ok"):
-            errors.append(reply or f"hyprctl eval exited {result.returncode}")
+            try:
+                pre_result = subprocess.run(["hyprctl", "eval", pre_lua], capture_output=True, text=True,
+                                            timeout=HYPRCTL_TIMEOUT)
+                pre_reply = (pre_result.stdout + pre_result.stderr).strip()
+                if pre_result.returncode != 0 or (pre_reply and pre_reply != "ok"):
+                    errors.append(pre_reply or f"hyprctl eval pre-disable exited {pre_result.returncode}")
+                else:
+                    time.sleep(0.15)
+            except (OSError, subprocess.SubprocessError) as exc:
+                errors.append(f"hyprctl eval pre-disable failed: {exc}")
+        try:
+            result = subprocess.run(["hyprctl", "eval", lua], capture_output=True, text=True,
+                                    timeout=HYPRCTL_TIMEOUT)
+            reply = (result.stdout + result.stderr).strip()
+            if result.returncode != 0 or (reply and reply != "ok"):
+                errors.append(reply or f"hyprctl eval exited {result.returncode}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            errors.append(f"hyprctl eval failed: {exc}")
     errors.extend(_verify_some_display_enabled(outputs))
     return {"ok": not errors, "errors": errors, "fallbacks": fallbacks(outputs)}
 
@@ -1188,6 +1205,8 @@ def _smbus_read_i2c_block(fd, register: int, length: int) -> bytes:
 
 
 # An I2C NACK: nothing answers at the target slave address (absent or powered down).
+# Generic I/O errors (e.g. EIO on drivers that do not distinguish NACK from bus
+# failure) stay `ambiguous` so detection always fails open.
 SCDC_ABSENT_ERRNOS = (errno.EREMOTEIO, errno.ENXIO)
 
 
@@ -1332,13 +1351,22 @@ def _dpms_view(live):
 
 
 def ddc_read(specs: list, *, detect=()) -> dict:
-    """Read-only readings, one per connector. `NAME@scdc` (a monitor already
-    watched through HDMI SCDC) only reads SCDC, never ddcutil; a NACK there is
-    `absent` (a TV that powers its SCDC down in standby). Otherwise a
-    sysfs-linked connector is checked for an SCDC lock first (no ddcutil when
-    locked), then falls through to VCP 0x60 (keeping an SCDC `unlocked` reading
-    if VCP 0x60 cannot answer); without ddcutil an SCDC sink still answers
-    `locked`/`unlocked`, and only a connector with no SCDC sink is `no_tool`.
+    """Read-only readings, one per connector.
+    - `NAME@scdc` (watched through HDMI SCDC) only reads SCDC (0x54), never
+      ddcutil; a NACK there is `absent` (a TV that powers its SCDC down).
+    - `NAME@ddc+hdcp` (HDMI DDC/CI monitor whose HDCP RX 0x3A answered while
+      lit) skips SCDC (0x54), checks read-only HDCP Bksv (0x3A) first using the
+      sysfs bus or bus hint (returning `power: off` in <1 ms on NACK), and
+      reads VCP 0x60 when HDCP answers or is ambiguous.
+    - `NAME@ddc` (settled DisplayPort or non-HDCP DDC/CI monitor) skips both
+      SCDC (0x54) and HDCP (0x3A) and reads only VCP 0x60.
+    - Unsuffixed `NAME` (initial discovery) checks SCDC first on a sysfs-linked
+      connector (no ddcutil when locked), then falls through to VCP 0x60
+      (keeping an SCDC `unlocked` reading if VCP 0x60 cannot answer); on a
+      successful HDMI VCP read it also checks HDCP 0x3A once on the resolved
+      bus and tags `hdcp: true` when present. Without ddcutil an SCDC sink
+      still answers `locked`/`unlocked`, and only a connector with no SCDC sink
+      is `no_tool`.
     Each connector's bus comes from sysfs, else from the `NAME:BUS` hint an
     earlier detect gave, else, only for connectors named in `detect` (still
     probing), from one locked `ddcutil detect`. A bus that did not come from
@@ -1389,7 +1417,7 @@ def ddc_read(specs: list, *, detect=()) -> dict:
             continue
         if mode == "ddc+hdcp":
             bus = sysfs[name] if sysfs[name] is not None else hint
-            if bus is not None:
+            if HDMI_RE.match(name) and bus is not None:
                 hdcp = read_hdcp_present(bus)
                 if hdcp["status"] == "busy":
                     readings[name] = {"status": "busy"}
@@ -1400,10 +1428,7 @@ def ddc_read(specs: list, *, detect=()) -> dict:
                 if hdcp["status"] == "ok":
                     hdcp_seen.add(name)
         elif mode == "ddc":
-            if sysfs[name] is not None:
-                hdcp = read_hdcp_present(sysfs[name])
-                if hdcp["status"] == "ok":
-                    hdcp_seen.add(name)
+            pass
         elif sysfs[name] is not None:
             reading = read_scdc_status(sysfs[name])
             if reading["status"] == "busy" or reading.get("scdc") == "locked":
@@ -1467,8 +1492,8 @@ def ddc_read(specs: list, *, detect=()) -> dict:
             if reading.get("status") not in ("ok", "busy") and n in scdc_unlocked:
                 readings[n] = scdc_unlocked[n]
             else:
-                if reading.get("status") == "ok" and modes_by_name.get(n) == "" and sysfs[n] is not None:
-                    if read_hdcp_present(sysfs[n])["status"] == "ok":
+                if reading.get("status") == "ok" and modes_by_name.get(n) == "" and HDMI_RE.match(n) and buses[n] is not None:
+                    if read_hdcp_present(buses[n])["status"] == "ok":
                         hdcp_seen.add(n)
                 if n in hdcp_seen and reading.get("status") == "ok":
                     reading = dict(reading, hdcp=True)

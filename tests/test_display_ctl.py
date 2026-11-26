@@ -770,11 +770,30 @@ class ScdcTest(_DdcReadBase):
             on = ctl.ddc_read(["HDMI-A-1@ddc+hdcp"])
         self.assertEqual(on["readings"]["HDMI-A-1"], {"status": "ok", "code": "0x11", "hdcp": True})
         scdc_probe.assert_not_called()
-        # @ddc discovers hdcp=True once lit, and does NOT treat none as power-off (DP safe).
-        with mock.patch.object(ctl, "read_hdcp_present", return_value={"status": "ok"}), \
+        # Settled @ddc skips both SCDC (0x54) and HDCP (0x3A), reading only VCP 60.
+        with mock.patch.object(ctl, "read_scdc_status") as scdc_probe, \
+                mock.patch.object(ctl, "read_hdcp_present") as hdcp_probe, \
                 mock.patch.object(ctl.subprocess, "run", return_value=completed("VCP 60 SNC x11")):
-            disc = ctl.ddc_read(["HDMI-A-1@ddc"])
-        self.assertEqual(disc["readings"]["HDMI-A-1"], {"status": "ok", "code": "0x11", "hdcp": True})
+            settled = ctl.ddc_read(["HDMI-A-1@ddc"])
+        self.assertEqual(settled["readings"]["HDMI-A-1"], {"status": "ok", "code": "0x11"})
+        scdc_probe.assert_not_called()
+        hdcp_probe.assert_not_called()
+        # Initial discovery probes HDCP 0x3A only on HDMI connectors (never DP) and
+        # uses the resolved bus (including a ddcutil-detected bus when sysfs is missing).
+        with mock.patch.object(ctl, "sysfs_bus", return_value="5"), \
+                mock.patch.object(ctl, "read_scdc_status", return_value={"status": "none"}), \
+                mock.patch.object(ctl, "read_hdcp_present") as hdcp_dp, \
+                mock.patch.object(ctl.subprocess, "run", return_value=completed("VCP 60 SNC x0f")):
+            dp_res = ctl.ddc_read(["DP-1"])
+        self.assertEqual(dp_res["readings"]["DP-1"], {"status": "ok", "code": "0x0f"})
+        hdcp_dp.assert_not_called()
+        with mock.patch.object(ctl, "sysfs_bus", return_value=None), \
+                mock.patch.object(ctl, "ddc_buses", return_value={"HDMI-A-2": "9"}), \
+                mock.patch.object(ctl, "read_hdcp_present", return_value={"status": "ok"}) as hdcp_hdmi, \
+                mock.patch.object(ctl.subprocess, "run", return_value=completed("VCP 60 SNC x11")):
+            hdmi_det = ctl.ddc_read(["HDMI-A-2"], detect=["HDMI-A-2"])
+        self.assertEqual(hdmi_det["readings"]["HDMI-A-2"], {"status": "ok", "code": "0x11", "hdcp": True, "bus": "9"})
+        hdcp_hdmi.assert_called_once_with("9")
 
     def test_scdc_is_only_tried_on_sysfs_linked_connectors(self):
         fake = FakeScdc({0x01: 0x01, 0x31: 0x00, 0x40: 0x0F})
@@ -1131,10 +1150,11 @@ class MirrorParkTest(unittest.TestCase):
     def test_apply_unmirror_pre_disables_to_recreate_wl_output(self):
         plan = [output(**LAPTOP), output()]
         mirrored_live = [
-            {"name": "eDP-1", "disabled": False, "mirrorOf": "none"},
-            {"name": "HDMI-A-1", "disabled": False, "mirrorOf": "eDP-1"},
+            {"name": "eDP-1", "disabled": False, "dpmsStatus": True, "mirrorOf": "none"},
+            {"name": "HDMI-A-1", "disabled": False, "dpmsStatus": True, "mirrorOf": "eDP-1"},
         ]
         with mock.patch.object(ctl, "connected_monitors", return_value=mirrored_live), \
+                mock.patch.object(ctl, "lid_closed", return_value=False), \
                 mock.patch.object(ctl.subprocess, "run", return_value=completed("ok")) as run, \
                 mock.patch.object(ctl.time, "sleep") as sleep_fn, \
                 mock.patch.object(ctl, "_verify_some_display_enabled", return_value=[]), \
@@ -1146,12 +1166,39 @@ class MirrorParkTest(unittest.TestCase):
         self.assertIn('output = "HDMI-A-1", disabled = false', run.call_args_list[1][0][0][2])
         self.assertIn('mirror = ""', run.call_args_list[1][0][0][2])
         sleep_fn.assert_called_once()
+        # Refuses to pre-disable when the only other output is DPMS-off or behind a closed lid.
+        dpms_off_live = [
+            {"name": "eDP-1", "disabled": False, "dpmsStatus": False, "mirrorOf": "none"},
+            {"name": "HDMI-A-1", "disabled": False, "dpmsStatus": True, "mirrorOf": "eDP-1"},
+        ]
+        self.assertEqual(ctl._unmirror_pre_disable_lua(ctl.validate_plan(plan), dpms_off_live, False), "")
+        self.assertEqual(ctl._unmirror_pre_disable_lua(ctl.validate_plan(plan), mirrored_live, True), "")
+        # Pre-disable failure is reported and skips sleep; main eval timeout still runs recovery.
+        with mock.patch.object(ctl, "connected_monitors", return_value=mirrored_live), \
+                mock.patch.object(ctl, "lid_closed", return_value=False), \
+                mock.patch.object(ctl.subprocess, "run", side_effect=[completed("err", 1), completed("ok")]), \
+                mock.patch.object(ctl.time, "sleep") as sleep_err, \
+                mock.patch.object(ctl, "_verify_some_display_enabled", return_value=[]), \
+                mock.patch.object(ctl, "fallbacks", return_value=[]):
+            res_pre_err = ctl.apply(ctl.validate_plan(plan))
+        self.assertFalse(res_pre_err["ok"])
+        sleep_err.assert_not_called()
+        with mock.patch.object(ctl, "connected_monitors", return_value=mirrored_live), \
+                mock.patch.object(ctl, "lid_closed", return_value=False), \
+                mock.patch.object(ctl.subprocess, "run", side_effect=[completed("ok"), subprocess.TimeoutExpired("hyprctl", 10)]), \
+                mock.patch.object(ctl.time, "sleep"), \
+                mock.patch.object(ctl, "_verify_some_display_enabled", return_value=["restored"]) as verify_fn, \
+                mock.patch.object(ctl, "fallbacks", return_value=[]):
+            res_timeout = ctl.apply(ctl.validate_plan(plan))
+        self.assertFalse(res_timeout["ok"])
+        verify_fn.assert_called_once()
         # Already-unmirrored outputs do not incur a pre-disable cycle.
         extended_live = [
-            {"name": "eDP-1", "disabled": False, "mirrorOf": "none"},
-            {"name": "HDMI-A-1", "disabled": False, "mirrorOf": "none"},
+            {"name": "eDP-1", "disabled": False, "dpmsStatus": True, "mirrorOf": "none"},
+            {"name": "HDMI-A-1", "disabled": False, "dpmsStatus": True, "mirrorOf": "none"},
         ]
         with mock.patch.object(ctl, "connected_monitors", return_value=extended_live), \
+                mock.patch.object(ctl, "lid_closed", return_value=False), \
                 mock.patch.object(ctl.subprocess, "run", return_value=completed("ok")) as run2, \
                 mock.patch.object(ctl.time, "sleep") as sleep_fn2, \
                 mock.patch.object(ctl, "_verify_some_display_enabled", return_value=[]), \

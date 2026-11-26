@@ -1240,6 +1240,21 @@ TestCase {
         verify(!Model.ddcIsHotplug(50000, 51500))
         verify(!Model.ddcIsHotplug(50000, 57999))
         verify(Model.ddcIsHotplug(50000, 58000))
+        // A 7.5s HPD pulse classified as a bounce at raw monitoradded stays a bounce
+        // even after the 1.2s settle timer pushes refresh past 8.0s (8.7s total).
+        var mons = [laptop(), benq()]
+        var pluggedBounce = Model.ddcResolvePlugged(mons, { "eDP-1": true }, {}, { "HDMI-A-1": true },
+                                                    { "HDMI-A-1": 50000 }, 58700, 0)
+        compare(pluggedBounce, {})
+        var prunedBounce = Model.ddcPrune({}, Model.planFromLive(mons, {}, {}), pluggedBounce, 58700)
+        var benqFp = byName(Model.planFromLive(mons, {}, {}), "HDMI-A-1").fp
+        var afterBounce = feed(prunedBounce[benqFp], [ok("0x12"), ok("0x12")], 70000, "0x11")
+        compare([afterBounce.state.state, afterBounce.state.expected, afterBounce.learns.length],
+                ["UNVERIFIED", "0x11", 0])
+        // Without a bounce flag, a genuine >8s unplug+replug is marked hotplugged.
+        var pluggedReal = Model.ddcResolvePlugged(mons, { "eDP-1": true }, {}, {},
+                                                  { "HDMI-A-1": 50000 }, 58700, 0)
+        compare(pluggedReal, { "HDMI-A-1": true })
     }
 
     function test_input_pause_never_changes_the_persisted_unpaused_layout() {
@@ -1484,6 +1499,44 @@ TestCase {
         compare(stillOff.state.state, "PAUSED")
         var backOn = feed(stillOff.state, [hdcpOk], stillOff.t, "0x11")
         compare([backOn.state.state, backOn.state.pausedReason], ["WATCHING", ""])
+        // Alternating power-off and other-input VCP readings advance the same away streak
+        // instead of resetting to 1 and stalling at the 1s confirm rate.
+        var alt = feed(backOn.state, [ok("0x12"), pwrOff, ok("0x12")], backOn.t + 15000, "0x11", true, 1000)
+        compare([alt.state.state, alt.state.pausedReason, alt.state.pausedCode], ["PAUSED", "input", "0x12"])
+        // Resume and Re-probe preserve hdcpCapable and route through @ddc+hdcp (never
+        // touching SCDC 0x54); an AC-off monitor across suspend lands in UNVERIFIED.
+        var resumedHdcp = Model.ddcResume({ fp: benqOff.state }, 500000)
+        verify(resumedHdcp.fp.hdcpCapable)
+        compare(Model.ddcReadArgs([{ fp: "fp", name: "HDMI-A-1" }], resumedHdcp), ["--detect", "HDMI-A-1", "HDMI-A-1@ddc+hdcp"])
+        var acOffResume = feed(resumedHdcp.fp, [pwrOff], 510000, "0x11")
+        compare([acOffResume.state.state, acOffResume.state.mode, acOffResume.state.expected], ["UNVERIFIED", "ddc", "0x11"])
+        var wokenAfterSuspend = feed(acOffResume.state, [hdcpOk], acOffResume.t, "0x11")
+        compare(wokenAfterSuspend.state.state, "WATCHING")
+        // Mid-pause hdcp:true does NOT flip a disabled pause to mirror-parked, and
+        // planFromLive never mistakes a disabled paused monitor for lit/extended.
+        var noHdcpW = feed(Model.ddcFresh("HDMI-A-1", 0, false), [ok("0x11"), ok("0x11")], 10000, "")
+        var disPaused = feed(noHdcpW.state, [ok("0x12"), ok("0x12"), ok("0x12")], noHdcpW.t, "0x11").state
+        compare([disPaused.state, disPaused.pauseMode, disPaused.hdcpCapable], ["PAUSED", "disable", false])
+        var midPauseHdcp = feed(disPaused, [{ status: "ok", code: "0x12", hdcp: true }], disPaused.t, "0x11").state
+        compare([midPauseHdcp.state, midPauseHdcp.pauseMode, midPauseHdcp.hdcpCapable], ["PAUSED", "disable", false])
+        var disLive = Model.planFromLive([laptop(), Object.assign({}, benq(), { disabled: true })], {},
+                                         { [byName(Model.planFromLive([laptop(), benq()], {}, {}), "HDMI-A-1").fp]: "input" },
+                                         { [byName(Model.planFromLive([laptop(), benq()], {}, {}), "HDMI-A-1").fp]: "mirror" }, {})
+        compare([byName(disLive, "HDMI-A-1").autoOff, byName(disLive, "HDMI-A-1").enabled], [true, false])
+        // Explicit manual power-off edit in draft survives mirror-park pause + wake and stays dirty.
+        var litMons = [laptop(), benq()]
+        var memMan = Model.remember({}, Model.derive(litMons, {}, {}), "t")
+        var bFp = byName(Model.planFromLive(litMons, memMan, {}), "HDMI-A-1").fp
+        var manualDraft = Model.planFromLive(litMons, memMan, {})
+        byName(manualDraft, "HDMI-A-1").enabled = false
+        var parkedLive = Model.planFromLive([laptop(), Object.assign({}, benq(), { mirrorOf: "eDP-1" })], memMan,
+                                            { [bFp]: "input" }, { [bFp]: "mirror" }, { "HDMI-A-1": ["eDP-1"] })
+        var syncedMan = Model.syncDraftAutoOff(manualDraft, parkedLive)
+        compare(byName(syncedMan.draft, "HDMI-A-1").enabled, false)
+        compare(byName(syncedMan.draft, "HDMI-A-1").autoOff, false)
+        verify(!Model.outputMatchesLive(byName(syncedMan.draft, "HDMI-A-1"), byName(parkedLive, "HDMI-A-1")))
+        var wokeMan = Model.syncDraftAutoOff(syncedMan.draft, Model.planFromLive(litMons, memMan, {}))
+        compare(byName(wokeMan.draft, "HDMI-A-1").enabled, false)
     }
 
     function test_scdc_monitor_after_resume_probes_through_scdc() {
