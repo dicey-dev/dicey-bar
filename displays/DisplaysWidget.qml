@@ -1,3 +1,4 @@
+pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
 import Quickshell
@@ -9,8 +10,8 @@ import "DisplayModel.js" as Model
 
 // Unified Displays bar widget (replaces stock `omarchy.monitor` and answers
 // `dicey.displays`). Per-monitor settings (position, resolution, refresh rate,
-// scale, orientation, adaptive sync, HDR + SDR tuning, brightness, DDC/CI
-// input watch) are scoped to the selected monitor; OS-wide controls
+// scale, orientation, adaptive sync, HDR + SDR tuning, brightness, and the
+// read-only input-switch auto-pause status) are scoped to the selected monitor; OS-wide controls
 // (text size and night light) sit in a dedicated All Displays card with a
 // separating bar so their scope is never ambiguous.
 Panel {
@@ -66,7 +67,6 @@ Panel {
     if (brightnessEdited) return true
     if (!Model.planMatchesLive(draft, live)) return true
     for (var i = 0; i < draft.length; i++) {
-      if (draft[i].ddcWatch !== live[i].ddcWatch) return true
       if ((draft[i].brightness || null) !== (live[i].brightness || null)) return true
     }
     return false
@@ -132,8 +132,15 @@ Panel {
     return (isFinite(k) && k >= 1500 && k <= 6400) ? k : 4000
   }
   readonly property bool currentHasSavedProfile: !!(service && current && service.hasSavedProfile(current.fp))
-  readonly property bool currentSavedDdcWatch: !!(service && current && service.hasSavedDdcWatch(current.fp))
-  readonly property string currentLearnedDdcInput: (service && current) ? service.savedDdcInput(current.fp) : ""
+  // Read-only DDC/CI auto-pause status for the selected monitor (no setting).
+  // Explicitly touch service.ddcStates and service.memory so Qt re-evaluates live.
+  readonly property var currentDdcStatus: {
+    var _states = service ? service.ddcStates : null
+    var _mem = service ? service.memory : null
+    return (service && current && !current.internal) ? service.ddcStatusFor(current.fp) : null
+  }
+  readonly property bool currentPausedForInput: !!current && current.autoOff && current.offReason === "input"
+  readonly property bool canWakeNow: !!service && !service.confirming && !service.applyInFlight && !service.revertInFlight
 
   // Theme-derived palette — strictly Commons.Color tokens so theme swaps apply live.
   readonly property color fg: bar ? bar.foreground : Commons.Color.foreground
@@ -166,14 +173,25 @@ Panel {
     else noticeTimer.stop()
   }
 
-  function ddcInputLabel(code) {
-    var c = String(code || "").toLowerCase()
-    var map = {
-      "0x01": "VGA-1", "0x02": "VGA-2", "0x03": "DVI-1", "0x04": "DVI-2",
-      "0x0f": "DP-1", "0x10": "DP-2", "0x11": "HDMI-1", "0x12": "HDMI-2",
-      "0x19": "USB-C-1", "0x1b": "USB-C"
+  function wakeCurrent() {
+    if (!service || !current || !canWakeNow) return
+    var name = current.name
+    var fp = current.fp
+    if (!service.wakeDisplay(fp)) return
+    if (edited) {
+      // Keep the edits, but never let Apply submit the pause that just ended.
+      var next = draft.map(copyOutput)
+      for (var i = 0; i < next.length; i++) {
+        if (next[i].fp !== fp || !next[i].autoOff) continue
+        next[i].autoOff = false
+        next[i].offReason = ""
+        next[i].parkMirrorOf = ""
+        next[i].pauseMode = ""
+        next[i].enabled = true
+      }
+      draft = next
     }
-    return map[c] ? (map[c] + " (" + c + ")") : c
+    showNotice("Woke " + name + " · stays on until its input returns")
   }
 
   function transformDegrees(t) {
@@ -334,20 +352,6 @@ Panel {
     })
   }
 
-  function relearnSelectedDdc() {
-    if (!service || !current) return
-    var name = current.name
-    var fp = current.fp
-    showNotice("Reading DDC/CI input for " + name + "…")
-    service.relearnDdcInput(name, fp, function(ok, data) {
-      if (ok && data && data.ddcInput) {
-        showNotice("Learned input " + root.ddcInputLabel(data.ddcInput) + " for " + name)
-      } else {
-        showNotice((data && data.error) ? data.error : ("Could not read input for " + name))
-      }
-    })
-  }
-
   function canTurnOff(index) {
     var o = draft[index]
     if (!o) return false
@@ -365,16 +369,40 @@ Panel {
       brightnessDebounce.stop()
       setBrightness(brightness, true)
     }
-    if (service.brightnessBusy) {
+    if (service.brightnessBusy || service.reconcileInFlight || service.wakePending) {
       applyingPending = true
-      service.whenBrightnessIdle(function() {
-        if (!root.applyingPending) return
-        root.applyingPending = false
-        root.applyNow()
-      })
+      waitBeforeApply()
       return
     }
     applyNow()
+  }
+
+  function waitBeforeApply() {
+    if (!root.applyingPending || !service || service.confirming || service.applyInFlight) {
+      root.applyingPending = false
+      return
+    }
+    if (service.reconcileInFlight || service.wakePending) {
+      service.whenReconcileIdle(function(ready) {
+        if (!root.applyingPending) return
+        if (!ready) {
+          root.applyingPending = false
+          root.showNotice("Waiting for display readback — try Apply again")
+          return
+        }
+        root.waitBeforeApply()
+      })
+      return
+    }
+    if (service.brightnessBusy) {
+      service.whenBrightnessIdle(function() {
+        if (!root.applyingPending) return
+        root.waitBeforeApply()
+      })
+      return
+    }
+    root.applyingPending = false
+    root.applyNow()
   }
 
   function applyNow() {
@@ -407,13 +435,13 @@ Panel {
   function offText(o) {
     if (!o) return ""
     if (o.offReason === "lid") return "Off while lid is closed"
-    if (o.offReason === "input") return "Switched to another input"
+    if (o.offReason === "input") return "Paused · switched away or off"
     return ""
   }
 
   function statusBadgeText(o) {
     if (!o) return ""
-    if (o.autoOff) return o.offReason === "lid" ? "Lid closed" : "Switched away"
+    if (o.autoOff) return o.offReason === "lid" ? "Lid closed" : "Paused"
     if (!o.enabled) return "Disabled"
     if (o.mirrorOf) return "Mirroring"
     return "Active"
@@ -451,6 +479,11 @@ Panel {
       })
     }
 
+    function wakeDisplays(): string {
+      var count = root.service ? root.service.wakeAllDisplays() : 0
+      return "woke " + count
+    }
+
     function open() { root.open() }
     function close() { root.close() }
     function toggle() { root.toggle() }
@@ -479,7 +512,7 @@ Panel {
     target: root.service
     function onRefreshed() {
       if (!root.edited) {
-        root.resetDraft()
+        if (!root.service || !root.service.wakePending) root.resetDraft()
         if (root.pendingHostSelect && root.selectHostDisplay()) {
           root.pendingHostSelect = false
           root.readAllBrightness(true)
@@ -490,6 +523,10 @@ Panel {
         root.selectHostDisplay()
         root.readAllBrightness(true)
         root.showNotice("Display topology changed — refreshed")
+      } else {
+        // Same monitors, edits kept: runtime pauses and wakes still follow live.
+        var synced = Model.syncDraftAutoOff(root.draft, root.live)
+        if (synced.changed) root.draft = synced.draft
       }
       root.syncNightLightFromService()
     }
@@ -1111,7 +1148,9 @@ Panel {
                   Text {
                     visible: !tabPill.isActive || tabPill.isMirrored
                     textFormat: Text.PlainText
-                    text: tabPill.modelData.autoOff ? "AUTO OFF" : (!tabPill.isActive ? "OFF" : "MIRROR")
+                    text: tabPill.modelData.autoOff
+                      ? (tabPill.modelData.offReason === "lid" ? "LID" : "PAUSED")
+                      : (!tabPill.isActive ? "OFF" : "MIRROR")
                     color: tabPill.modelData.autoOff
                       ? root.alertColor
                       : (tabPill.isMirrored ? root.accent : root.muted)
@@ -1245,8 +1284,16 @@ Panel {
                   id: powerSwitch
                   anchors.verticalCenter: parent.verticalCenter
                   checked: !!root.current && root.current.enabled && !root.current.autoOff
-                  interactive: !!root.current && !root.current.autoOff && root.canTurnOff(root.selected)
+                  // A monitor paused for an input switch wakes at once (no Apply);
+                  // the lid's pause stays Omarchy's to undo.
+                  interactive: !!root.current && (root.currentPausedForInput
+                    ? root.canWakeNow
+                    : (!root.current.autoOff && root.canTurnOff(root.selected)))
                   onToggled: {
+                    if (root.currentPausedForInput) {
+                      root.wakeCurrent()
+                      return
+                    }
                     var turningOn = !root.current.enabled
                     var patch = { enabled: turningOn }
                     if (turningOn) {
@@ -1265,18 +1312,60 @@ Panel {
           // ---------- Disabled / Auto-Off Notice ----------
           CardBox {
             width: parent.width
-            visible: !!root.current && (!root.current.enabled || root.current.autoOff)
+            visible: !!root.current && (!root.current.enabled || root.current.autoOff) && !root.currentPausedForInput
 
             Text {
               width: parent.width
               textFormat: Text.PlainText
               wrapMode: Text.Wrap
               text: root.current && root.current.autoOff
-                ? "This display is paused (" + root.offText(root.current).toLowerCase() + ") and will restore automatically when available."
+                ? "This display is off while the lid is closed and turns back on when you open it."
                 : "This display is turned off. Flip the switch above and press Apply to re-enable it."
               color: root.muted
               font.family: root.fontName
               font.pixelSize: Style.font.caption
+            }
+          }
+
+          // ---------- Paused for an input switch ----------
+          CardBox {
+            width: parent.width
+            visible: root.currentPausedForInput
+
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(pausedNoticeText.implicitHeight, wakeNowBtn.implicitHeight)
+
+              Text {
+                id: pausedNoticeText
+                anchors.left: parent.left
+                anchors.right: wakeNowBtn.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                text: {
+                  if (root.currentDdcStatus && root.currentDdcStatus.mode === "scdc")
+                    return "Paused — no HDMI signal lock (switched away or powered off). Restores automatically when you switch back."
+                  var label = root.currentDdcStatus && root.currentDdcStatus.pausedLabel
+                    ? root.currentDdcStatus.pausedLabel : "another input"
+                  return "Paused — switched to " + label + ". Turns back on automatically when you switch back."
+                }
+                color: root.muted
+                font.family: root.fontName
+                font.pixelSize: Style.font.caption
+              }
+
+              MiniActionButton {
+                id: wakeNowBtn
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Wake now"
+                accented: true
+                enabled: root.canWakeNow
+                opacity: enabled ? 1 : 0.42
+                onClicked: root.wakeCurrent()
+              }
             }
           }
 
@@ -1779,7 +1868,7 @@ Panel {
 
                 Rectangle { width: parent.width; height: 1; color: root.hairline }
 
-                // Per-monitor Auto-Disable
+                // Per-monitor automation (no settings: lid guard and input-switch pause)
                 Column {
                   width: parent.width
                   spacing: Style.space(6)
@@ -1787,7 +1876,7 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: "AUTO-DISABLE"
+                    text: "AUTOMATION"
                     color: root.muted
                     font.family: root.fontName
                     font.pixelSize: Math.max(9, Style.font.caption - 1)
@@ -1795,80 +1884,32 @@ Panel {
                     font.letterSpacing: 1.0
                   }
 
-                  // External display: DDC/CI input watch + Re-learn fallback
+                  // External display: read-only DDC/CI auto-pause status
                   Column {
                     width: parent.width
                     visible: !!root.current && !root.current.internal
-                    spacing: Style.space(6)
+                    spacing: Style.space(2)
 
-                    Item {
+                    Text {
                       width: parent.width
-                      implicitHeight: Math.max(ddcCol.implicitHeight, ddcSwitch.implicitHeight)
-
-                      Column {
-                        id: ddcCol
-                        anchors.left: parent.left
-                        anchors.right: ddcSwitch.left
-                        anchors.rightMargin: Style.space(8)
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: Style.space(2)
-
-                        Text {
-                          width: parent.width
-                          textFormat: Text.PlainText
-                          text: "Switch away / power off"
-                          color: root.fg
-                          font.family: root.fontName
-                          font.pixelSize: Style.font.caption
-                          font.bold: true
-                          elide: Text.ElideRight
-                        }
-
-                        Text {
-                          width: parent.width
-                          textFormat: Text.PlainText
-                          wrapMode: Text.Wrap
-                          text: {
-                            if (!root.current || !root.current.ddcWatch)
-                              return "Auto-disable when monitor switches HDMI/DP input"
-                            return root.currentLearnedDdcInput
-                              ? ("Watching " + root.ddcInputLabel(root.currentLearnedDdcInput))
-                              : "Will learn active DDC/CI input on Apply"
-                          }
-                          color: root.current && root.current.ddcWatch ? root.accent : root.muted
-                          font.family: root.fontName
-                          font.pixelSize: Math.max(9, Style.font.caption - 1)
-                        }
-                      }
-
-                      AccentSwitch {
-                        id: ddcSwitch
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        checked: !!root.current && root.current.ddcWatch
-                        onToggled: root.update(root.selected, { ddcWatch: !root.current.ddcWatch }, false)
-                      }
+                      textFormat: Text.PlainText
+                      text: "Auto-pause on input switch"
+                      color: root.fg
+                      font.family: root.fontName
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                      elide: Text.ElideRight
                     }
 
-                    Column {
+                    Text {
                       width: parent.width
-                      visible: root.currentSavedDdcWatch
-                      spacing: Style.space(4)
-
-                      TinyChipButton {
-                        text: "Re-learn input"
-                        onClicked: root.relearnSelectedDdc()
-                      }
-
-                      Text {
-                        width: parent.width
-                        textFormat: Text.PlainText
-                        wrapMode: Text.Wrap
-                        text: "Auto-updates if you switch PC ports. Click only if you moved this cable to another port on the monitor."
-                        color: root.muted
-                        font.family: root.fontName
-                        font.pixelSize: Math.max(9, Style.font.caption - 1)
-                      }
+                      textFormat: Text.PlainText
+                      wrapMode: Text.Wrap
+                      text: root.currentDdcStatus ? root.currentDdcStatus.text : ""
+                      color: root.currentDdcStatus && (root.currentDdcStatus.state === "WATCHING" || root.currentDdcStatus.state === "PAUSED")
+                        ? root.accent : root.muted
+                      font.family: root.fontName
+                      font.pixelSize: Math.max(9, Style.font.caption - 1)
                     }
                   }
 
@@ -1904,7 +1945,7 @@ Panel {
                         width: parent.width
                         textFormat: Text.PlainText
                         wrapMode: Text.Wrap
-                        text: "Auto-disables on lid close while an external display is connected."
+                        text: "Turns off while the lid is closed and an external display is connected."
                         color: root.muted
                         font.family: root.fontName
                         font.pixelSize: Math.max(9, Style.font.caption - 1)
