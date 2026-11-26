@@ -1241,11 +1241,15 @@ TestCase {
         verify(!Model.ddcIsHotplug(50000, 57999))
         verify(Model.ddcIsHotplug(50000, 58000))
         // A 7.5s HPD pulse classified as a bounce at raw monitoradded stays a bounce
-        // even after the 1.2s settle timer pushes refresh past 8.0s (8.7s total).
+        // even if a stale pre-settle refresh sees the connector absent first and the
+        // settled refresh arrives past 8.0s (8.7s total).
         var mons = [laptop(), benq()]
-        var pluggedBounce = Model.ddcResolvePlugged(mons, { "eDP-1": true }, {}, { "HDMI-A-1": true },
+        var staleBounced = Model.ddcRetainPendingFlags({ "HDMI-A-1": true }, { "eDP-1": true })
+        compare(staleBounced, { "HDMI-A-1": true })
+        var pluggedBounce = Model.ddcResolvePlugged(mons, { "eDP-1": true }, {}, staleBounced,
                                                     { "HDMI-A-1": 50000 }, 58700, 0)
         compare(pluggedBounce, {})
+        compare(Model.ddcRetainPendingFlags(staleBounced, { "eDP-1": true, "HDMI-A-1": true }), {})
         var prunedBounce = Model.ddcPrune({}, Model.planFromLive(mons, {}, {}), pluggedBounce, 58700)
         var benqFp = byName(Model.planFromLive(mons, {}, {}), "HDMI-A-1").fp
         var afterBounce = feed(prunedBounce[benqFp], [ok("0x12"), ok("0x12")], 70000, "0x11")
@@ -1499,19 +1503,34 @@ TestCase {
         compare(stillOff.state.state, "PAUSED")
         var backOn = feed(stillOff.state, [hdcpOk], stillOff.t, "0x11")
         compare([backOn.state.state, backOn.state.pausedReason], ["WATCHING", ""])
-        // Alternating power-off and other-input VCP readings advance the same away streak
-        // instead of resetting to 1 and stalling at the 1s confirm rate.
+        // Alternating power-off and the same other-input VCP reading advance the streak,
+        // while a power-off between two DIFFERENT VCP codes (0x12 -> power -> 0x13) resets.
+        var mixedVcp = feed(backOn.state, [ok("0x12"), pwrOff, ok("0x13")], backOn.t + 15000, "0x11", true, 1000)
+        compare([mixedVcp.state.state, mixedVcp.state.otherStreak, mixedVcp.state.otherCode], ["WATCHING", 1, "0x13"])
         var alt = feed(backOn.state, [ok("0x12"), pwrOff, ok("0x12")], backOn.t + 15000, "0x11", true, 1000)
         compare([alt.state.state, alt.state.pausedReason, alt.state.pausedCode], ["PAUSED", "input", "0x12"])
-        // Resume and Re-probe preserve hdcpCapable and route through @ddc+hdcp (never
-        // touching SCDC 0x54); an AC-off monitor across suspend lands in UNVERIFIED.
-        var resumedHdcp = Model.ddcResume({ fp: benqOff.state }, 500000)
+        // Resume and Re-probe preserve hdcpCapable (forgetting any stale bus number)
+        // and route through @ddc+hdcp; AC-off or unreachable without a sysfs bus lands
+        // in UNVERIFIED with --detect enabled so it recovers as soon as it powers back on.
+        var withBus = Model.ddcCopyState(benqOff.state)
+        withBus.detectedBus = "9"
+        var resumedHdcp = Model.ddcResume({ fp: withBus }, 500000)
         verify(resumedHdcp.fp.hdcpCapable)
+        compare(resumedHdcp.fp.detectedBus, "")
         compare(Model.ddcReadArgs([{ fp: "fp", name: "HDMI-A-1" }], resumedHdcp), ["--detect", "HDMI-A-1", "HDMI-A-1@ddc+hdcp"])
         var acOffResume = feed(resumedHdcp.fp, [pwrOff], 510000, "0x11")
         compare([acOffResume.state.state, acOffResume.state.mode, acOffResume.state.expected], ["UNVERIFIED", "ddc", "0x11"])
         var wokenAfterSuspend = feed(acOffResume.state, [hdcpOk], acOffResume.t, "0x11")
         compare(wokenAfterSuspend.state.state, "WATCHING")
+        var noBusResume = feed(resumedHdcp.fp, [amb(), amb(), amb()], 510000, "0x11")
+        compare([noBusResume.state.state, noBusResume.state.mode, noBusResume.state.expected], ["UNVERIFIED", "ddc", "0x11"])
+        compare(Model.ddcReadArgs([{ fp: "fp", name: "HDMI-A-1" }], { fp: noBusResume.state }), ["--detect", "HDMI-A-1", "HDMI-A-1@ddc+hdcp"])
+        var suspHdcp = Model.ddcCopyState(withBus)
+        suspHdcp.state = "SUSPENDED"
+        var reprobedHdcp = Model.ddcReprobe({ fp: suspHdcp }, 520000)
+        compare([reprobedHdcp.fp.hdcpCapable, reprobedHdcp.fp.detectedBus], [true, ""])
+        var acOffReprobe = feed(reprobedHdcp.fp, [pwrOff], 530000, "0x11")
+        compare([acOffReprobe.state.state, acOffReprobe.state.mode, acOffReprobe.state.expected], ["UNVERIFIED", "ddc", "0x11"])
         // Mid-pause hdcp:true does NOT flip a disabled pause to mirror-parked, and
         // planFromLive never mistakes a disabled paused monitor for lit/extended.
         var noHdcpW = feed(Model.ddcFresh("HDMI-A-1", 0, false), [ok("0x11"), ok("0x11")], 10000, "")

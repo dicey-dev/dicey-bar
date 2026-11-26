@@ -284,15 +284,15 @@ Item {
   // wakes any paused monitor it is no longer safe to keep dark.
   function syncDdcStates(previousNames) {
     var now = Date.now()
-    var plugged = Model.ddcResolvePlugged(monitors, previousNames, hotpluggedConnectors,
-                                          hpdBounceConnectors, removedConnectorsAt, now, resumeAt)
-    hotpluggedConnectors = ({})
-    hpdBounceConnectors = ({})
     var currentNames = {}
     for (var ci = 0; ci < monitors.length; ci++) {
       var cn = monitors[ci] ? String(monitors[ci].name || "") : ""
       if (cn) currentNames[cn] = true
     }
+    var plugged = Model.ddcResolvePlugged(monitors, previousNames, hotpluggedConnectors,
+                                          hpdBounceConnectors, removedConnectorsAt, now, resumeAt)
+    hotpluggedConnectors = Model.ddcRetainPendingFlags(hotpluggedConnectors, currentNames)
+    hpdBounceConnectors = Model.ddcRetainPendingFlags(hpdBounceConnectors, currentNames)
     var nextRemoved = {}
     for (var r in removedConnectorsAt) {
       if (!currentNames[r]) nextRemoved[r] = removedConnectorsAt[r]
@@ -336,8 +336,13 @@ Item {
     if (!name || !loaded) return
     var next = {}
     for (var k in removedConnectorsAt) next[k] = removedConnectorsAt[k]
-    if (!next[name]) next[name] = Date.now()
+    next[name] = Date.now()
     removedConnectorsAt = next
+    if (hpdBounceConnectors[name]) {
+      var cleared = {}
+      for (var bk in hpdBounceConnectors) if (bk !== name) cleared[bk] = true
+      hpdBounceConnectors = cleared
+    }
   }
 
   // A monitor that shows up re-enabled after being off (our own wake, or the
