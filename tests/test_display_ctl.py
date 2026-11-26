@@ -440,11 +440,13 @@ class DdcReadTest(_DdcReadBase):
         for bad in ("DP-5:", "DP-5:1a", "DP-5:../1", "a;b:3", "DP-5:1:2"):
             with self.subTest(spec=bad):
                 self.assertIsNone(ctl.parse_ddc_spec(bad))
-        self.assertEqual(ctl.parse_ddc_spec("DP-2:13"), ("DP-2", "13", False))
-        self.assertEqual(ctl.parse_ddc_spec("DP-2"), ("DP-2", None, False))
-        self.assertEqual(ctl.parse_ddc_spec("DP-2@scdc"), ("DP-2", None, True))
-        self.assertEqual(ctl.parse_ddc_spec("DP-2:13@scdc"), ("DP-2", "13", True))
-        for bad in ("@scdc", "DP-2@scd", "DP-2@scdc:3", "DP-2:@scdc"):
+        self.assertEqual(ctl.parse_ddc_spec("DP-2:13"), ("DP-2", "13", ""))
+        self.assertEqual(ctl.parse_ddc_spec("DP-2"), ("DP-2", None, ""))
+        self.assertEqual(ctl.parse_ddc_spec("DP-2@scdc"), ("DP-2", None, "scdc"))
+        self.assertEqual(ctl.parse_ddc_spec("DP-2:13@scdc"), ("DP-2", "13", "scdc"))
+        self.assertEqual(ctl.parse_ddc_spec("DP-2@ddc"), ("DP-2", None, "ddc"))
+        self.assertEqual(ctl.parse_ddc_spec("DP-2:13@ddc"), ("DP-2", "13", "ddc"))
+        for bad in ("@scdc", "@ddc", "DP-2@scd", "DP-2@scdc:3", "DP-2:@scdc", "DP-2:@ddc"):
             with self.subTest(spec=bad):
                 self.assertIsNone(ctl.parse_ddc_spec(bad))
 
@@ -563,13 +565,15 @@ class ScdcTest(_DdcReadBase):
                 # Only Sink_Version, Config_1, and Status_Flags_0, in that order:
                 # never a clear-on-read/update register.
                 self.assertEqual(fake.reads, [0x01, 0x31, 0x40])
-        # Clock-only, partial TMDS channels, partial FRL lanes, and reserved FRL
-        # rates are ambiguous (never full lock and never away).
+        # Clock-only, partial TMDS channels (including BenQ 0x0B), partial FRL
+        # lanes, and reserved FRL rates are ambiguous (never locked or away).
         partial_cases = (
             (0x00, 0x01),  # TMDS clock-only
             (0x00, 0x07),  # TMDS missing Ch2
+            (0x00, 0x0B),  # TMDS missing Ch1
             (0x00, 0x0E),  # TMDS missing Clock_Detected
             (0x00, 0x10),  # stray lane bit in TMDS
+            (0x00, 0x1F),  # stray lane 3 bit in TMDS
             (0x01, 0x02),  # 3-lane FRL single lane
             (0x02, 0x06),  # 3-lane FRL 2/3 lanes
             (0x03, 0x0E),  # 4-lane FRL 3/4 lanes
@@ -719,6 +723,14 @@ class ScdcTest(_DdcReadBase):
         with fake.patch(), mock.patch.object(ctl.subprocess, "run", return_value=completed("VCP 60 ERR\n")):
             result = ctl.ddc_read(["HDMI-A-1"])
         self.assertEqual(result["readings"]["HDMI-A-1"], {"status": "ok", "signal": "scdc", "scdc": "unlocked"})
+
+    def test_ddc_target_never_touches_scdc(self):
+        fake = FakeScdc({0x01: 0x01, 0x31: 0x00, 0x40: 0x0F})
+        with fake.patch(), mock.patch.object(ctl.subprocess, "run", return_value=completed("VCP 60 SNC x11")) as run:
+            result = ctl.ddc_read(["HDMI-A-1@ddc"])
+        self.assertEqual(fake.opened, [])
+        self.assertEqual(result["readings"]["HDMI-A-1"], {"status": "ok", "code": "0x11"})
+        self.assertEqual(run.call_count, 1)
 
     def test_scdc_is_only_tried_on_sysfs_linked_connectors(self):
         fake = FakeScdc({0x01: 0x01, 0x31: 0x00, 0x40: 0x0F})

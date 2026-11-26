@@ -708,9 +708,9 @@ TestCase {
         var sysfs = watching("0x0f", "DP-2").state
         var states = { a: w, b: sysfs, c: Model.ddcFresh("HDMI-A-1", 0, false) }
         compare(Model.ddcReadArgs([{ fp: "a", name: "DP-5" }, { fp: "b", name: "DP-2" }, { fp: "c", name: "HDMI-A-1" }], states),
-                ["--detect", "HDMI-A-1", "DP-5:13", "DP-2", "HDMI-A-1"])
-        // A watching monitor never asks for detect even without a bus.
-        compare(Model.ddcReadArgs([{ fp: "b", name: "DP-2" }], states), ["DP-2"])
+                ["--detect", "HDMI-A-1", "DP-5:13@ddc", "DP-2@ddc", "HDMI-A-1"])
+        // A watching DDC monitor never asks for detect or probes SCDC.
+        compare(Model.ddcReadArgs([{ fp: "b", name: "DP-2" }], states), ["DP-2@ddc"])
         // Reconnect, port move and resume all forget the bus.
         var ids = Model.planFromLive([laptop(), benq()], {}, {})
         var benqFp = byName(ids, "HDMI-A-1").fp
@@ -1283,7 +1283,7 @@ TestCase {
         var w = feed(one.state, [scdc("locked")], one.t, "0x11")
         compare([w.state.state, w.state.mode, w.state.pauseMode], ["WATCHING", "scdc", "mirror"])
         compare(w.learns.length, 0)
-        compare(Model.ddcPollInterval({ fp: w.state }, 0), 2000)
+        compare(Model.ddcPollInterval({ fp: w.state }, 0), 5000)
         compare(Model.ddcReadArgs([{ fp: "fp", name: "HDMI-A-1", mode: "scdc" }], { fp: w.state }), ["HDMI-A-1@scdc"])
         compare(Model.ddcStatusText(w.state, true), "Active · HDMI signal lock")
         // Two unlocked reads are not enough; a lock resets the evidence.
@@ -1292,9 +1292,9 @@ TestCase {
         // Busy is neutral; an unreadable answer breaks the streak.
         var broken = feed(w.state, [scdc("unlocked"), scdc("unlocked"), amb(), scdc("unlocked")], w.t, "")
         compare(broken.state.state, "WATCHING")
-        var p = feed(w.state, [scdc("unlocked"), busy(), scdc("unlocked"), scdc("unlocked")], w.t, "", true, 2000)
+        var p = feed(w.state, [scdc("unlocked"), busy(), scdc("unlocked"), scdc("unlocked")], w.t, "", true, 5000)
         compare([p.state.state, p.state.pauseMode, p.state.pausedReason], ["PAUSED", "mirror", "unlocked"])
-        compare(Model.ddcPollInterval({ fp: p.state }, 0), 2000)
+        compare(Model.ddcPollInterval({ fp: p.state }, 0), 3000)
         compare(Model.ddcStatusText(p.state, true), "Paused · switched away or powered off")
 
         var mons = [laptop(), benq()]
@@ -1439,7 +1439,7 @@ TestCase {
         var dp = feed(Model.ddcFresh("DP-1", 0, false), [ok("0x0f"), ok("0x0f")], 10000, "")
         compare([dp.state.state, dp.state.mode, dp.state.pauseMode], ["WATCHING", "ddc", "disable"])
         compare(dp.learns.length, 1)
-        compare(Model.ddcReadArgs([{ fp: "fp", name: "DP-1", mode: "ddc" }], { fp: dp.state }), ["DP-1"])
+        compare(Model.ddcReadArgs([{ fp: "fp", name: "DP-1", mode: "ddc" }], { fp: dp.state }), ["DP-1@ddc"])
         var p = feed(dp.state, [ok("0x11"), ok("0x11"), ok("0x11")], dp.t, "0x0f").state
         compare(p.state, "PAUSED")
         compare(Model.ddcPauseModes({ fp: p }), { fp: "disable" })

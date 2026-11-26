@@ -9,13 +9,14 @@ The panel and its hotplug service decide what each monitor should do
   revert                    stdin plan -> re-read connected monitors & safely roll back
   persist                   stdin {"plan": [...]?, "memory": {...}?, "removeManagedBlock": bool?,
                                    "forgetDdcFp": "<fp>"?}
-  ddc-read [--detect NAME]... NAME[:BUS][@scdc]...
+  ddc-read [--detect NAME]... NAME[:BUS][@scdc|@ddc]...
                             JSON: one read-only reading per connector, each
                             {"status": "ok"|"ambiguous"|"busy"|"no_tool", "code"?, "bus"?}
                             or, from HDMI SCDC, {"status": "ok", "signal": "scdc",
                             "scdc": "locked"|"unlocked"|"absent"}. `@scdc` reads only
-                            SCDC (never ddcutil); without it a sysfs-linked connector
-                            is checked for SCDC lock first, then VCP 0x60.
+                            SCDC (never ddcutil); `@ddc` reads only VCP 0x60 (never
+                            I2C 0x54); without either a sysfs-linked connector is
+                            checked for SCDC lock first, then VCP 0x60.
                             `ddcutil detect` only runs for connectors named by --detect.
   ddc-learn NAME FP CODE    JSON: remember CODE as FP's input on connector NAME (ddc.json)
   ddc-forget FP             JSON: drop FP's learned input from ddc.json
@@ -1186,25 +1187,29 @@ def read_scdc_status(bus) -> dict:
         return {"status": "ambiguous"}
     if (flags & SCDC_LOCK_MASK) == 0:
         return {"status": "ok", "signal": "scdc", "scdc": "unlocked"}
-    if (flags & required) == required:
+    if (flags & required) == required and (frl_rate != 0 or (flags & 0x10) == 0):
         return {"status": "ok", "signal": "scdc", "scdc": "locked"}
     # Clock-only or partial channel/lane lock is never a full lock or away.
     return {"status": "ambiguous"}
 
 
 def parse_ddc_spec(spec):
-    """`NAME`, `NAME:BUS`, `NAME@scdc` or `NAME:BUS@scdc` (BUS digits only) ->
-    (name, bus or None, scdc), else None."""
+    """`NAME`, `NAME:BUS`, `NAME[@scdc|@ddc]` or `NAME:BUS[@scdc|@ddc]`
+    (BUS digits only) -> (name, bus or None, mode), else None."""
     text = str(spec or "")
-    scdc = text.endswith("@scdc")
-    if scdc:
+    mode = ""
+    if text.endswith("@scdc"):
+        mode = "scdc"
         text = text[:-len("@scdc")]
+    elif text.endswith("@ddc"):
+        mode = "ddc"
+        text = text[:-len("@ddc")]
     name, sep, bus = text.partition(":")
     if not CONNECTOR_RE.fullmatch(name):
         return None
     if sep and not re.fullmatch(r"\d{1,6}", bus):
         return None
-    return name, (bus if sep else None), scdc
+    return name, (bus if sep else None), mode
 
 
 def live_dpms_snapshot():
@@ -1271,12 +1276,12 @@ def ddc_read(specs: list, *, detect=()) -> dict:
     scdc_unlocked = {}
     pending = []
     has_ddcutil = shutil.which("ddcutil") is not None
-    for name, hint, scdc in parsed:
+    for name, hint, mode in parsed:
         if dpms.get(name) is False:
             readings[name] = {"status": "dpms_off"}
             continue
         sysfs[name] = sysfs_bus(name)
-        if scdc:
+        if mode == "scdc":
             bus = sysfs[name] if sysfs[name] is not None else hint
             if bus is None:
                 readings[name] = {"status": "ambiguous"}
@@ -1286,7 +1291,7 @@ def ddc_read(specs: list, *, detect=()) -> dict:
                 reading = {"status": "ok", "signal": "scdc", "scdc": "absent"}
             readings[name] = reading
             continue
-        if sysfs[name] is not None:
+        if mode != "ddc" and sysfs[name] is not None:
             reading = read_scdc_status(sysfs[name])
             if reading["status"] == "busy" or reading.get("scdc") == "locked":
                 readings[name] = reading

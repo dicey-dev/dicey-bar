@@ -2107,10 +2107,10 @@ function ddcHold(states, pollable, now) {
 function ddcStateInterval(st) {
   if (!st) return 0
   if (st.mode === "scdc") {
-    if (st.state === "PAUSED" || st.state === "WATCHING") return DDC_INTERVAL_SCDC
-    if (st.state === "UNVERIFIED" || st.state === "SNOOZED") return DDC_INTERVAL_ACTIVE
+    if (st.state === "PAUSED") return DDC_INTERVAL_PAUSED
+    if (st.state === "WATCHING" || st.state === "UNVERIFIED" || st.state === "SNOOZED") return DDC_INTERVAL_ACTIVE
   }
-  if (st.state === "PROBING" && st.probeSawScdc === true) return DDC_INTERVAL_SCDC
+  if (st.state === "PROBING" && st.probeSawScdc === true) return DDC_INTERVAL_PAUSED
   if (st.state === "PAUSED") return DDC_INTERVAL_PAUSED
   if (st.state === "PROBING" || st.state === "WATCHING" || st.state === "UNPROBED") return DDC_INTERVAL_ACTIVE
   if (st.state === "UNVERIFIED" || st.state === "SNOOZED") return DDC_INTERVAL_SLOW
@@ -2179,7 +2179,8 @@ function ddcReadArgs(targets, states) {
     var bus = /^[0-9]{1,6}$/.test(String(st.detectedBus || "")) ? String(st.detectedBus) : ""
     var mode = clean(t.mode) || clean(st.mode)
     var scdc = mode === "scdc" || st.scdcCapable === true
-    specs.push((bus ? t.name + ":" + bus : t.name) + (scdc ? "@scdc" : ""))
+    var suffix = scdc ? "@scdc" : (mode === "ddc" ? "@ddc" : "")
+    specs.push((bus ? t.name + ":" + bus : t.name) + suffix)
     if (!bus && !scdc && (st.state === "UNPROBED" || st.state === "PROBING")) detect.push("--detect", t.name)
   }
   return detect.concat(specs)
