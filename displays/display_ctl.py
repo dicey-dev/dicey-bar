@@ -9,14 +9,15 @@ The panel and its hotplug service decide what each monitor should do
   revert                    stdin plan -> re-read connected monitors & safely roll back
   persist                   stdin {"plan": [...]?, "memory": {...}?, "removeManagedBlock": bool?,
                                    "forgetDdcFp": "<fp>"?}
-  ddc-read [--detect NAME]... NAME[:BUS][@scdc|@ddc]...
+  ddc-read [--detect NAME]... NAME[:BUS][@scdc|@ddc|@ddc+hdcp]...
                             JSON: one read-only reading per connector, each
-                            {"status": "ok"|"ambiguous"|"busy"|"no_tool", "code"?, "bus"?}
+                            {"status": "ok"|"ambiguous"|"busy"|"no_tool", "code"?, "bus"?, "hdcp"?}
                             or, from HDMI SCDC, {"status": "ok", "signal": "scdc",
-                            "scdc": "locked"|"unlocked"|"absent"}. `@scdc` reads only
-                            SCDC (never ddcutil); `@ddc` reads only VCP 0x60 (never
-                            I2C 0x54); without either a sysfs-linked connector is
-                            checked for SCDC lock first, then VCP 0x60.
+                            "scdc": "locked"|"unlocked"|"absent"}, or, from HDMI HDCP
+                            RX presence (`@ddc+hdcp`), {"status": "ok", "signal": "power",
+                            "power": "off"}. `@scdc` reads only SCDC (never ddcutil);
+                            `@ddc`/`@ddc+hdcp` never touch SCDC (0x54); without a suffix
+                            a sysfs-linked connector checks SCDC first, then VCP 0x60.
                             `ddcutil detect` only runs for connectors named by --detect.
   ddc-learn NAME FP CODE    JSON: remember CODE as FP's input on connector NAME (ddc.json)
   ddc-forget FP             JSON: drop FP's learned input from ddc.json
@@ -70,6 +71,7 @@ I2C_SLAVE = 0x0703
 I2C_SMBUS = 0x0720
 I2C_SMBUS_READ = 1
 I2C_SMBUS_BYTE_DATA = 2
+I2C_SMBUS_I2C_BLOCK_DATA = 8
 # HDMI 2.0/2.1 SCDC: read-only register reads only. Sink_Version (0x01) is
 # nonzero on any SCDC sink; Config_1 (0x31, bits 3:0) gives FRL_Rate (0 = TMDS,
 # 1-2 = 3-lane FRL, 3-6 = 4-lane FRL); Status_Flags_0 (0x40) holds
@@ -83,6 +85,13 @@ SCDC_LOCK_MASK = 0x1F
 SCDC_TMDS_LOCK = 0x0F
 SCDC_FRL_3LANE_LOCK = 0x0E
 SCDC_FRL_4LANE_LOCK = 0x1E
+# HDMI HDCP RX (I2C 0x3A): read-only Bksv (5 bytes at 0x00..0x04) is inside the
+# HDMI receiver PHY (unlike the +5V-powered EDID EEPROM at 0x50). By HDCP spec
+# every valid Bksv has exactly 20 set bits; when the monitor is powered off
+# (soft-off or AC-off), 0x3A NACKs with ENXIO/EREMOTEIO.
+HDCP_ADDR = 0x3A
+HDCP_BKSV_REG = 0x00
+HDCP_BKSV_LEN = 5
 INTERNAL_RE = re.compile(r"^(eDP|LVDS|DSI)-")
 # How an input-paused monitor is kept off: "mirror" (parked lit as a mirror,
 # HDMI SCDC) or "disable" (DDC/CI); "" for an older caller (disable).
@@ -845,10 +854,51 @@ def pick_rescue_monitor(live: list, lid_is_closed: bool) -> dict:
     return ordered[0] if ordered else live[0]
 
 
+def _unmirror_pre_disable_lua(outputs: list, live: list) -> str:
+    """Hyprland drops an output's wl_output global when it starts mirroring and
+    does not recreate it on a direct `mirror = ""` transition, leaving the
+    unmirrored monitor without wallpaper/bar/grim until disabled and re-enabled.
+    Return `disabled = true` rules for any currently-mirrored output that is
+    about to become enabled and unmirrored, provided another lit non-mirrored
+    output stays on during the brief cycle."""
+    if not live:
+        return ""
+    mirrored_live = {
+        str(m["name"]) for m in live
+        if m.get("name") and not m.get("disabled") and _live_mirror_of(m)
+    }
+    if not mirrored_live:
+        return ""
+    settled = [_settle_pending_mirror_pause(dict(o, pauseMode=o.get("pauseMode") or "")) for o in outputs]
+    unmirroring = [
+        o["name"] for o in settled
+        if o["enabled"] and not o["autoOff"] and not o["mirrorOf"] and o["name"] in mirrored_live
+    ]
+    if not unmirroring:
+        return ""
+    unmirror_set = set(unmirroring)
+    other_lit = any(
+        str(m.get("name") or "") not in unmirror_set and not m.get("disabled") and not _live_mirror_of(m)
+        for m in live
+    )
+    if not other_lit:
+        return ""
+    return "\n".join(f"hl.monitor({{ output = {lua_string(n)}, disabled = true }})" for n in unmirroring)
+
+
 def apply(outputs: list) -> dict:
     lua = live_lua(outputs)
     errors = []
     if lua:
+        try:
+            pre_live = connected_monitors()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pre_live = []
+        pre_lua = _unmirror_pre_disable_lua(outputs, pre_live)
+        if pre_lua:
+            subprocess.run(["hyprctl", "eval", pre_lua], capture_output=True, text=True,
+                           timeout=HYPRCTL_TIMEOUT)
+            time.sleep(0.15)
         result = subprocess.run(["hyprctl", "eval", lua], capture_output=True, text=True,
                                 timeout=HYPRCTL_TIMEOUT)
         reply = (result.stdout + result.stderr).strip()
@@ -1093,14 +1143,14 @@ def read_vcp_input(bus) -> dict:
     return {"status": "ok", "code": code} if code else {"status": "ambiguous"}
 
 
-def _open_i2c(bus):
-    """An fd on /dev/i2c-BUS addressed to the SCDC slave, or raises OSError.
-    Never follows a symlink and only accepts a character device."""
+def _open_i2c(bus, addr: int = SCDC_ADDR):
+    """An fd on /dev/i2c-BUS addressed to `addr` (I2C_SLAVE, never force), or
+    raises OSError. Never follows a symlink and only accepts a character device."""
     fd = os.open(str(i2c_dev_root() / f"i2c-{bus}"), os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         if not stat.S_ISCHR(os.fstat(fd).st_mode):
             raise OSError(f"/dev/i2c-{bus} is not a character device")
-        fcntl.ioctl(fd, I2C_SLAVE, SCDC_ADDR)
+        fcntl.ioctl(fd, I2C_SLAVE, addr)
     except BaseException:
         os.close(fd)
         raise
@@ -1127,8 +1177,53 @@ def _smbus_read_byte_data(fd, register: int) -> int:
     return int(data.byte) & 0xFF
 
 
-# An I2C NACK: nothing answers at 0x54, i.e. no SCDC sink (or one powered down).
+def _smbus_read_i2c_block(fd, register: int, length: int) -> bytes:
+    """One read-only SMBus I2C block read (`length` bytes starting at `register`)."""
+    data = _SmbusData()
+    data.block[0] = length & 0xFF
+    args = _SmbusIoctlData(I2C_SMBUS_READ, register & 0xFF, I2C_SMBUS_I2C_BLOCK_DATA, ctypes.pointer(data))
+    fcntl.ioctl(fd, I2C_SMBUS, args)
+    count = min(int(data.block[0]), length)
+    return bytes(data.block[1:1 + count])
+
+
+# An I2C NACK: nothing answers at the target slave address (absent or powered down).
 SCDC_ABSENT_ERRNOS = (errno.EREMOTEIO, errno.ENXIO)
+
+
+def read_hdcp_present(bus) -> dict:
+    """Read-only HDMI HDCP RX presence check: reads the 5-byte static Bksv at
+    I2C 0x3A in a single transaction. Returns `ok` when Bksv has the spec's
+    exact 20-bit popcount (HDMI receiver powered on), `none` on an actual SMBus
+    NACK (EREMOTEIO/ENXIO) or all-zero Bksv (receiver powered off / absent),
+    `busy` while the brightness lock is held, else `ambiguous`."""
+    if not re.fullmatch(r"\d{1,6}", str(bus or "")):
+        return {"status": "ambiguous"}
+    lock = _try_lock()
+    if not _locked(lock):
+        return {"status": lock}
+    try:
+        try:
+            fd = _open_i2c(bus, HDCP_ADDR)
+        except OSError:
+            return {"status": "ambiguous"}
+        try:
+            bksv = _smbus_read_i2c_block(fd, HDCP_BKSV_REG, HDCP_BKSV_LEN)
+        except OSError as error:
+            if error.errno in SCDC_ABSENT_ERRNOS:
+                return {"status": "none"}
+            return {"status": "ambiguous"}
+        finally:
+            os.close(fd)
+    finally:
+        _unlock(lock)
+    if len(bksv) != HDCP_BKSV_LEN:
+        return {"status": "ambiguous"}
+    if bksv == b"\x00" * HDCP_BKSV_LEN:
+        return {"status": "none"}
+    if sum(b.bit_count() for b in bksv) == 20:
+        return {"status": "ok"}
+    return {"status": "ambiguous"}
 
 
 def read_scdc_status(bus) -> dict:
@@ -1194,16 +1289,16 @@ def read_scdc_status(bus) -> dict:
 
 
 def parse_ddc_spec(spec):
-    """`NAME`, `NAME:BUS`, `NAME[@scdc|@ddc]` or `NAME:BUS[@scdc|@ddc]`
-    (BUS digits only) -> (name, bus or None, mode), else None."""
+    """`NAME`, `NAME:BUS`, `NAME[@scdc|@ddc|@ddc+hdcp]` or
+    `NAME:BUS[@scdc|@ddc|@ddc+hdcp]` (BUS digits only) ->
+    (name, bus or None, mode), else None."""
     text = str(spec or "")
     mode = ""
-    if text.endswith("@scdc"):
-        mode = "scdc"
-        text = text[:-len("@scdc")]
-    elif text.endswith("@ddc"):
-        mode = "ddc"
-        text = text[:-len("@ddc")]
+    for suffix, tag in (("@ddc+hdcp", "ddc+hdcp"), ("@scdc", "scdc"), ("@ddc", "ddc")):
+        if text.endswith(suffix):
+            mode = tag
+            text = text[:-len(suffix)]
+            break
     name, sep, bus = text.partition(":")
     if not CONNECTOR_RE.fullmatch(name):
         return None
@@ -1274,6 +1369,7 @@ def ddc_read(specs: list, *, detect=()) -> dict:
     readings = {}
     sysfs = {}
     scdc_unlocked = {}
+    hdcp_seen = set()
     pending = []
     has_ddcutil = shutil.which("ddcutil") is not None
     for name, hint, mode in parsed:
@@ -1291,7 +1387,24 @@ def ddc_read(specs: list, *, detect=()) -> dict:
                 reading = {"status": "ok", "signal": "scdc", "scdc": "absent"}
             readings[name] = reading
             continue
-        if mode != "ddc" and sysfs[name] is not None:
+        if mode == "ddc+hdcp":
+            bus = sysfs[name] if sysfs[name] is not None else hint
+            if bus is not None:
+                hdcp = read_hdcp_present(bus)
+                if hdcp["status"] == "busy":
+                    readings[name] = {"status": "busy"}
+                    continue
+                if hdcp["status"] == "none":
+                    readings[name] = {"status": "ok", "signal": "power", "power": "off"}
+                    continue
+                if hdcp["status"] == "ok":
+                    hdcp_seen.add(name)
+        elif mode == "ddc":
+            if sysfs[name] is not None:
+                hdcp = read_hdcp_present(sysfs[name])
+                if hdcp["status"] == "ok":
+                    hdcp_seen.add(name)
+        elif sysfs[name] is not None:
             reading = read_scdc_status(sysfs[name])
             if reading["status"] == "busy" or reading.get("scdc") == "locked":
                 readings[name] = reading
@@ -1307,8 +1420,8 @@ def ddc_read(specs: list, *, detect=()) -> dict:
                 continue
             if reading.get("scdc") == "unlocked":
                 scdc_unlocked[name] = reading
-        pending.append((name, hint))
-    names = [name for name, _ in pending]
+        pending.append((name, hint, mode))
+    names = [name for name, _, _ in pending]
     if not has_ddcutil:
         readings.update({n: {"status": "no_tool"} for n in names})
         suspend_after = suspend_clock_ms()
@@ -1319,7 +1432,9 @@ def ddc_read(specs: list, *, detect=()) -> dict:
     may_detect = {str(n) for n in (detect or ())} & set(names)
     buses = {}
     reported = set()
-    for name, hint in pending:
+    modes_by_name = {}
+    for name, hint, mode in pending:
+        modes_by_name[name] = mode
         bus = sysfs[name]
         if bus is None and hint is not None:
             bus = hint
@@ -1352,6 +1467,11 @@ def ddc_read(specs: list, *, detect=()) -> dict:
             if reading.get("status") not in ("ok", "busy") and n in scdc_unlocked:
                 readings[n] = scdc_unlocked[n]
             else:
+                if reading.get("status") == "ok" and modes_by_name.get(n) == "" and sysfs[n] is not None:
+                    if read_hdcp_present(sysfs[n])["status"] == "ok":
+                        hdcp_seen.add(n)
+                if n in hdcp_seen and reading.get("status") == "ok":
+                    reading = dict(reading, hdcp=True)
                 if n in reported:
                     reading = dict(reading, bus=buses[n])
                 readings[n] = reading

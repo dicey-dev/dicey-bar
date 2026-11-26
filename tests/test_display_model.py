@@ -1456,6 +1456,34 @@ TestCase {
         compare([upWake.state.state, upWake.state.mode, upWake.state.readyAt], ["WATCHING", "scdc", 90000])
         // No ddcutil and no SCDC lock: needs ddcutil.
         compare(feed(Model.ddcFresh("DP-1", 0, false), [{ status: "no_tool" }], 10000, "").state.state, "NO_TOOL")
+        // DDC/CI monitor with HDMI HDCP RX (0x3A) uses @ddc+hdcp, mirror-parks on power-off, and wakes on return.
+        var hdcpOk = { status: "ok", code: "0x11", hdcp: true }
+        var pwrOff = { status: "ok", signal: "power", power: "off" }
+        var benqW = feed(Model.ddcFresh("HDMI-A-1", 0, false), [hdcpOk, hdcpOk], 10000, "")
+        compare([benqW.state.state, benqW.state.mode, benqW.state.hdcpCapable, benqW.state.pauseMode],
+                ["WATCHING", "ddc", true, "mirror"])
+        compare(Model.ddcReadArgs([{ fp: "fp", name: "HDMI-A-1", mode: "ddc" }], { fp: benqW.state }),
+                ["HDMI-A-1@ddc+hdcp"])
+        // Normal watching polls every 5s; after the first off/away signal the
+        // next 2 confirmation checks accelerate to 1s, then drop back to 3s once
+        // paused (or 5s if unable to pause, e.g. last lit display).
+        compare(Model.ddcPollInterval({ fp: benqW.state }, 0), 5000)
+        var c1 = feed(benqW.state, [pwrOff], benqW.t, "0x11", true, 5000)
+        compare([c1.state.state, c1.state.otherStreak, Model.ddcPollInterval({ fp: c1.state }, 0)], ["WATCHING", 1, 1000])
+        var c2 = feed(c1.state, [pwrOff], c1.t, "0x11", true, 1000)
+        compare([c2.state.state, c2.state.otherStreak, Model.ddcPollInterval({ fp: c2.state }, 0)], ["WATCHING", 2, 1000])
+        var unsafe3 = feed(c2.state, [pwrOff], c2.t, "0x11", false, 1000)
+        compare([unsafe3.state.state, unsafe3.state.otherStreak, Model.ddcPollInterval({ fp: unsafe3.state }, 0)], ["WATCHING", 3, 5000])
+        var benqOff = feed(c2.state, [pwrOff], c2.t, "0x11", true, 1000)
+        compare([benqOff.state.state, benqOff.state.pausedReason], ["PAUSED", "power"])
+        compare(Model.ddcPollInterval({ fp: benqOff.state }, 0), 3000)
+        compare(Model.ddcPauseModes({ fp: benqOff.state }), { fp: "mirror" })
+        compare(Model.ddcStatusText(benqOff.state, true), "Paused · switched away or powered off")
+        // Stays paused while still powered off; wakes cleanly when powered back on.
+        var stillOff = feed(benqOff.state, [pwrOff, pwrOff], benqOff.t, "0x11")
+        compare(stillOff.state.state, "PAUSED")
+        var backOn = feed(stillOff.state, [hdcpOk], stillOff.t, "0x11")
+        compare([backOn.state.state, backOn.state.pausedReason], ["WATCHING", ""])
     }
 
     function test_scdc_monitor_after_resume_probes_through_scdc() {
