@@ -167,7 +167,7 @@ multi-monitor manager (and deduplicates `dicey.displays` if both IDs appear in
     kept lit as a live-only mirror of another active display, so it drops out
     of the layout and pointer bounds but keeps its HDMI link, and the first
     lock (you switch back or power it on) restores the saved layout within
-    about 2 s. It can never get stuck dark. Without `ddcutil` installed, if an
+    about 3 s. It can never get stuck dark. Without `ddcutil` installed, if an
     HDMI display is powered off or on another input at startup and stops
     answering SCDC, **Re-probe** (or replugging it) may be needed once you
     switch it back if discovery has already stopped.
