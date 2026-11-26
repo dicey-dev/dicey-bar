@@ -1719,9 +1719,10 @@ function ddcTransition(st, reading, ctx) {
     }
     if (powerOff && s.hdcpCapable === true) {
       var savedPowerL = ddcCode(c.savedL)
-      if (savedPowerL && !s.hotplugged) {
-        // Known HDMI DDC+HDCP monitor powered off across suspend/reprobe: keep
-        // the learned input and wait in UNVERIFIED until it comes back on.
+      if (savedPowerL) {
+        // Known HDMI DDC+HDCP monitor powered off across suspend or manual
+        // Re-probe: keep the learned input and wait in UNVERIFIED until it
+        // comes back on (there is no lit input to learn while powered off).
         ddcSetMode(s, "ddc")
         s.state = "UNVERIFIED"
         s.expected = savedPowerL
@@ -1754,9 +1755,17 @@ function ddcTransition(st, reading, ctx) {
     // answered at least once is only intermittent, so it gets a few more.
     var giveUp = s.probeSawValid ? s.probeReads >= DDC_PROBE_MAX_READS : s.probeAmbiguous >= DDC_PROBE_READS
     if (giveUp) {
+      var savedGiveUpL = ddcCode(c.savedL)
       if (s.probeSawScdc) {
         ddcSetMode(s, "scdc")
         s.state = "UNVERIFIED"
+      } else if (s.hdcpCapable === true && savedGiveUpL) {
+        // Known HDMI DDC+HDCP monitor unreachable right after resume/reprobe
+        // (e.g. powered off without a sysfs bus): keep waiting in UNVERIFIED
+        // instead of dropping to UNSUPPORTED.
+        ddcSetMode(s, "ddc")
+        s.state = "UNVERIFIED"
+        s.expected = savedGiveUpL
       } else {
         s.state = "UNSUPPORTED"
       }
@@ -1811,9 +1820,11 @@ function ddcTransition(st, reading, ctx) {
 
   if (s.state === "WATCHING") {
     if (powerOff) {
-      if (s.otherCode) s.otherStreak += 1
-      else s.otherStreak = 1
-      s.otherCode = "power"
+      if (s.otherStreak > 0) s.otherStreak += 1
+      else {
+        s.otherCode = "power"
+        s.otherStreak = 1
+      }
       ddcTryPause(s, now, c.canPause, "", "power")
     } else if (code && code === s.expected) {
       s.seenL = true
@@ -2213,7 +2224,8 @@ function ddcReadArgs(targets, states) {
     var scdc = mode === "scdc" || st.scdcCapable === true
     var suffix = scdc ? "@scdc" : (st.hdcpCapable === true ? "@ddc+hdcp" : (mode === "ddc" ? "@ddc" : ""))
     specs.push((bus ? t.name + ":" + bus : t.name) + suffix)
-    if (!bus && !scdc && (st.state === "UNPROBED" || st.state === "PROBING")) detect.push("--detect", t.name)
+    if (!bus && !scdc && (st.state === "UNPROBED" || st.state === "PROBING"
+        || (st.state === "UNVERIFIED" && st.hdcpCapable === true))) detect.push("--detect", t.name)
   }
   return detect.concat(specs)
 }
@@ -2460,14 +2472,20 @@ function ddcIsHotplug(removedAt, now) {
 // Connectors that should relearn their input on this refresh: explicit raw
 // hotplugs, plus connectors newly appearing since `previousNames` unless a raw
 // monitoradded already classified them as a brief HPD bounce (<8s) before the
-// settle timer elapsed.
+// settle timer elapsed. Flags for connectors not yet present in `monitors` are
+// preserved so a stale pre-settle refresh never drops a pending classification.
 function ddcResolvePlugged(monitors, previousNames, hotplugged, bounced, removedAt, now, resumeAt) {
+  var list = Array.isArray(monitors) ? monitors : []
+  var current = {}
+  for (var c = 0; c < list.length; c++) {
+    var cn = list[c] ? String(list[c].name || "") : ""
+    if (cn) current[cn] = true
+  }
   var plugged = {}
-  for (var h in hotplugged || {}) if (hotplugged[h] === true) plugged[h] = true
+  for (var h in hotplugged || {}) if (hotplugged[h] === true && current[h]) plugged[h] = true
   var bounce = bounced || {}
   var rem = removedAt || {}
   if (previousNames && (Number(now) || 0) - (Number(resumeAt) || 0) > 30000) {
-    var list = Array.isArray(monitors) ? monitors : []
     for (var i = 0; i < list.length; i++) {
       var name = list[i] ? String(list[i].name || "") : ""
       if (name && previousNames[name] !== true && bounce[name] !== true && ddcIsHotplug(rem[name], now))
@@ -2475,6 +2493,15 @@ function ddcResolvePlugged(monitors, previousNames, hotplugged, bounced, removed
     }
   }
   return plugged
+}
+
+function ddcRetainPendingFlags(flags, currentNames) {
+  var kept = {}
+  var cur = currentNames || {}
+  for (var k in flags || {}) {
+    if (flags[k] === true && !cur[k]) kept[k] = true
+  }
+  return kept
 }
 
 // The connector a Hyprland monitoradded/monitorremoved (or v2) event names
