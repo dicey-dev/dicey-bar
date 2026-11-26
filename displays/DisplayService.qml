@@ -616,6 +616,7 @@ Item {
       mode: st ? String(st.mode || "") : "",
       code: st ? String(st.expected || "") : "",
       pausedCode: st ? String(st.pausedCode || "") : "",
+      pausedReason: st ? String(st.pausedReason || "") : "",
       connector: st ? String(st.connector || "") : ""
     }
     status.label = Model.ddcInputLabel(status.code)

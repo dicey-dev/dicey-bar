@@ -1479,6 +1479,7 @@ var DDC_PAUSE_STREAK = 3
 var DDC_WAKE_AMBIGUOUS = 2
 var DDC_FLAP_WINDOW_MS = 600000
 var DDC_FLAP_LIMIT = 3
+var DDC_INTERVAL_CONFIRM = 1000
 var DDC_INTERVAL_PAUSED = 3000
 var DDC_INTERVAL_ACTIVE = 5000
 var DDC_INTERVAL_SLOW = 15000
@@ -1540,6 +1541,9 @@ function ddcFresh(connector, now, hotplugged, recentPauses) {
     pauseMode: "",
     // Watched through SCDC before (resume / Re-probe): probe it through SCDC.
     scdcCapable: false,
+    // HDMI HDCP RX (0x3A) answered while lit: detects soft/hard power-off on
+    // DDC/CI monitors and mirror-parks so the HDMI link stays alive for wake.
+    hdcpCapable: false,
     scdcLocks: 0,
     pausedReason: "",
     otherCode: "",
@@ -1596,7 +1600,7 @@ function ddcResetProbe(s) {
 
 function ddcSetMode(s, mode) {
   s.mode = mode
-  s.pauseMode = mode === "scdc" ? "mirror" : "disable"
+  s.pauseMode = (mode === "scdc" || s.hdcpCapable === true) ? "mirror" : "disable"
   if (mode === "scdc") s.scdcCapable = true
   return s
 }
@@ -1636,8 +1640,13 @@ function ddcTransition(st, reading, ctx) {
       status = "ambiguous"
     }
   }
-  var code = status === "ok" && !scdc ? ddcCode(reading.code) : ""
-  if (status === "ok" && !code && !scdc) status = "ambiguous"
+  var powerOff = status === "ok" && reading.signal === "power" && reading.power === "off"
+  var code = status === "ok" && !scdc && !powerOff ? ddcCode(reading.code) : ""
+  if (status === "ok" && !code && !scdc && !powerOff) status = "ambiguous"
+  if (reading && reading.hdcp === true) {
+    s.hdcpCapable = true
+    if (s.mode === "ddc") s.pauseMode = "mirror"
+  }
   var away = scdc === "unlocked" || scdc === "absent"
   var learn = null
   // A bus found by `ddcutil detect` is kept for this connection and passed
@@ -1791,7 +1800,14 @@ function ddcTransition(st, reading, ctx) {
   }
 
   if (s.state === "WATCHING") {
-    if (code && code === s.expected) {
+    if (powerOff) {
+      if (s.otherCode === "power") s.otherStreak += 1
+      else {
+        s.otherCode = "power"
+        s.otherStreak = 1
+      }
+      ddcTryPause(s, now, c.canPause, "", "power")
+    } else if (code && code === s.expected) {
       s.seenL = true
       s.otherCode = ""
       s.otherStreak = 0
@@ -1812,9 +1828,16 @@ function ddcTransition(st, reading, ctx) {
 
   if (s.state === "PAUSED") {
     if (code && code === s.expected) return { state: ddcToWatching(s, s.expected, now), learn: null }
+    if (powerOff) {
+      s.ambiguousStreak = 0
+      s.pausedCode = ""
+      s.pausedReason = "power"
+      return { state: s, learn: null }
+    }
     if (code) {
       s.ambiguousStreak = 0
       s.pausedCode = code
+      s.pausedReason = "input"
       return { state: s, learn: null }
     }
     s.ambiguousStreak += 1
@@ -1863,7 +1886,7 @@ function ddcPauseModes(states) {
   for (var fp in states || {}) {
     var st = states[fp]
     if (!st || st.state !== "PAUSED") continue
-    out[fp] = st.mode === "scdc" ? "mirror" : "disable"
+    out[fp] = (st.mode === "scdc" || st.hdcpCapable === true) ? "mirror" : "disable"
   }
   return out
 }
@@ -2019,6 +2042,7 @@ function ddcResume(states, now) {
     }
     var fresh = ddcFresh(cur.connector, now, false, cur.recentPauses)
     fresh.scdcCapable = cur.mode === "scdc" || cur.scdcCapable === true
+    fresh.hdcpCapable = cur.hdcpCapable === true
     next[fp] = fresh
   }
   return next
@@ -2106,6 +2130,7 @@ function ddcHold(states, pollable, now) {
 
 function ddcStateInterval(st) {
   if (!st) return 0
+  if (st.state === "WATCHING" && st.otherStreak > 0 && st.otherStreak < DDC_PAUSE_STREAK) return DDC_INTERVAL_CONFIRM
   if (st.mode === "scdc") {
     if (st.state === "PAUSED") return DDC_INTERVAL_PAUSED
     if (st.state === "WATCHING" || st.state === "UNVERIFIED" || st.state === "SNOOZED") return DDC_INTERVAL_ACTIVE
@@ -2179,7 +2204,7 @@ function ddcReadArgs(targets, states) {
     var bus = /^[0-9]{1,6}$/.test(String(st.detectedBus || "")) ? String(st.detectedBus) : ""
     var mode = clean(t.mode) || clean(st.mode)
     var scdc = mode === "scdc" || st.scdcCapable === true
-    var suffix = scdc ? "@scdc" : (mode === "ddc" ? "@ddc" : "")
+    var suffix = scdc ? "@scdc" : (mode === "ddc" ? (st.hdcpCapable === true ? "@ddc+hdcp" : "@ddc") : "")
     specs.push((bus ? t.name + ":" + bus : t.name) + suffix)
     if (!bus && !scdc && (st.state === "UNPROBED" || st.state === "PROBING")) detect.push("--detect", t.name)
   }
@@ -2399,7 +2424,10 @@ function ddcStatusText(status, ready) {
     if (st === "UNVERIFIED") return "Waiting for HDMI signal lock"
   }
   if (st === "WATCHING") return "Watching · " + (ddcInputLabel(status.code) || "this PC's input")
-  if (st === "PAUSED") return "Paused · switched to " + (ddcInputLabel(status.pausedCode) || "another input")
+  if (st === "PAUSED") {
+    if (status && status.pausedReason === "power") return "Paused · switched away or powered off"
+    return "Paused · switched to " + (ddcInputLabel(status.pausedCode) || "another input")
+  }
   if (st === "UNVERIFIED") return "Waiting for this PC's input"
   if (st === "SNOOZED") return "Snoozed until input returns"
   if (st === "UNSUPPORTED") return "Not supported by this display"

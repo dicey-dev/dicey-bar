@@ -173,9 +173,13 @@ multi-monitor manager (and deduplicates `dicey.displays` if both IDs appear in
     switch it back if discovery has already stopped.
   - **Tier 2, DDC/CI input source** (DisplayPort, HDMI 1.4, docks). The bar
     reads VCP `0x60` and learns which input this computer is on; after three
-    readings of another input the monitor is turned off, and it wakes as soon
-    as it is back on this computer's input. This needs `ddcutil`; monitors
-    with neither (many TVs over HDMI 1.4) are simply left alone.
+    readings of another input the monitor is paused, and it wakes as soon as it
+    is back on this computer's input. On direct HDMI sinks that also expose a
+    valid read-only HDCP receiver `Bksv` (I2C `0x3A`) while lit, a NACK there
+    also catches soft/hard power-off (even when the standby MCU keeps EDID and
+    DDC/CI alive) and mirror-parks the monitor so its HDMI link stays ready to
+    wake. This needs `ddcutil`; monitors with neither (many TVs over HDMI 1.4)
+    are simply left alone.
 
   Both fail open: a monitor that stops answering while paused is woken, an
   unreadable answer never pauses anything, the last lit display (counting a

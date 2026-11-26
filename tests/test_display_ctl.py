@@ -446,7 +446,9 @@ class DdcReadTest(_DdcReadBase):
         self.assertEqual(ctl.parse_ddc_spec("DP-2:13@scdc"), ("DP-2", "13", "scdc"))
         self.assertEqual(ctl.parse_ddc_spec("DP-2@ddc"), ("DP-2", None, "ddc"))
         self.assertEqual(ctl.parse_ddc_spec("DP-2:13@ddc"), ("DP-2", "13", "ddc"))
-        for bad in ("@scdc", "@ddc", "DP-2@scd", "DP-2@scdc:3", "DP-2:@scdc", "DP-2:@ddc"):
+        self.assertEqual(ctl.parse_ddc_spec("DP-2@ddc+hdcp"), ("DP-2", None, "ddc+hdcp"))
+        self.assertEqual(ctl.parse_ddc_spec("DP-2:13@ddc+hdcp"), ("DP-2", "13", "ddc+hdcp"))
+        for bad in ("@scdc", "@ddc", "@ddc+hdcp", "DP-2@scd", "DP-2@scdc:3", "DP-2:@scdc", "DP-2:@ddc"):
             with self.subTest(spec=bad):
                 self.assertIsNone(ctl.parse_ddc_spec(bad))
 
@@ -519,7 +521,9 @@ class FakeScdc:
         self.reads = []
         self.opened = []
 
-    def open(self, bus):
+    def open(self, bus, addr=ctl.SCDC_ADDR):
+        if addr != ctl.SCDC_ADDR:
+            raise OSError(errno.ENXIO, "no hdcp in FakeScdc")
         self.opened.append(bus)
         if self.open_error:
             raise self.open_error
@@ -731,6 +735,46 @@ class ScdcTest(_DdcReadBase):
         self.assertEqual(fake.opened, [])
         self.assertEqual(result["readings"]["HDMI-A-1"], {"status": "ok", "code": "0x11"})
         self.assertEqual(run.call_count, 1)
+
+    def test_hdcp_present_and_ddc_hdcp_power_off(self):
+        # Valid 5-byte Bksv has exactly 20 set bits (0x0f=4 bits each x 5 = 20).
+        valid_bksv = bytes([0x0F, 0x0F, 0x0F, 0x0F, 0x0F])
+        with mock.patch.object(ctl, "_open_i2c", return_value=os.open(os.devnull, os.O_RDONLY)), \
+                mock.patch.object(ctl, "_smbus_read_i2c_block", return_value=valid_bksv):
+            self.assertEqual(ctl.read_hdcp_present("7"), {"status": "ok"})
+        # NACK (ENXIO/EREMOTEIO) or all-zero Bksv -> none (powered off).
+        for err in (OSError(errno.ENXIO, "ENXIO"), OSError(errno.EREMOTEIO, "EREMOTEIO")):
+            with mock.patch.object(ctl, "_open_i2c", return_value=os.open(os.devnull, os.O_RDONLY)), \
+                    mock.patch.object(ctl, "_smbus_read_i2c_block", side_effect=err):
+                self.assertEqual(ctl.read_hdcp_present("7"), {"status": "none"})
+        with mock.patch.object(ctl, "_open_i2c", return_value=os.open(os.devnull, os.O_RDONLY)), \
+                mock.patch.object(ctl, "_smbus_read_i2c_block", return_value=b"\x00" * 5):
+            self.assertEqual(ctl.read_hdcp_present("7"), {"status": "none"})
+        # Floating bus (0xFF*5) or wrong popcount -> ambiguous.
+        for bad in (b"\xff" * 5, b"\x01\x00\x00\x00\x00", b"\x0f\x0f"):
+            with mock.patch.object(ctl, "_open_i2c", return_value=os.open(os.devnull, os.O_RDONLY)), \
+                    mock.patch.object(ctl, "_smbus_read_i2c_block", return_value=bad):
+                self.assertEqual(ctl.read_hdcp_present("7"), {"status": "ambiguous"})
+        # @ddc+hdcp: when HDCP NACKs (soft-off or AC-off), returns power=off without calling ddcutil or SCDC.
+        with mock.patch.object(ctl, "read_scdc_status") as scdc_probe, \
+                mock.patch.object(ctl, "read_hdcp_present", return_value={"status": "none"}), \
+                mock.patch.object(ctl.subprocess, "run") as run:
+            off = ctl.ddc_read(["HDMI-A-1@ddc+hdcp"])
+        self.assertEqual(off["readings"]["HDMI-A-1"], {"status": "ok", "signal": "power", "power": "off"})
+        scdc_probe.assert_not_called()
+        run.assert_not_called()
+        # @ddc+hdcp when HDCP answers ok: reads VCP 60 and tags hdcp=True, never touching SCDC.
+        with mock.patch.object(ctl, "read_scdc_status") as scdc_probe, \
+                mock.patch.object(ctl, "read_hdcp_present", return_value={"status": "ok"}), \
+                mock.patch.object(ctl.subprocess, "run", return_value=completed("VCP 60 SNC x11")):
+            on = ctl.ddc_read(["HDMI-A-1@ddc+hdcp"])
+        self.assertEqual(on["readings"]["HDMI-A-1"], {"status": "ok", "code": "0x11", "hdcp": True})
+        scdc_probe.assert_not_called()
+        # @ddc discovers hdcp=True once lit, and does NOT treat none as power-off (DP safe).
+        with mock.patch.object(ctl, "read_hdcp_present", return_value={"status": "ok"}), \
+                mock.patch.object(ctl.subprocess, "run", return_value=completed("VCP 60 SNC x11")):
+            disc = ctl.ddc_read(["HDMI-A-1@ddc"])
+        self.assertEqual(disc["readings"]["HDMI-A-1"], {"status": "ok", "code": "0x11", "hdcp": True})
 
     def test_scdc_is_only_tried_on_sysfs_linked_connectors(self):
         fake = FakeScdc({0x01: 0x01, 0x31: 0x00, 0x40: 0x0F})
@@ -1074,7 +1118,8 @@ class MirrorParkTest(unittest.TestCase):
 
     def test_apply_cli_parks_live(self):
         plan = [output(**LAPTOP), self.parked()]
-        with mock.patch.object(ctl.subprocess, "run", return_value=completed("ok")) as run, \
+        with mock.patch.object(ctl, "connected_monitors", return_value=[]), \
+                mock.patch.object(ctl.subprocess, "run", return_value=completed("ok")) as run, \
                 mock.patch.object(ctl, "_verify_some_display_enabled", return_value=[]), \
                 mock.patch.object(ctl, "fallbacks", return_value=[]):
             result = ctl.apply(ctl.validate_plan(plan))
@@ -1082,6 +1127,39 @@ class MirrorParkTest(unittest.TestCase):
         lua = run.call_args[0][0][2]
         self.assertIn('mirror = "eDP-1"', lua)
         self.assertNotIn("disabled = true", lua)
+
+    def test_apply_unmirror_pre_disables_to_recreate_wl_output(self):
+        plan = [output(**LAPTOP), output()]
+        mirrored_live = [
+            {"name": "eDP-1", "disabled": False, "mirrorOf": "none"},
+            {"name": "HDMI-A-1", "disabled": False, "mirrorOf": "eDP-1"},
+        ]
+        with mock.patch.object(ctl, "connected_monitors", return_value=mirrored_live), \
+                mock.patch.object(ctl.subprocess, "run", return_value=completed("ok")) as run, \
+                mock.patch.object(ctl.time, "sleep") as sleep_fn, \
+                mock.patch.object(ctl, "_verify_some_display_enabled", return_value=[]), \
+                mock.patch.object(ctl, "fallbacks", return_value=[]):
+            result = ctl.apply(ctl.validate_plan(plan))
+        self.assertTrue(result["ok"])
+        self.assertEqual(run.call_count, 2)
+        self.assertIn('output = "HDMI-A-1", disabled = true', run.call_args_list[0][0][0][2])
+        self.assertIn('output = "HDMI-A-1", disabled = false', run.call_args_list[1][0][0][2])
+        self.assertIn('mirror = ""', run.call_args_list[1][0][0][2])
+        sleep_fn.assert_called_once()
+        # Already-unmirrored outputs do not incur a pre-disable cycle.
+        extended_live = [
+            {"name": "eDP-1", "disabled": False, "mirrorOf": "none"},
+            {"name": "HDMI-A-1", "disabled": False, "mirrorOf": "none"},
+        ]
+        with mock.patch.object(ctl, "connected_monitors", return_value=extended_live), \
+                mock.patch.object(ctl.subprocess, "run", return_value=completed("ok")) as run2, \
+                mock.patch.object(ctl.time, "sleep") as sleep_fn2, \
+                mock.patch.object(ctl, "_verify_some_display_enabled", return_value=[]), \
+                mock.patch.object(ctl, "fallbacks", return_value=[]):
+            result2 = ctl.apply(ctl.validate_plan(plan))
+        self.assertTrue(result2["ok"])
+        self.assertEqual(run2.call_count, 1)
+        sleep_fn2.assert_not_called()
 
 
 class DdcMemoryTest(unittest.TestCase):

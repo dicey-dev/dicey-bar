@@ -1347,6 +1347,8 @@ Panel {
                 text: {
                   if (root.currentDdcStatus && root.currentDdcStatus.mode === "scdc")
                     return "Paused — no HDMI signal lock (switched away or powered off). Restores automatically when you switch back."
+                  if (root.currentDdcStatus && root.currentDdcStatus.pausedReason === "power")
+                    return "Paused — switched away or powered off. Restores automatically when it comes back."
                   var label = root.currentDdcStatus && root.currentDdcStatus.pausedLabel
                     ? root.currentDdcStatus.pausedLabel : "another input"
                   return "Paused — switched to " + label + ". Turns back on automatically when you switch back."
