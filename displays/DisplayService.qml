@@ -26,6 +26,11 @@ Item {
   property var bar: null
 
   readonly property string helperPath: decodeURIComponent(String(Qt.resolvedUrl("display_ctl.py")).replace(/^(file|qs):\/\//, ""))
+  // Development deployments (`dicey.bar.dev`) skip automatic startup/hotplug
+  // reconcile and polling so starting dev mode never mutates real displays
+  // unasked (set DICEY_BAR_DEV_AUTO=1 in the shell environment to test it live).
+  readonly property bool isDevInstance: String(Qt.resolvedUrl(".")).indexOf("dicey.bar.dev") !== -1
+    && Quickshell.env("DICEY_BAR_DEV_AUTO") !== "1"
 
   property var monitors: []
   property var memory: ({})
@@ -63,6 +68,10 @@ Item {
   property int ddcPollStartEpoch: 0
   // Connectors seen plugged in since the last refresh; they relearn their input.
   property var hotpluggedConnectors: ({})
+  // Connectors whose raw monitoradded arrived within the HPD-bounce window;
+  // carried through the settle delay so syncDdcStates never upgrades a brief
+  // pulse into a hotplug after the 1.2 s settle timer elapses.
+  property var hpdBounceConnectors: ({})
   // When each connector last disconnected, so brief HPD pulses on input switch
   // are never mistaken for a physical cable swap that overwrites ddc.json.
   property var removedConnectorsAt: ({})
@@ -275,20 +284,14 @@ Item {
   // wakes any paused monitor it is no longer safe to keep dark.
   function syncDdcStates(previousNames) {
     var now = Date.now()
-    var plugged = {}
-    for (var h in hotpluggedConnectors) plugged[h] = true
+    var plugged = Model.ddcResolvePlugged(monitors, previousNames, hotpluggedConnectors,
+                                          hpdBounceConnectors, removedConnectorsAt, now, resumeAt)
     hotpluggedConnectors = ({})
+    hpdBounceConnectors = ({})
     var currentNames = {}
     for (var ci = 0; ci < monitors.length; ci++) {
       var cn = monitors[ci] ? String(monitors[ci].name || "") : ""
       if (cn) currentNames[cn] = true
-    }
-    if (previousNames && now - resumeAt > 30000) {
-      for (var i = 0; i < monitors.length; i++) {
-        var name = monitors[i] ? String(monitors[i].name || "") : ""
-        if (name && previousNames[name] !== true && Model.ddcIsHotplug(removedConnectorsAt[name], now))
-          plugged[name] = true
-      }
     }
     var nextRemoved = {}
     for (var r in removedConnectorsAt) {
@@ -345,7 +348,13 @@ Item {
     var now = Date.now()
     if (!name || !loaded || now - resumeAt < 30000) return
     var removedAt = Number(removedConnectorsAt[name] || 0)
-    if (!Model.ddcIsHotplug(removedAt, now)) return
+    if (!Model.ddcIsHotplug(removedAt, now)) {
+      var nextBounced = {}
+      for (var bk in hpdBounceConnectors) nextBounced[bk] = true
+      nextBounced[name] = true
+      hpdBounceConnectors = nextBounced
+      return
+    }
     for (var i = 0; i < monitors.length; i++) {
       if (monitors[i] && monitors[i].name === name) {
         if (monitors[i].disabled === true || removedAt <= 0) return
@@ -355,6 +364,11 @@ Item {
     for (var k in hotpluggedConnectors) next[k] = true
     next[name] = true
     hotpluggedConnectors = next
+    if (hpdBounceConnectors[name]) {
+      var cleared = {}
+      for (var ck in hpdBounceConnectors) if (ck !== name) cleared[ck] = true
+      hpdBounceConnectors = cleared
+    }
   }
 
   // Suspend shows up directly as CLOCK_BOOTTIME - CLOCK_MONOTONIC advancing
@@ -373,6 +387,7 @@ Item {
     lastSuspendMs = ms
     resumeAt = now
     hotpluggedConnectors = ({})
+    hpdBounceConnectors = ({})
     var wasPaused = Object.keys(Model.ddcOffMap(ddcStates)).length > 0
     ddcStates = Model.ddcResume(ddcStates, now)
     ddcPollEpoch = ddcPollEpoch + 1
@@ -416,7 +431,7 @@ Item {
   property string ddcPollText: ""
 
   function pollInputs() {
-    if (!loaded || !Model.hasMemory(memory)) return
+    if (isDevInstance || !loaded || !Model.hasMemory(memory)) return
     if (confirming || applyInFlight || persistInFlight || revertInFlight || brightnessBusy || ddcPollBusy || ddcPollProc.running) return
     var now = Date.now()
     var pollable = ddcPollableMap()
@@ -629,7 +644,7 @@ Item {
     id: ddcTimer
     interval: Math.max(1000, Model.ddcPollInterval(service.ddcStates, 0, service.liveDpms, service.liveGlobalIdle) || 5000)
     repeat: true
-    running: true
+    running: !service.isDevInstance
     onTriggered: {
       if (service.reconcilePending && !service.reconcileInFlight && !service.liveGlobalIdle
           && !service.confirming && !service.applyInFlight && !service.persistInFlight && !service.revertInFlight)
@@ -952,7 +967,7 @@ Item {
   // can never race a panel preview or Forget on disk. Hotplug and startup
   // reconciles (no argument) also persist the layout for the new set.
   function reconcile(liveOnly) {
-    if (!loaded || !Model.hasMemory(memory) || monitors.length === 0) return
+    if (isDevInstance || !loaded || !Model.hasMemory(memory) || monitors.length === 0) return
     if (liveOnly !== true) reconcileNeedsPersist = true
     if (confirming || applyInFlight || persistInFlight || revertInFlight || reconcileInFlight || liveGlobalIdle) {
       // Picked up again once the panel's change has finished or DPMS wakes.

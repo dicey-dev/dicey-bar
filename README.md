@@ -189,7 +189,9 @@ multi-monitor manager (and deduplicates `dicey.displays` if both IDs appear in
   screens come back.
   **Wake now** (or the power switch) wakes a paused monitor at once and keeps
   it on until its input (or HDMI lock) returns. Plugging a monitor into
-  another PC port or monitor port relearns it; after startup or resume a
+  another PC port or monitor port relearns it (moving a cable between ports on
+  the same monitor in under 8 s is filtered as an HPD bounce; use **Forget** or
+  replug after 8 s to relearn); after startup or resume a
   monitor showing another input is only watched once it returns. The panel's
   **Automation** row shows the live status, and **Re-probe** retries monitors
   marked unsupported or suspended (snoozed or waiting ones are re-checked at

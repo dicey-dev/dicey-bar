@@ -873,7 +873,7 @@ function planFromLive(monitors, memory, autoOff, pauseModes, appliedParks) {
       out.offReason = String(off[out.fp])
       if (out.offReason === "input") out.pauseMode = modes[out.fp] === "mirror" || modes[out.fp] === "disable" ? modes[out.fp] : ""
       if (out.parkMirrorOf && !(out.offReason === "input" && park !== out.name && activeNames[park])) out.parkMirrorOf = ""
-      if (pausedAsMirror && !out.parkMirrorOf) {
+      if (pausedAsMirror && !out.parkMirrorOf && out.enabled !== false) {
         // Not parked (yet): it is lit and extended, never "off".
         out.autoOff = false
         out.offReason = ""
@@ -1111,11 +1111,11 @@ function outputMatchesLive(output, live) {
   if (output.autoOff) {
     if (output.offReason !== "input") return true
     var park = cleanMirrorOf(output.parkMirrorOf)
-    if (park) return live.enabled === true && cleanMirrorOf(live.mirrorOf || live.parkMirrorOf) === park
+    if (park) return output.enabled !== false && live.enabled === true && cleanMirrorOf(live.mirrorOf || live.parkMirrorOf) === park
     return live.enabled === false
   }
   if (output.enabled !== live.enabled) return false
-  if (!output.enabled) return true
+  if (!output.enabled) return !live.autoOff
   var mirrorA = cleanMirrorOf(output.mirrorOf)
   var mirrorB = cleanMirrorOf(live.mirrorOf || live.parkMirrorOf)
   if (mirrorA !== mirrorB) return false
@@ -1459,11 +1459,11 @@ function autoOffFor(plan, lidClosed, ddcOff) {
 //                unreadable answers with no valid one -> UNSUPPORTED, and a
 //                monitor that answered once (VCP, or SCDC without a lock)
 //                gets 5 reads in all
-//   WATCHING     5s polls (2s for SCDC); 3 identical reads of another input,
-//                or 3 SCDC reads without a lock -> PAUSED
-//   PAUSED       3s polls (2s for SCDC); this PC's input / an SCDC lock ->
-//                wake; 2 unreadable -> wake. No lock keeps an SCDC pause (it
-//                is parked lit, so it can always relock)
+//   WATCHING     5s polls (1s confirm burst after first away/off read); 3
+//                away/off reads (another input, HDCP off, or SCDC unlock) -> PAUSED
+//   PAUSED       3s polls; this PC's input / an SCDC lock -> wake; 2
+//                unreadable -> wake. No lock / power-off keeps a mirror-parked
+//                pause (it is parked lit, so it can always wake)
 //   UNVERIFIED   started on another input than the learned one; never pauses
 //                until this PC's input is seen
 //   SNOOZED      woken by hand; never pauses until this PC's input is seen
@@ -1483,8 +1483,6 @@ var DDC_INTERVAL_CONFIRM = 1000
 var DDC_INTERVAL_PAUSED = 3000
 var DDC_INTERVAL_ACTIVE = 5000
 var DDC_INTERVAL_SLOW = 15000
-// An SCDC read is one sub-millisecond ioctl, no ddcutil.
-var DDC_INTERVAL_SCDC = 2000
 var DDC_SCDC_PROBE_LOCKS = 2
 
 var MCCS_INPUTS = {
@@ -1535,8 +1533,8 @@ function ddcFresh(connector, now, hotplugged, recentPauses) {
     // An SCDC sink answered (locked or unlocked) during this probe.
     probeSawScdc: false,
     detectedBus: "",
-    // How this monitor is watched once probed: "scdc" (signal lock, paused by
-    // mirror-parking) or "ddc" (VCP 0x60, paused by disabling).
+    // How this monitor is watched once probed: "scdc" (signal lock, mirror-parked)
+    // or "ddc" (VCP 0x60; mirror-parked when HDMI HDCP RX 0x3A is present, else disabled).
     mode: "",
     pauseMode: "",
     // Watched through SCDC before (resume / Re-probe): probe it through SCDC.
@@ -1643,7 +1641,7 @@ function ddcTransition(st, reading, ctx) {
   var powerOff = status === "ok" && reading.signal === "power" && reading.power === "off"
   var code = status === "ok" && !scdc && !powerOff ? ddcCode(reading.code) : ""
   if (status === "ok" && !code && !scdc && !powerOff) status = "ambiguous"
-  if (reading && reading.hdcp === true) {
+  if (reading && reading.hdcp === true && s.state !== "PAUSED") {
     s.hdcpCapable = true
     if (s.mode === "ddc") s.pauseMode = "mirror"
   }
@@ -1718,6 +1716,18 @@ function ddcTransition(st, reading, ctx) {
         ddcResetProbe(s)
       }
       return { state: s, learn: null }
+    }
+    if (powerOff && s.hdcpCapable === true) {
+      var savedPowerL = ddcCode(c.savedL)
+      if (savedPowerL && !s.hotplugged) {
+        // Known HDMI DDC+HDCP monitor powered off across suspend/reprobe: keep
+        // the learned input and wait in UNVERIFIED until it comes back on.
+        ddcSetMode(s, "ddc")
+        s.state = "UNVERIFIED"
+        s.expected = savedPowerL
+        ddcResetProbe(s)
+        return { state: s, learn: null }
+      }
     }
     s.probeReads += 1
     if (code) s.probeSawValid = true
@@ -1801,22 +1811,18 @@ function ddcTransition(st, reading, ctx) {
 
   if (s.state === "WATCHING") {
     if (powerOff) {
-      if (s.otherCode === "power") s.otherStreak += 1
-      else {
-        s.otherCode = "power"
-        s.otherStreak = 1
-      }
+      if (s.otherCode) s.otherStreak += 1
+      else s.otherStreak = 1
+      s.otherCode = "power"
       ddcTryPause(s, now, c.canPause, "", "power")
     } else if (code && code === s.expected) {
       s.seenL = true
       s.otherCode = ""
       s.otherStreak = 0
     } else if (code) {
-      if (code === s.otherCode) s.otherStreak += 1
-      else {
-        s.otherCode = code
-        s.otherStreak = 1
-      }
+      if (code === s.otherCode || s.otherCode === "power") s.otherStreak += 1
+      else s.otherStreak = 1
+      s.otherCode = code
       ddcTryPause(s, now, c.canPause, code, "input")
     } else {
       // An unreadable answer is never evidence of a switch.
@@ -2066,6 +2072,7 @@ function ddcReprobe(states, now) {
     if (cur.state === "UNSUPPORTED" || cur.state === "SUSPENDED" || cur.state === "NO_TOOL") {
       var fresh = ddcFresh(cur.connector, now, true, cur.state === "SUSPENDED" ? [] : cur.recentPauses)
       fresh.scdcCapable = cur.mode === "scdc" || cur.scdcCapable === true
+      fresh.hdcpCapable = cur.hdcpCapable === true
       next[fp] = fresh
       continue
     }
@@ -2204,7 +2211,7 @@ function ddcReadArgs(targets, states) {
     var bus = /^[0-9]{1,6}$/.test(String(st.detectedBus || "")) ? String(st.detectedBus) : ""
     var mode = clean(t.mode) || clean(st.mode)
     var scdc = mode === "scdc" || st.scdcCapable === true
-    var suffix = scdc ? "@scdc" : (mode === "ddc" ? (st.hdcpCapable === true ? "@ddc+hdcp" : "@ddc") : "")
+    var suffix = scdc ? "@scdc" : (st.hdcpCapable === true ? "@ddc+hdcp" : (mode === "ddc" ? "@ddc" : ""))
     specs.push((bus ? t.name + ":" + bus : t.name) + suffix)
     if (!bus && !scdc && (st.state === "UNPROBED" || st.state === "PROBING")) detect.push("--detect", t.name)
   }
@@ -2330,6 +2337,9 @@ function syncDraftAutoOff(draft, live) {
     if (!l) return o
     var wasOff = o.autoOff === true
     var nowOff = l.autoOff === true
+    // Preserve an explicit manual power-off edit in the draft across runtime
+    // auto-pause and auto-wake transitions.
+    if (!wasOff && o.enabled === false) return o
     var livePark = nowOff ? String(l.parkMirrorOf || "") : ""
     var livePause = nowOff ? String(l.pauseMode || "") : ""
     if (wasOff === nowOff && String(o.offReason || "") === String(l.offReason || "")
@@ -2445,6 +2455,26 @@ function ddcIsHotplug(removedAt, now) {
   var r = Number(removedAt) || 0
   if (r <= 0) return true
   return (Number(now) || 0) - r >= DDC_HPD_BOUNCE_MS
+}
+
+// Connectors that should relearn their input on this refresh: explicit raw
+// hotplugs, plus connectors newly appearing since `previousNames` unless a raw
+// monitoradded already classified them as a brief HPD bounce (<8s) before the
+// settle timer elapsed.
+function ddcResolvePlugged(monitors, previousNames, hotplugged, bounced, removedAt, now, resumeAt) {
+  var plugged = {}
+  for (var h in hotplugged || {}) if (hotplugged[h] === true) plugged[h] = true
+  var bounce = bounced || {}
+  var rem = removedAt || {}
+  if (previousNames && (Number(now) || 0) - (Number(resumeAt) || 0) > 30000) {
+    var list = Array.isArray(monitors) ? monitors : []
+    for (var i = 0; i < list.length; i++) {
+      var name = list[i] ? String(list[i].name || "") : ""
+      if (name && previousNames[name] !== true && bounce[name] !== true && ddcIsHotplug(rem[name], now))
+        plugged[name] = true
+    }
+  }
+  return plugged
 }
 
 // The connector a Hyprland monitoradded/monitorremoved (or v2) event names
